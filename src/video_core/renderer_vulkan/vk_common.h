@@ -8,6 +8,10 @@
 #define VK_ENABLE_BETA_EXTENSIONS
 #define VK_NO_PROTOTYPES
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
+#ifdef __SWITCH__
+// No shared libraries on Switch: the driver (OunceVK) is linked statically.
+#define VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL 0
+#endif
 #define VULKAN_HPP_NO_CONSTRUCTORS
 #define VULKAN_HPP_NO_STRUCT_SETTERS
 #include <vulkan/vulkan.hpp>

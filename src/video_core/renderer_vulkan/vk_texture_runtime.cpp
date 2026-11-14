@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/hen_stats.h"
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
 #include <limits>
@@ -33,6 +34,17 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 MICROPROFILE_DEFINE(Vulkan_ImageAlloc, "Vulkan", "Texture Allocation", MP_RGB(192, 52, 235));
+
+#ifdef __SWITCH__
+extern "C" int hen_depth_scale_blit; // --no-depth-scale-blit
+#else
+static constexpr int hen_depth_scale_blit = 1;
+#endif
+
+#ifdef __SWITCH__
+extern "C" void hen_backtrace(const char* what); // hen/jit/hen_jit.c
+extern "C" int hen_depth_lag;                     // --sync-depth-reads turns it off
+#endif
 
 namespace Vulkan {
 
@@ -292,6 +304,10 @@ TextureRuntime::TextureRuntime(const Instance& instance, Scheduler& scheduler,
                       vk::BufferUsageFlagBits::eTransferDst |
                           vk::BufferUsageFlagBits::eStorageBuffer,
                       DOWNLOAD_BUFFER_SIZE, BufferType::Download},
+      depth_lag_buffer{instance, scheduler,
+                       vk::BufferUsageFlagBits::eTransferDst |
+                           vk::BufferUsageFlagBits::eStorageBuffer,
+                       16 * 1024 * 1024, BufferType::Download},
       num_swapchain_images{num_swapchain_images_} {}
 
 TextureRuntime::~TextureRuntime() = default;
@@ -868,6 +884,81 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
                      const VideoCore::StagingData& staging) {
     runtime.renderpass_cache.EndRendering();
 
+    // (Switch 2 port) Depth and stencil the program wrote, for a surface drawn at a multiple
+    // of its size, where the device can neither blit the format (BlitScale) nor write stencil
+    // from a shader (BlitHelper::BlitDepthStencil): NVK here. Without this the scaled image
+    // kept its old contents and "Depth scale unsupported by hardware" was all that happened.
+    // The pixels are repeated here and uploaded to the scaled image as well. (Read before the
+    // upload below is recorded: that rewrites the staging data in place, on another thread.)
+    std::vector<u32> hen_source;
+    const bool hen_scale_here =
+        hen_depth_scale_blit && res_scale != 1 && pixel_format == PixelFormat::D24S8 &&
+        !traits.blit_support && (Aspect() & vk::ImageAspectFlagBits::eStencil) &&
+        (traits.native == vk::Format::eD24UnormS8Uint ||
+         traits.native == vk::Format::eD32SfloatS8Uint);
+    const u32 hen_w = upload.texture_rect.GetWidth(), hen_h = upload.texture_rect.GetHeight();
+    if (hen_scale_here && staging.size >= hen_w * hen_h * 5) {
+        hen_source.resize(static_cast<std::size_t>(hen_w) * hen_h);
+        std::memcpy(hen_source.data(), staging.mapped.data(), hen_source.size() * 4);
+    }
+    // (Switch 2 port) Depth and stencil are separated here, in ordinary memory, not by
+    // UnpackDepthStencil in the recorded command below: that reads and rewrites the upload
+    // buffer a pixel at a time, and reads of that memory are slow on this device (not cached):
+    // 40 ms for a 512x400 depth buffer, on the thread the emulation thread waits for at every
+    // frame. A final smash in Super Smash Bros. that writes the depth buffer every frame ran
+    // at 27 to 38%.
+    bool hen_unpacked = false;
+    if (pixel_format == PixelFormat::D24S8 && (Aspect() & vk::ImageAspectFlagBits::eStencil) &&
+        traits.native == vk::Format::eD24UnormS8Uint && staging.size >= 5) {
+        const std::size_t pixels = staging.size / 5;
+        std::vector<u32> words(pixels);
+        // (one pass over the buffer at most: the copy made above for scaling serves too)
+        if (hen_source.size() == pixels) {
+            std::memcpy(words.data(), hen_source.data(), pixels * 4);
+        } else {
+            std::memcpy(words.data(), staging.mapped.data(), pixels * 4);
+        }
+        std::vector<u8> stencil(pixels);
+        for (std::size_t i = 0; i < pixels; i++) {
+            stencil[i] = static_cast<u8>(words[i]);
+            words[i] >>= 8;
+        }
+        std::memcpy(staging.mapped.data(), words.data(), pixels * 4);
+        std::memcpy(staging.mapped.data() + 4 * staging.size / 5, stencil.data(), pixels);
+        hen_unpacked = true;
+    }
+    // Writes the scaled depth words, then the scaled stencil bytes, at out.
+    const auto hen_scale_into = [&](u8* out) {
+        const u32 s = res_scale, sw = hen_w * s, sh = hen_h * s;
+        u8* const depth_out = out;
+        u8* const stencil_out = out + static_cast<std::size_t>(sw) * sh * 4;
+        const bool as_float = traits.native == vk::Format::eD32SfloatS8Uint;
+        // One scaled row built in ordinary memory, then written s times: the buffer may be
+        // write-combined memory, which must not be read back.
+        std::vector<u32> depth_row(sw);
+        std::vector<u8> stencil_row(sw);
+        for (u32 y = 0; y < hen_h; y++) {
+            const u32* const src = hen_source.data() + static_cast<std::size_t>(y) * hen_w;
+            for (u32 x = 0; x < hen_w; x++) {
+                const u32 d24s8 = src[x];
+                u32 word = d24s8 >> 8;
+                if (as_float) {
+                    const float d32 = (d24s8 >> 8) / 16777215.f;
+                    std::memcpy(&word, &d32, 4);
+                }
+                for (u32 i = 0; i < s; i++) {
+                    depth_row[x * s + i] = word;
+                    stencil_row[x * s + i] = static_cast<u8>(d24s8);
+                }
+            }
+            for (u32 i = 0; i < s; i++) {
+                const std::size_t row = static_cast<std::size_t>(y) * s + i;
+                std::memcpy(depth_out + row * sw * 4, depth_row.data(), static_cast<std::size_t>(sw) * 4);
+                std::memcpy(stencil_out + row * sw, stencil_row.data(), sw);
+            }
+        }
+    };
+
     const RecordParams params = {
         .aspect = Aspect(),
         .pipeline_flags = PipelineStageFlags(),
@@ -876,7 +967,7 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
     };
 
     scheduler.Record([buffer = runtime.upload_buffer.Handle(), format = traits.native, params,
-                      staging, upload](vk::CommandBuffer cmdbuf) {
+                      staging, upload, hen_unpacked](vk::CommandBuffer cmdbuf) {
         boost::container::static_vector<vk::BufferImageCopy, 2> buffer_image_copies;
 
         const auto rect = upload.texture_rect;
@@ -900,7 +991,8 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
             vk::BufferImageCopy& stencil_copy =
                 buffer_image_copies.emplace_back(buffer_image_copies[0]);
             stencil_copy = buffer_image_copies[0];
-            stencil_copy.bufferOffset += UnpackDepthStencil(staging, format);
+            stencil_copy.bufferOffset +=
+                hen_unpacked ? 4 * staging.size / 5 : UnpackDepthStencil(staging, format);
             stencil_copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
         }
 
@@ -946,8 +1038,68 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
             .src_rect = upload.texture_rect,
             .dst_rect = upload.texture_rect * res_scale,
         };
-        if ((type != SurfaceType::Color && type != SurfaceType::Texture) ||
-            !runtime.blit_helper.Filter(*this, blit)) {
+        if (!hen_source.empty()) {
+            const u32 size = hen_w * res_scale * hen_h * res_scale * 5;
+            const auto [data, offset, invalidate] = runtime.upload_buffer.Map(size, 16);
+            hen_scale_into(data);
+            const RecordParams scaled_params = {
+                .aspect = Aspect(),
+                .pipeline_flags = PipelineStageFlags(),
+                .src_access = AccessFlags(),
+                .src_image = Image(Type::Scaled),
+            };
+            scheduler.Record([buffer = runtime.upload_buffer.Handle(), scaled_params,
+                              rect = blit.dst_rect, level = upload.texture_level,
+                              offset](vk::CommandBuffer cmdbuf) {
+                std::array<vk::BufferImageCopy, 2> copies;
+                copies[0] = vk::BufferImageCopy{
+                    .bufferOffset = offset,
+                    .bufferRowLength = rect.GetWidth(),
+                    .bufferImageHeight = rect.GetHeight(),
+                    .imageSubresource{
+                        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+                        .mipLevel = level,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                    .imageOffset = {static_cast<s32>(rect.left), static_cast<s32>(rect.bottom), 0},
+                    .imageExtent = {rect.GetWidth(), rect.GetHeight(), 1},
+                };
+                copies[1] = copies[0];
+                copies[1].bufferOffset += static_cast<u64>(rect.GetWidth()) * rect.GetHeight() * 4;
+                copies[1].imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
+                const vk::ImageMemoryBarrier read_barrier = {
+                    .srcAccessMask = scaled_params.src_access,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = scaled_params.src_image,
+                    .subresourceRange = MakeSubresourceRange(scaled_params.aspect, level),
+                };
+                const vk::ImageMemoryBarrier write_barrier = {
+                    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .dstAccessMask = scaled_params.src_access,
+                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = scaled_params.src_image,
+                    .subresourceRange = MakeSubresourceRange(scaled_params.aspect, level),
+                };
+                cmdbuf.pipelineBarrier(scaled_params.pipeline_flags,
+                                       vk::PipelineStageFlagBits::eTransfer,
+                                       vk::DependencyFlagBits::eByRegion, {}, {}, read_barrier);
+                cmdbuf.copyBufferToImage(buffer, scaled_params.src_image,
+                                         vk::ImageLayout::eTransferDstOptimal, copies);
+                cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                       scaled_params.pipeline_flags,
+                                       vk::DependencyFlagBits::eByRegion, {}, {}, write_barrier);
+            });
+            runtime.upload_buffer.Commit(size);
+        } else if ((type != SurfaceType::Color && type != SurfaceType::Texture) ||
+                   !runtime.blit_helper.Filter(*this, blit)) {
             BlitScale(blit, true);
         }
     }
@@ -1028,14 +1180,88 @@ void Surface::UploadCustom(const VideoCore::Material* material, u32 level) {
 
 void Surface::Download(const VideoCore::BufferTextureCopy& download,
                        const VideoCore::StagingData& staging) {
+    bool hen_finished = false; // (the depth path below has done its own waiting)
     SCOPE_EXIT({
-        scheduler.Finish();
+        if (!hen_finished) {
+            HenGfxTimer hen_timer{HEN_GFX_DOWNLOAD_FINISH};
+            HenGfxTimer hen_depth_timer{pixel_format == PixelFormat::D24S8 ? HEN_GFX_DOWNLOAD_DEPTH
+                                                                           : HEN_GFX_KINDS};
+            scheduler.Finish();
+        }
         runtime.download_buffer.Commit(staging.size);
     });
 
     runtime.renderpass_cache.EndRendering();
 
     if (pixel_format == PixelFormat::D24S8) {
+#ifdef __SWITCH__
+        // (who asks for it: the 2nd, 100th and 1000th of a run)
+        static u32 depth_downloads;
+        if (++depth_downloads == 2 || depth_downloads == 100 || depth_downloads == 1000) {
+            hen_backtrace("a depth download");
+        }
+        static bool told;
+        if (!told) {
+            told = true;
+            std::printf("hen: gfx: first depth download: %ux%u of a %ux%u surface, scale %u, host format %s\n",
+                        download.texture_rect.GetWidth(), download.texture_rect.GetHeight(), width,
+                        height, static_cast<unsigned>(res_scale), vk::to_string(traits.native).c_str());
+        }
+#endif
+#ifdef __SWITCH__
+        // (Switch 2 port) A program that reads the depth buffer with its CPU (Ocarina of Time's
+        // lens flare, Super Smash Bros. in some matches: once a frame) made every such read
+        // wait for the GPU to finish everything drawn so far: 5 to 6 ms each, a quarter of the
+        // emulation thread's time and 73 to 76% speed in a Smash match. When the same part of
+        // the same surface was read less than 100 ms ago, the program is given what was copied
+        // out then (one frame old), and a copy of the present contents is recorded for the next
+        // read, without waiting. --sync-depth-reads: wait every time, as upstream does.
+        if (hen_depth_lag) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto& rect = download.texture_rect;
+            // (the slot for this part of the surface, or the one unused for the longest)
+            using HenDepthLag = TextureRuntime::HenDepthLag;
+            auto& hen_lags = runtime.hen_lags;
+            HenDepthLag* slot = &hen_lags[0];
+            bool same = false;
+            for (HenDepthLag& candidate : hen_lags) {
+                if (candidate.data != nullptr && candidate.addr == addr &&
+                    candidate.size == staging.size &&
+                    candidate.level == download.texture_level && candidate.left == rect.left &&
+                    candidate.top == rect.top && candidate.right == rect.right &&
+                    candidate.bottom == rect.bottom) {
+                    slot = &candidate;
+                    same = true;
+                    break;
+                }
+                if (candidate.time < slot->time) {
+                    slot = &candidate;
+                }
+            }
+            HenDepthLag& hen_lag = *slot;
+            const bool recent = same && now - hen_lag.time < std::chrono::milliseconds(100);
+            HenGfxTimer hen_timer{HEN_GFX_DOWNLOAD_FINISH};
+            HenGfxTimer hen_depth_timer{HEN_GFX_DOWNLOAD_DEPTH};
+            if (recent) {
+                scheduler.Wait(hen_lag.tick); // (submitted a frame ago: normally done already)
+                std::memcpy(staging.mapped.data(), hen_lag.data, staging.size);
+                hen_gfx_note(HEN_GFX_DOWNLOAD_LAGGED, 0);
+            }
+            const auto [data, offset, invalidate] = runtime.depth_lag_buffer.Map(staging.size, 16);
+            VideoCore::BufferTextureCopy copy = download;
+            copy.buffer_offset = offset;
+            runtime.blit_helper.DepthToBuffer(*this, runtime.depth_lag_buffer.Handle(), copy);
+            runtime.depth_lag_buffer.Commit(staging.size);
+            hen_lag = {data, addr, staging.size, download.texture_level, rect.left, rect.top, rect.right,
+                       rect.bottom, scheduler.CurrentTick(), now};
+            if (!recent) {
+                scheduler.Finish();
+                std::memcpy(staging.mapped.data(), data, staging.size);
+            }
+            hen_finished = true;
+            return;
+        }
+#endif
         runtime.blit_helper.DepthToBuffer(*this, runtime.download_buffer.Handle(), download);
         return;
     }
@@ -1361,7 +1587,12 @@ vk::Framebuffer Surface::Framebuffer(Type type) noexcept {
 void Surface::BlitScale(const VideoCore::TextureBlit& blit, bool up_scale) {
     const bool is_depth_stencil = pixel_format == PixelFormat::D24S8;
     if (is_depth_stencil && !traits.blit_support) {
-        LOG_WARNING(Render_Vulkan, "Depth scale unsupported by hardware");
+        // (Switch 2 port) The device can't blit this format (NVK here: D24S8), so a depth
+        // surface the program wrote was never scaled up, and what was then drawn against it
+        // used stale depth. Draw it across with the shader that BlitTextures uses.
+        if (!hen_depth_scale_blit || !runtime.blit_helper.BlitDepthStencilScale(*this, blit, up_scale)) {
+            LOG_WARNING(Render_Vulkan, "Depth scale unsupported by hardware");
+        }
         return;
     }
 

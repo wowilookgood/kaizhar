@@ -6,6 +6,73 @@
 
 namespace Pica::Shader {
 
+namespace {
+using TevOperation = Pica::TexturingRegs::TevStageConfig::Operation;
+
+constexpr bool TevOpUsesSource2(TevOperation op) {
+    return op != TevOperation::Replace;
+}
+constexpr bool TevOpUsesSource3(TevOperation op) {
+    return op == TevOperation::Lerp || op == TevOperation::MultiplyThenAdd ||
+           op == TevOperation::AddThenMultiply;
+}
+
+// (hen; the idea is dekopon's, PalindromicBreadLoaf/dekopon, GPLv2.) Zeroes the sources and
+// modifiers a stage's operations never read. Both generators write the three operands of
+// every stage out, but the combiner expression only uses those of its operation, so stages
+// that differ in an unread operand compute the same thing. Stage 0 keeps its third source:
+// it has no previous stage, and the generators read source 3 where a source says Previous.
+void CanonicalizeTevStage(TevStageConfigRaw& stage, std::size_t index) {
+    const auto color_op = static_cast<TevOperation>(stage.ops_raw & 0xF);
+    const auto alpha_op = static_cast<TevOperation>((stage.ops_raw >> 16) & 0xF);
+    const bool source3_is_dead = index != 0;
+    if (!TevOpUsesSource2(color_op)) {
+        stage.sources_raw &= ~(0xFu << 4);
+        stage.modifiers_raw &= ~(0xFu << 4);
+    }
+    if (!TevOpUsesSource3(color_op) && source3_is_dead) {
+        stage.sources_raw &= ~(0xFu << 8);
+        stage.modifiers_raw &= ~(0xFu << 8);
+    }
+    if (color_op == TevOperation::Dot3_RGBA) {
+        // (the colour result is the alpha too: no alpha operand or operation is read)
+        stage.sources_raw &= 0xFFF;
+        stage.modifiers_raw &= 0xFFF;
+        stage.ops_raw &= 0xF;
+        return;
+    }
+    if (!TevOpUsesSource2(alpha_op)) {
+        stage.sources_raw &= ~(0xFu << 20);
+        stage.modifiers_raw &= ~(0x7u << 16);
+    }
+    if (!TevOpUsesSource3(alpha_op) && source3_is_dead) {
+        stage.sources_raw &= ~(0xFu << 24);
+        stage.modifiers_raw &= ~(0x7u << 20);
+    }
+}
+} // Anonymous namespace
+
+void FSConfig::Canonicalize(const Profile& profile) {
+    ApplyProfile(profile);
+    // These exist only for ApplyProfile to emulate what a device lacks; with the feature
+    // present no generator reads them.
+    if (profile.has_logic_op) {
+        framebuffer.requested_logic_op = {};
+    }
+    if (profile.is_vulkan || profile.has_blend_minmax_factor) {
+        framebuffer.requested_rgb_blend = {};
+        framebuffer.requested_alpha_blend = {};
+    }
+    if (profile.has_custom_border_color) {
+        for (auto& wrap : texture.requested_wrap) {
+            wrap = {};
+        }
+    }
+    for (std::size_t i = 0; i < texture.tev_stages.size(); i++) {
+        CanonicalizeTevStage(texture.tev_stages[i], i);
+    }
+}
+
 FramebufferConfig::FramebufferConfig(const Pica::RegsInternal& regs) {
     const auto& output_merger = regs.framebuffer.output_merger;
     scissor_test_mode.Assign(regs.rasterizer.scissor_test.mode);

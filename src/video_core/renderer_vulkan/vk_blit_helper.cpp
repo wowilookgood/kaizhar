@@ -327,8 +327,13 @@ BlitHelper::~BlitHelper() {
     device.destroySampler(nearest_sampler);
 }
 
+// (Switch 2 port) src_width and src_height: the size of the image sampled. The texture
+// coordinates were the source rectangle in pixels, for a sampler that takes 0..1: every
+// pixel past the first row and column read the image's edge. (Only reached where the device
+// can't blit depth and stencil itself, as NVK here.)
 void BindBlitState(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
-                   const VideoCore::TextureBlit& blit, const Surface& dest) {
+                   const VideoCore::TextureBlit& blit, const Surface& dest, u32 src_width,
+                   u32 src_height) {
     const vk::Offset2D offset{
         .x = std::min<s32>(blit.dst_rect.left, blit.dst_rect.right),
         .y = std::min<s32>(blit.dst_rect.bottom, blit.dst_rect.top),
@@ -349,12 +354,12 @@ void BindBlitState(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
         .offset = offset,
         .extent = extent,
     };
-    const float scale_x = static_cast<float>(blit.src_rect.GetWidth());
-    const float scale_y = static_cast<float>(blit.src_rect.GetHeight());
+    const float scale_x = static_cast<float>(blit.src_rect.GetWidth()) / src_width;
+    const float scale_y = static_cast<float>(blit.src_rect.GetHeight()) / src_height;
     const PushConstants push_constants{
         .tex_scale = {scale_x, scale_y},
-        .tex_offset = {static_cast<float>(blit.src_rect.left),
-                       static_cast<float>(blit.src_rect.bottom)},
+        .tex_offset = {static_cast<float>(blit.src_rect.left) / src_width,
+                       static_cast<float>(blit.src_rect.bottom) / src_height},
     };
     cmdbuf.setViewport(0, viewport);
     cmdbuf.setScissor(0, scissor);
@@ -387,15 +392,60 @@ bool BlitHelper::BlitDepthStencil(Surface& source, Surface& dest,
     };
     renderpass_cache.BeginRendering(depth_pass);
 
-    scheduler.Record([blit, descriptor_set, &dest, this](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([blit, descriptor_set, &dest, this, src_width = source.GetScaledWidth(),
+                      src_height = source.GetScaledHeight()](vk::CommandBuffer cmdbuf) {
         const vk::PipelineLayout layout = two_textures_pipeline_layout;
 
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, depth_blit_pipeline);
         cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, descriptor_set, {});
-        BindBlitState(cmdbuf, layout, blit, dest);
+        BindBlitState(cmdbuf, layout, blit, dest, src_width, src_height);
         cmdbuf.draw(3, 1, 0, 0);
     });
     scheduler.MakeDirty(StateFlags::Pipeline);
+    return true;
+}
+
+bool BlitHelper::BlitDepthStencilScale(Surface& surface, const VideoCore::TextureBlit& blit,
+                                       bool up_scale) {
+    if (!instance.IsShaderStencilExportSupported()) {
+        return false;
+    }
+    const auto src_type = up_scale ? Type::Base : Type::Scaled;
+    const auto dst_type = up_scale ? Type::Scaled : Type::Base;
+
+    const vk::Rect2D dst_render_area = {
+        .offset = {0, 0},
+        .extent = {up_scale ? surface.GetScaledWidth() : surface.GetWidth(),
+                   up_scale ? surface.GetScaledHeight() : surface.GetHeight()},
+    };
+
+    const auto descriptor_set = two_textures_provider.Commit();
+    update_queue.AddImageSampler(descriptor_set, 0, 0, surface.ImageView(ViewType::Depth, src_type),
+                                 nearest_sampler);
+    update_queue.AddImageSampler(descriptor_set, 1, 0,
+                                 surface.ImageView(ViewType::Stencil, src_type), nearest_sampler);
+
+    const RenderPass depth_pass = {
+        .framebuffer = surface.Framebuffer(dst_type),
+        .render_pass =
+            renderpass_cache.GetRenderpass(PixelFormat::Invalid, surface.pixel_format, false),
+        .render_area = dst_render_area,
+    };
+    renderpass_cache.BeginRendering(depth_pass);
+
+    scheduler.Record([blit, descriptor_set, &surface, this,
+                      src_width = up_scale ? surface.GetWidth() : surface.GetScaledWidth(),
+                      src_height = up_scale ? surface.GetHeight() : surface.GetScaledHeight()](
+                         vk::CommandBuffer cmdbuf) {
+        const vk::PipelineLayout layout = two_textures_pipeline_layout;
+
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, depth_blit_pipeline);
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, descriptor_set, {});
+        BindBlitState(cmdbuf, layout, blit, surface, src_width, src_height);
+        cmdbuf.draw(3, 1, 0, 0);
+    });
+    scheduler.MakeDirty(StateFlags::Pipeline);
+    renderpass_cache.EndRendering();
     return true;
 }
 

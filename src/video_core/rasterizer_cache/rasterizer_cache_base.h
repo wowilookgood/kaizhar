@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <functional>
 #include <list>
 #include <optional>
@@ -37,6 +39,10 @@ enum class TextureFilter : u32;
 }
 
 namespace VideoCore {
+
+// (Switch 2 port) video_core/hen_gpu_thread.cpp
+extern const u64* hen_dirty_pages_live;
+extern bool hen_invalidate_small;
 
 enum class ScaleMatch {
     Exact,   ///< Only accept same res scale
@@ -225,6 +231,57 @@ private:
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;
     SurfaceMap dirty_regions;
+    // (Switch 2 port) One bit a 4 KiB page: set when dirty_regions may have something on it.
+    // FlushRegion looks here first: a program reading memory next to its textures (Xenoblade
+    // Chronicles 3D: 4.4 million such reads in 5 s) asked for a flush every time, and nearly
+    // none of that memory had been drawn to. Index: the page number's low 17 bits (VRAM,
+    // FCRAM and the New 3DS's extra RAM do not collide).
+    // With --gpu-thread the emulation thread reads this while the GPU thread owns the cache
+    // (video_core/hen_gpu_thread.cpp, rule 5): whole words, stored and loaded as such.
+    std::array<u64, 2048> hen_dirty_pages{};
+    void HenDirtyStore(u64 page, bool dirty) {
+        u64& word = hen_dirty_pages[(page & 0x1FFFF) >> 6];
+        const u64 bit = 1ull << (page & 63);
+        if (((word & bit) != 0) == dirty) {
+            return;
+        }
+        // (release: a cleared bit says the download's bytes are in guest memory, and the
+        // reader on the other thread must see those bytes if it sees the bit)
+        __atomic_store_n(&word, dirty ? (word | bit) : (word & ~bit), __ATOMIC_RELEASE);
+        // (hen_read_table, core/memory.h: the entries generated code reads through follow
+        // the bit, in this order; they are tested in place of it and promise the same)
+        memory.HenReadTableUpdate(static_cast<PAddr>(page << 12));
+    }
+    void HenDirtySet(PAddr lower, PAddr upper) {
+        if (upper <= lower) {
+            return;
+        }
+        for (u64 page = lower >> 12; page <= (static_cast<u64>(upper) - 1) >> 12; page++) {
+            HenDirtyStore(page, true);
+        }
+    }
+    /// After regions were removed: each page's bit from what dirty_regions still has on it.
+    void HenDirtyRefresh(PAddr lower, PAddr upper) {
+        if (upper <= lower) {
+            return;
+        }
+        for (u64 page = lower >> 12; page <= (static_cast<u64>(upper) - 1) >> 12; page++) {
+            const SurfaceInterval whole{static_cast<PAddr>(page << 12),
+                                        static_cast<PAddr>((page << 12) + 0xFFF) + 1};
+            if (page == 0xFFFFF) {
+                continue; // (the interval above would wrap)
+            }
+            HenDirtyStore(page, boost::icl::intersects(dirty_regions, whole));
+        }
+    }
+    bool HenDirtyAny(PAddr addr, u32 size) const {
+        for (u64 page = addr >> 12; page <= (static_cast<u64>(addr) + size - 1) >> 12; page++) {
+            if (hen_dirty_pages[(page & 0x1FFFF) >> 6] & (1ull << (page & 63))) {
+                return true;
+            }
+        }
+        return false;
+    }
     PageMap cached_pages;
     u32 resolution_scale_factor;
     FramebufferParams fb_params;

@@ -5,6 +5,8 @@
 // Include the vulkan platform specific header
 #if defined(ANDROID)
 #define VK_USE_PLATFORM_ANDROID_KHR
+#elif defined(__SWITCH__)
+#define VK_USE_PLATFORM_VI_NN
 #elif defined(WIN32)
 #define VK_USE_PLATFORM_WIN32_KHR
 #elif defined(__APPLE__)
@@ -24,6 +26,14 @@
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+
+#ifdef __SWITCH__
+// The statically linked driver's entry point (vk_common.h sets VK_NO_PROTOTYPES), and the
+// frontend's choice between it and a call tracer (citra_switch/main.cpp, --vk-trace).
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
+                                                                          const char* name);
+extern "C" PFN_vkGetInstanceProcAddr hen_vulkan_entry_point;
+#endif
 
 namespace Vulkan {
 
@@ -130,7 +140,18 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::EmuWindow& e
     vk::SurfaceKHR surface{};
     vk::Result res;
 
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(VK_USE_PLATFORM_VI_NN)
+    if (window_info.type == Frontend::WindowSystemType::Switch) {
+        const vk::ViSurfaceCreateInfoNN vi_ci = {
+            .window = window_info.render_surface,
+        };
+
+        if (instance.createViSurfaceNN(&vi_ci, nullptr, &surface) != vk::Result::eSuccess) {
+            LOG_CRITICAL(Render_Vulkan, "Failed to initialize VI surface");
+            UNREACHABLE();
+        }
+    }
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
     if (window_info.type == Frontend::WindowSystemType::Windows) {
         const vk::Win32SurfaceCreateInfoKHR win32_ci = {
             .hinstance = nullptr,
@@ -226,7 +247,11 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
     switch (window_type) {
     case Frontend::WindowSystemType::Headless:
         break;
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(VK_USE_PLATFORM_VI_NN)
+    case Frontend::WindowSystemType::Switch:
+        extensions.push_back(VK_NN_VI_SURFACE_EXTENSION_NAME);
+        break;
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
     case Frontend::WindowSystemType::Windows:
         extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
         break;
@@ -288,6 +313,11 @@ vk::InstanceCreateFlags GetInstanceFlags() {
 vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
                                   Frontend::WindowSystemType window_type, bool enable_validation,
                                   bool dump_command_buffers) {
+#ifdef __SWITCH__
+    (void)library;
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(hen_vulkan_entry_point ? hen_vulkan_entry_point
+                                                              : &::vkGetInstanceProcAddr);
+#else
     if (!library.IsLoaded()) {
         throw std::runtime_error("Failed to load Vulkan driver library");
     }
@@ -298,6 +328,7 @@ vk::UniqueInstance CreateInstance(const Common::DynamicLibrary& library,
         throw std::runtime_error("Failed GetSymbol vkGetInstanceProcAddr");
     }
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
+#endif
 
     const u32 available_version = VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
                                       ? vk::enumerateInstanceVersion()

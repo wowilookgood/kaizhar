@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
+#include "common/hen_stats.h"
+#include "common/hen_crumb.h"
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/microprofile.h"
@@ -89,9 +92,19 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> 
     primitive_assembler.Reconfigure(PipelineRegs::TriangleTopology::List);
 }
 
+#ifdef __SWITCH__
+// (Switch 2 port) Vertex shaders on the CPU: a draw whose pipeline is still being compiled has
+// its vertex shader run here instead (the rasterizer's stand-in pipelines). What that costs is
+// measured for the rasterizer, which decides how many such draws a frame can afford.
+extern "C" unsigned long long hen_jit_now_ns(void);
+extern "C" unsigned long long hen_cpu_shade_ns_per_vertex; // (measured: for the report)
+extern "C" long long hen_cpu_shade_debt_ns;
+#endif
+
 PicaCore::~PicaCore() = default;
 
 void PicaCore::InitializeRegs() {
+    HEN_CRUMB("PicaCore::InitializeRegs");
     // Values initialized by GSP
     regs.internal.irq_autostop = 1;
     regs.internal.irq_mask = 0xFFFFFFF0;
@@ -129,10 +142,12 @@ void PicaCore::InitializeRegs() {
 }
 
 void PicaCore::BindRasterizer(VideoCore::RasterizerInterface* rasterizer) {
+    HEN_CRUMB("PicaCore::BindRasterizer");
     this->rasterizer = rasterizer;
 }
 
 void PicaCore::SetInterruptHandler(Service::GSP::InterruptHandler& signal_interrupt) {
+    HEN_CRUMB("PicaCore::SetInterruptHandler");
     this->signal_interrupt = signal_interrupt;
 }
 
@@ -375,6 +390,7 @@ static bool any_byte_match(u32 a, u32 b) {
 
 // Handle registers which our backend support batch writes.
 void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
+    HEN_CRUMB("PicaCore::HandleSpecialRegBatch");
     switch (id) {
     case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]):
     case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[1]):
@@ -575,6 +591,7 @@ void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
 // registers that support batch processing can be submitted
 // individually.
 void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
+    HEN_CRUMB("PicaCore::HandleSpecialReg");
     switch (id) {
     // Trigger IRQ
     case PICA_REG_INDEX(irq_request):
@@ -854,6 +871,7 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
 // Handle batch register writes
 void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                      bool& stop_requested) {
+    HEN_CRUMB("PicaCore::WriteInternalRegBatch");
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
         // Writes to OOB registers are no-op.
         LOG_DEBUG(HW_GPU,
@@ -886,6 +904,7 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
 // Handle sequential register writes.
 void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, u32 count, u32 mask,
                                           bool& stop_requested) {
+    HEN_CRUMB("PicaCore::WriteInternalRegSequential");
     if (id + count > RegsInternal::NUM_REGS) [[unlikely]] {
         // Writes to OOB registers are no-op.
         LOG_DEBUG(
@@ -939,6 +958,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
 
 // Handle individual command write.
 void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested) {
+    HEN_CRUMB("PicaCore::WriteInternalReg");
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
         // Writes to OOB registers are no-op.
         LOG_DEBUG(
@@ -974,6 +994,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
 }
 
 void PicaCore::SubmitImmediate(u32 value) {
+    HEN_CRUMB("PicaCore::SubmitImmediate");
     // Push to word to the queue. This returns true when a full attribute is formed.
     if (!immediate.queue.Push(value)) {
         return;
@@ -1007,6 +1028,7 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    HEN_CRUMB("PicaCore::DrawImmediate");
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -1045,6 +1067,7 @@ void PicaCore::DrawImmediate() {
 }
 
 void PicaCore::DrawArrays(bool is_indexed) {
+    HEN_CRUMB("PicaCore::DrawArrays");
     MICROPROFILE_SCOPE(GPU_Drawing);
 
     // Track vertex in the debug recorder.
@@ -1084,7 +1107,26 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
 
     // We cannot accelerate the draw, so load and execute the vertex shader for each vertex.
-    LoadVertices(is_indexed);
+    {
+        HenGfxTimer hen_timer{HEN_GFX_SOFTWARE_DRAW};
+        hen_gfx_note(HEN_GFX_SOFTWARE_VERTICES, regs.internal.pipeline.num_vertices);
+#ifdef __SWITCH__
+        // (what a vertex costs here, measured: the rasterizer's budget for draws shaded on
+        // the CPU goes by it, so it follows the helper threads and the CPU's clock)
+        const unsigned long long hen_start = hen_jit_now_ns();
+        LoadVertices(is_indexed);
+        // What this draw cost goes on the rasterizer's debt for draws shaded on the CPU
+        // (vk_rasterizer.cpp, AccelerateDrawBatchInternal): measured, not estimated.
+        const unsigned long long hen_took = hen_jit_now_ns() - hen_start;
+        hen_cpu_shade_debt_ns += static_cast<long long>(hen_took);
+        const u32 hen_count = regs.internal.pipeline.num_vertices;
+        if (hen_count >= 64) {
+            hen_cpu_shade_ns_per_vertex = (hen_cpu_shade_ns_per_vertex * 7 + hen_took / hen_count) / 8;
+        }
+#else
+        LoadVertices(is_indexed);
+#endif
+    }
 
     // Draw emitted triangles.
     rasterizer->DrawTriangles();
@@ -1095,6 +1137,7 @@ void PicaCore::DrawArrays(bool is_indexed) {
 }
 
 void PicaCore::LoadVertices(bool is_indexed) {
+    HEN_CRUMB("PicaCore::LoadVertices");
     // Read and validate vertex information from the loaders
     const auto& pipeline = regs.internal.pipeline;
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
@@ -1182,6 +1225,7 @@ void PicaCore::LoadVertices(bool is_indexed) {
 }
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {
+    HEN_CRUMB("PicaCore::GuessCmdRenderProperties");
     // Initialize command list tracking.
     const u8* head = memory.GetPhysicalPointer(list);
     cmd_list.Reset(list, head, size);

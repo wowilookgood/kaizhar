@@ -410,6 +410,10 @@ struct FSConfig {
         texture.ApplyProfile(profile);
     }
 
+    /// (hen) Applies the profile, then zeroes what the generated shader cannot depend on, so
+    /// that configurations that give the same shader have the same hash (pica_fs_config.cpp).
+    void Canonicalize(const Profile& profile);
+
     bool operator==(const FSConfig& other) const noexcept {
         return std::memcmp(this, &other, sizeof(FSConfig)) == 0;
     }

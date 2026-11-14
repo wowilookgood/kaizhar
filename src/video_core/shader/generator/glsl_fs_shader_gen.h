@@ -5,6 +5,7 @@
 #pragma once
 
 #include "video_core/shader/generator/pica_fs_config.h"
+#include "video_core/shader/generator/shader_uniforms.h"
 
 namespace Pica::Shader::Generator::GLSL {
 
@@ -100,5 +101,17 @@ private:
  */
 std::string GenerateFragmentShader(const FSConfig& config, const UserConfig& user,
                                    const Profile& profile);
+
+/// (hen) One fragment shader for every configuration it supports: it reads the configuration
+/// from the uniform block (FSUniformData::hen_cfg) and does at run time what a generated
+/// shader has decided when it was written. Slower per pixel, there from the start: for a draw
+/// whose own fragment shader is still being compiled. Vulkan only.
+std::string GenerateGenericFragmentShader(const Profile& profile);
+
+/// (hen) Whether the generic fragment shader draws this configuration as its own would.
+bool GenericFragmentSupports(const FSConfig& config, const UserConfig& user);
+
+/// (hen) Writes the configuration into the uniform data, as the generic shader reads it.
+void FillGenericFragmentConfig(const FSConfig& config, FSUniformData& data);
 
 } // namespace Pica::Shader::Generator::GLSL

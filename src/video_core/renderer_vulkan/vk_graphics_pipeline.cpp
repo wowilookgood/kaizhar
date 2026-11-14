@@ -2,16 +2,81 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <unordered_map>
 #include <boost/container/static_vector.hpp>
 
 #include "common/alignment.h"
 #include "common/hash.h"
+#include <mutex>
+#include <unordered_set>
+#include "common/hen_stats.h"
 #include "common/microprofile.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+#ifdef __SWITCH__
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <utility>
+#include <vector>
+#include <set>
+#if HEN_DEV
+extern "C" int hen_pipe_log; // hen/jit/hen_jit.c: --pipe-log
+extern "C" void hen_jit_profile_retarget(void);
+#else
+static constexpr int hen_pipe_log = 0;
+#endif
+extern "C" int hen_pipeline_libraries;
+extern "C" int hen_pipe_dedup; // --no-pipe-dedup
+extern "C" unsigned long long hen_pipe_parked;
+/// How often a pre-rasterization or fragment part is asked of the driver that is identical to
+/// one asked before (same shader modules, state, layout and render pass), and the time those
+/// requests take: what keeping the parts and sharing them between pipelines would save.
+static std::mutex hen_repeat_mutex;
+static std::unordered_set<u64> hen_part_seen[2];
+// The generic fragment shader's part of a pipeline, kept for reuse. The driver keeps the
+// vertex side of a pipeline in its cache and gives a repeat back in microseconds, but a
+// repeat of a fragment shader part costs as much as the first. (Keeping every fragment
+// shader's part was tried on 2026-11-13: fewer requests to the driver, time and counts
+// unchanged.) Keyed by the fragment shader's id (not its module: a handle can come back for
+// another shader), layout, render pass and sample count, and by the depth state only where
+// that is not dynamic state. Emptied when the pipeline cache goes (HenDestroyPipelineParts).
+extern "C" unsigned long long hen_part_cache_hits;
+static std::mutex hen_part_cache_mutex;
+static std::unordered_map<u64, VkPipeline> hen_part_cache_map;
+static std::array<std::atomic<u64>, 2> hen_part_requests{}, hen_part_repeats{}, hen_part_repeat_ns{};
+extern "C" void hen_gfx_part_repeat_stats(unsigned long long* out) {
+    for (int i = 0; i < 2; i++) {
+        out[3 * i] = hen_part_requests[i].exchange(0);
+        out[3 * i + 1] = hen_part_repeats[i].exchange(0);
+        out[3 * i + 2] = hen_part_repeat_ns[i].exchange(0);
+    }
+}
+static u64 HenHashBytes(u64 h, const void* data, std::size_t size) {
+    const u8* bytes = static_cast<const u8*>(data);
+    for (std::size_t i = 0; i < size; i++) {
+        h = (h ^ bytes[i]) * 0x100000001b3ull;
+    }
+    return h;
+}
+/// Time in each of the four parts of pipelines the driver had to compile (not its cache hits).
+static std::array<std::atomic<u64>, 4> hen_part_ns{}, hen_part_count{};
+extern "C" void hen_gfx_part_stats(unsigned long long* out) {
+    for (int i = 0; i < 4; i++) {
+        out[2 * i] = hen_part_count[i].exchange(0);
+        out[2 * i + 1] = hen_part_ns[i].exchange(0);
+    }
+}
+#endif
+
+#include <chrono>
+extern "C" unsigned long long hen_standin_stats[7]; // hen_jit.c
+extern "C" unsigned long long hen_standin_part_ns[6];
+extern "C" __thread int hen_standin_build;
 
 namespace Vulkan {
 
@@ -81,17 +146,58 @@ GraphicsPipeline::GraphicsPipeline(const Instance& instance_, RenderManager& ren
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
-bool GraphicsPipeline::TryBuild(bool wait_built) {
+#ifdef __SWITCH__
+void HenDestroyPipelineParts(vk::Device device) {
+    std::scoped_lock lock{hen_part_cache_mutex};
+    for (const auto& [key, part] : hen_part_cache_map) {
+        device.destroyPipeline(vk::Pipeline{part});
+    }
+    hen_part_cache_map.clear();
+}
+#endif
+
+#ifdef __SWITCH__
+namespace {
+std::atomic<unsigned long long> hen_count[HEN_GFX_KINDS], hen_ns[HEN_GFX_KINDS],
+    hen_max[HEN_GFX_KINDS];
+}
+extern "C" void hen_gfx_note(int kind, unsigned long long ns) {
+    if (kind < 0 || kind >= HEN_GFX_KINDS) {
+        return;
+    }
+    hen_count[kind]++;
+    hen_ns[kind] += ns;
+    if (ns > hen_max[kind].load(std::memory_order_relaxed)) {
+        hen_max[kind].store(ns, std::memory_order_relaxed);
+    }
+}
+/// Adds to a kind's count only (events counted elsewhere without atomics).
+extern "C" void hen_gfx_add(int kind, unsigned long long count) {
+    if (kind >= 0 && kind < HEN_GFX_KINDS) {
+        hen_count[kind] += count;
+    }
+}
+/// Per kind: count, total and longest time in nanoseconds since the last call.
+extern "C" void hen_gfx_stats(unsigned long long* out) {
+    for (int k = 0; k < HEN_GFX_KINDS; k++) {
+        out[3 * k] = hen_count[k].exchange(0);
+        out[3 * k + 1] = hen_ns[k].exchange(0);
+        out[3 * k + 2] = hen_max[k].exchange(0);
+    }
+}
+#endif
+
+bool GraphicsPipeline::TryBuild(bool wait_built, bool fast_lane) {
     // The pipeline is currently being compiled. We can either wait for it
     // or skip the draw.
     if (is_pending) {
-        return wait_built;
+        return wait_built && !fast_lane;
     }
 
     // If the shaders haven't been compiled yet, we cannot proceed.
     const bool shaders_pending = std::any_of(
         stages.begin(), stages.end(), [](Shader* shader) { return shader && !shader->IsDone(); });
-    if (!wait_built && shaders_pending) {
+    if ((!wait_built || fast_lane) && shaders_pending) {
         return false;
     }
 
@@ -100,14 +206,116 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
         return true;
     }
 
+#ifdef __SWITCH__
+    // (Switch 2 port) fast_lane: the pipeline for a draw whose vertices were shaded on the CPU
+    // because its own pipeline is compiling. It has no vertex shader of the program's, so it
+    // takes milliseconds, but building it here stood the emulation thread still at scene
+    // starts (several fragment shaders in one frame, 140 ms). It is built by the shader
+    // workers, which are not behind the slow pipelines, and the draw is left out until it is
+    // done: a frame or two.
+    if (fast_lane && hen_fast_worker != nullptr) {
+        if (!is_pending && !shaders_pending) {
+            hen_fast_worker->QueueWork([this] {
+                const auto before = std::chrono::steady_clock::now();
+                hen_standin_build = 1;
+                Build();
+                hen_standin_build = 0;
+                const unsigned long long took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now() - before)
+                                                    .count();
+                __atomic_fetch_add(&hen_standin_stats[3], 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&hen_standin_stats[4], took, __ATOMIC_RELAXED);
+                if (took > hen_standin_stats[5]) {
+                    hen_standin_stats[5] = took;
+                }
+            });
+            is_pending = true;
+        }
+        return false;
+    }
+    // (Switch 2 port) A pipeline the caller is going to wait for is built here, on its thread,
+    // rather than behind whatever the workers have queued: the pipelines for vertices shaded on
+    // the CPU take about 13 ms to build but waited over 600 ms behind the program's vertex
+    // shaders (260 ms each on this driver) in a first launch.
+    // The same when its shaders are still being compiled (by the shader workers, which are
+    // not behind the pipelines): Build waits for them, a few tens of milliseconds at most.
+    if (wait_built) {
+        Build();
+        return true;
+    }
+#endif
+
     // Fallback to (a)synchronous compilation
+#ifdef __SWITCH__
+    // (Switch 2 port) One compile of a vertex shader at a time. The driver takes 150 to 700 ms
+    // over the vertex side of a pipeline and keeps the result, but it does not notice that the
+    // same shader is already being compiled on another thread: every pipeline that asked for
+    // it in the meantime compiled it again. A first launch of Pokemon Omega Ruby compiled 89
+    // vertex sides for 11 vertex shaders, 8 s of work. So the first pipeline with a given
+    // vertex and geometry shader builds; the others wait in a list and are queued again when
+    // it is done, by which time the driver has their vertex side ready.
+    worker->QueueWork([this] {
+#if HEN_DEV
+        hen_jit_profile_retarget();
+#endif
+        struct InFlight {
+            std::mutex mutex;
+            std::map<std::pair<Shader*, Shader*>, std::vector<GraphicsPipeline*>> waiting;
+        };
+        static InFlight in_flight;
+        const std::pair<Shader*, Shader*> key{stages[0], stages[2]};
+        if (hen_pipe_dedup) {
+            std::scoped_lock lock{in_flight.mutex};
+            const auto it = in_flight.waiting.find(key);
+            if (it != in_flight.waiting.end()) {
+                it->second.push_back(this);
+                hen_pipe_parked++; // (under the lock; reported by main.cpp)
+                return;
+            }
+            in_flight.waiting.emplace(key, std::vector<GraphicsPipeline*>{});
+        }
+        Build();
+        if (hen_pipe_dedup) {
+            std::vector<GraphicsPipeline*> others;
+            {
+                std::scoped_lock lock{in_flight.mutex};
+                const auto it = in_flight.waiting.find(key);
+                others = std::move(it->second);
+                in_flight.waiting.erase(it);
+            }
+            for (GraphicsPipeline* other : others) {
+                other->worker->QueueWork([other] { other->Build(); });
+            }
+        }
+    });
+#else
     worker->QueueWork([this] { Build(); });
+#endif
     is_pending = true;
     return wait_built;
 }
 
+#ifdef __SWITCH__
+extern "C" void hen_boost_note_work(unsigned long long ns); // hen/jit/hen_jit.c: the loading boost
+extern "C" unsigned long long hen_jit_now_ns(void);
+namespace {
+struct HenBoostBuildNote {
+    unsigned long long start = hen_jit_now_ns();
+    ~HenBoostBuildNote() {
+        const unsigned long long took = hen_jit_now_ns() - start;
+        if (took > 3'000'000ull) {
+            hen_boost_note_work(took); // (a pipeline that had to be compiled: more usually follow)
+        }
+    }
+};
+} // namespace
+#endif
+
 bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     MICROPROFILE_SCOPE(Vulkan_Pipeline);
+#ifdef __SWITCH__
+    const HenBoostBuildNote hen_boost_note;
+#endif
 
     const u32 stride_alignment = instance.GetMinVertexStrideAlignment();
     std::array<vk::VertexInputBindingDescription, MAX_VERTEX_BINDINGS> bindings;
@@ -282,8 +490,237 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         pipeline_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
     }
 
+    const auto hen_start = std::chrono::steady_clock::now();
+#ifdef __SWITCH__
+    // (Azahar's Switch 2 port) The pipeline from four separately compiled parts
+    // (VK_EXT_graphics_pipeline_library), linked without cross-stage optimisation. Measured on
+    // the Switch 2's driver over 44 pipelines of a first launch: the whole pipeline at once
+    // took 208 ms on average; its vertex shader part 22 ms, its fragment shader part 8 ms,
+    // the two interface parts and the link under 0.1 ms. The driver optimises a whole
+    // pipeline's stages against each other, so it compiled the vertex shader again for every
+    // new fragment shader or state; the parts are compiled alone and cached alone.
+    if (hen_pipeline_libraries && instance.IsGraphicsPipelineLibrarySupported()) {
+        const vk::Device device = instance.GetDevice();
+        const vk::PipelineCreateFlags fail_flag =
+            fail_on_compile_required ? vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT
+                                     : vk::PipelineCreateFlags{};
+        std::array<vk::PipelineShaderStageCreateInfo, MAX_SHADER_STAGES> pre{}, frag{};
+        u32 pre_count = 0, frag_count = 0;
+        for (u32 i = 0; i < shader_count; i++) {
+            if (shader_stages[i].stage == vk::ShaderStageFlagBits::eFragment) {
+                frag[frag_count++] = shader_stages[i];
+            } else {
+                pre[pre_count++] = shader_stages[i];
+            }
+        }
+        std::array<vk::UniquePipeline, 4> owned;
+        std::array<vk::Pipeline, 4> borrowed{}; // (from the cache of parts: not ours to destroy)
+        bool compile_required = false, failed = false;
+        const auto make = [&](std::size_t slot, vk::GraphicsPipelineLibraryFlagBitsEXT which,
+                              vk::GraphicsPipelineCreateInfo create) {
+            if (compile_required || failed) {
+                return;
+            }
+            u64 cache_key = 0;
+            // (the generic fragment shader: it is the one part worth keeping, tens of
+            // milliseconds to compile and wanted again with every blend and depth state)
+            if (slot == 2 && info.state.shader_ids[1] == HEN_GENERIC_FS_ID) {
+                cache_key = 0xcbf29ce484222325ull;
+                cache_key = HenHashBytes(cache_key, &info.state.shader_ids[1],
+                                         sizeof(info.state.shader_ids[1])); // (ProgramType::FS)
+                cache_key = HenHashBytes(cache_key, &pipeline_info.layout, sizeof(pipeline_info.layout));
+                cache_key = HenHashBytes(cache_key, &pipeline_info.renderPass,
+                                         sizeof(pipeline_info.renderPass));
+                cache_key = HenHashBytes(cache_key, &multisampling.rasterizationSamples,
+                                         sizeof(multisampling.rasterizationSamples));
+                if (!instance.IsExtendedDynamicStateSupported()) {
+                    cache_key = HenHashBytes(cache_key, &info.state.depth_stencil,
+                                             sizeof(info.state.depth_stencil));
+                }
+                cache_key |= 1;
+                std::scoped_lock lock{hen_part_cache_mutex};
+                if (const auto found = hen_part_cache_map.find(cache_key);
+                    found != hen_part_cache_map.end()) {
+                    borrowed[slot] = vk::Pipeline{found->second};
+                    hen_part_cache_hits++;
+                    return;
+                }
+            }
+            const vk::GraphicsPipelineLibraryCreateInfoEXT part{.flags = which};
+            create.pNext = &part;
+            create.flags = vk::PipelineCreateFlagBits::eLibraryKHR | fail_flag;
+            const auto part_start = std::chrono::steady_clock::now();
+            create.layout = pipeline_info.layout;
+            create.renderPass = pipeline_info.renderPass;
+            create.pDynamicState = &dynamic_info;
+            bool hen_repeat = false;
+            if (slot == 1 || slot == 2) {
+                u64 key = 0xcbf29ce484222325ull;
+                for (u32 i = 0; i < create.stageCount; i++) {
+                    key = HenHashBytes(key, &create.pStages[i].module, sizeof(create.pStages[i].module));
+                    key = HenHashBytes(key, &create.pStages[i].stage, sizeof(create.pStages[i].stage));
+                }
+                key = HenHashBytes(key, &create.layout, sizeof(create.layout));
+                key = HenHashBytes(key, &create.renderPass, sizeof(create.renderPass));
+                if (slot == 1) {
+                    key = HenHashBytes(key, &raster_state, sizeof(raster_state));
+                } else {
+                    key = HenHashBytes(key, &depth_info, sizeof(depth_info));
+                    key = HenHashBytes(key, &multisampling.rasterizationSamples,
+                                       sizeof(multisampling.rasterizationSamples));
+                }
+                std::scoped_lock lock{hen_repeat_mutex};
+                hen_repeat = !hen_part_seen[slot - 1].insert(key).second;
+                hen_part_requests[slot - 1]++;
+            }
+            auto made = device.createGraphicsPipelineUnique(pipeline_cache, create);
+            if (hen_standin_build && !fail_on_compile_required) {
+                __atomic_fetch_add(&hen_standin_part_ns[slot],
+                                   static_cast<unsigned long long>(
+                                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - part_start)
+                                           .count()),
+                                   __ATOMIC_RELAXED);
+                if ((slot == 1 || slot == 2) && !hen_repeat) {
+                    __atomic_fetch_add(&hen_standin_part_ns[5], 1ull, __ATOMIC_RELAXED);
+                }
+            }
+            if (hen_repeat) {
+                hen_part_repeats[slot - 1]++;
+                hen_part_repeat_ns[slot - 1] +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - part_start)
+                        .count();
+            }
+            if (!fail_on_compile_required) {
+                hen_part_ns[slot] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - part_start)
+                                         .count();
+                hen_part_count[slot]++;
+            }
+            if (made.result == vk::Result::eSuccess) {
+                owned[slot] = std::move(made.value);
+                if (cache_key != 0) {
+                    // (kept: the cache owns it from here; if another thread made the same part
+                    // meanwhile, this one stays ours and goes when the link is done)
+                    std::scoped_lock lock{hen_part_cache_mutex};
+                    if (hen_part_cache_map.try_emplace(cache_key, static_cast<VkPipeline>(*owned[slot]))
+                            .second) {
+                        borrowed[slot] = owned[slot].release();
+                    }
+                }
+            } else if (made.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
+                compile_required = true;
+            } else {
+                failed = true;
+            }
+        };
+        make(0, vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface,
+             vk::GraphicsPipelineCreateInfo{
+                 .pVertexInputState = &vertex_input_info,
+                 .pInputAssemblyState = &input_assembly,
+             });
+        make(1, vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+             vk::GraphicsPipelineCreateInfo{
+                 .stageCount = pre_count,
+                 .pStages = pre.data(),
+                 .pViewportState = &viewport_info,
+                 .pRasterizationState = &raster_state,
+             });
+        make(2, vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
+             vk::GraphicsPipelineCreateInfo{
+                 .stageCount = frag_count,
+                 .pStages = frag.data(),
+                 .pMultisampleState = &multisampling,
+                 .pDepthStencilState = &depth_info,
+             });
+        make(3, vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
+             vk::GraphicsPipelineCreateInfo{
+                 .pMultisampleState = &multisampling,
+                 .pColorBlendState = &color_blending,
+             });
+        if (compile_required) {
+            return false;
+        }
+        if (!failed) {
+            const std::array<vk::Pipeline, 4> parts{
+                *owned[0], *owned[1], borrowed[2] ? borrowed[2] : *owned[2], *owned[3]};
+            const vk::PipelineLibraryCreateInfoKHR libraries{
+                .libraryCount = static_cast<u32>(parts.size()),
+                .pLibraries = parts.data(),
+            };
+            const vk::GraphicsPipelineCreateInfo link{
+                .pNext = &libraries,
+                .flags = fail_flag,
+                .layout = pipeline_info.layout,
+            };
+            const auto link_start = std::chrono::steady_clock::now();
+            auto linked = device.createGraphicsPipelineUnique(pipeline_cache, link);
+            if (hen_standin_build && !fail_on_compile_required) {
+                __atomic_fetch_add(&hen_standin_part_ns[4],
+                                   static_cast<unsigned long long>(
+                                       std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - link_start)
+                                           .count()),
+                                   __ATOMIC_RELAXED);
+            }
+            if (linked.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
+                return false;
+            }
+            if (linked.result == vk::Result::eSuccess) {
+                const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - hen_start)
+                                    .count();
+                hen_gfx_note(fail_on_compile_required ? HEN_GFX_PIPELINE_CACHED
+                                                      : HEN_GFX_PIPELINE_COMPILE,
+                             ns);
+                if (hen_pipe_log && !fail_on_compile_required) {
+                    std::printf("hen: pipe %.1f ms (from parts)\n", ns / 1e6);
+                }
+                // (the parts are no longer needed once linked: the pipeline keeps what it uses)
+                pipeline = std::move(linked.value);
+                MarkDone();
+                return true;
+            }
+        }
+        // (a part or the link was refused: build it the usual way)
+        static bool told = false;
+        if (!told) {
+            told = true;
+            std::printf("hen: a pipeline couldn't be made from parts; using whole pipelines for it\n");
+        }
+    }
+#endif
     auto result = instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     if (result.result == vk::Result::eSuccess) {
+        hen_gfx_note(fail_on_compile_required ? HEN_GFX_PIPELINE_CACHED : HEN_GFX_PIPELINE_COMPILE,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - hen_start)
+                         .count());
+#ifdef __SWITCH__
+        // --pipe-log: for each pipeline the driver had to compile, how long it took and which
+        // of its shaders no earlier pipeline of this run had used (to tell what the time is for).
+        if (hen_pipe_log && !fail_on_compile_required) {
+            static std::mutex seen_mutex;
+            static std::set<VkShaderModule> seen;
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - hen_start)
+                                  .count();
+            char text[4] = {'-', '-', '-', 0};
+            {
+                std::scoped_lock lock{seen_mutex};
+                for (std::size_t i = 0; i < stages.size() && i < 3; i++) {
+                    if (stages[i]) {
+                        text[i] = seen.insert(static_cast<VkShaderModule>(stages[i]->Handle())).second
+                                      ? 'N'
+                                      : 's';
+                    }
+                }
+            }
+            std::printf("hen: pipe %.1f ms, shaders (vertex fragment geometry; N new, s seen) %s\n",
+                        ms, text);
+        }
+#endif
         pipeline = std::move(result.value);
     } else if (result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
         return false;

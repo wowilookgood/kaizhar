@@ -4,6 +4,9 @@
 
 #include <memory>
 #include <SPIRV/GlslangToSpv.h>
+#include <chrono>
+#include <mutex>
+#include <cstdio>
 #include <glslang/Include/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
 #include "common/assert.h"
@@ -11,6 +14,11 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" int hen_pipe_log; // --pipe-log
+extern "C" int hen_dump_spirv; // --dump-spirv
+#endif
 
 namespace Vulkan {
 
@@ -160,11 +168,47 @@ bool InitializeCompiler() {
 }
 } // Anonymous namespace
 
+#if defined(__SWITCH__) && HEN_DEV
+namespace {
+/// A SPIR-V module as base64 over the log (tools: spvdump.py, spvcorpus.py).
+void HenDumpSpirv(std::span<const u32> out_code, std::size_t glsl_bytes, const char* stage) {
+    static std::mutex dump_mutex;
+    static unsigned next_id = 0;
+    std::scoped_lock lock{dump_mutex};
+    const unsigned id = next_id++;
+    static const char digits[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const u8* const bytes = reinterpret_cast<const u8*>(out_code.data());
+    const std::size_t size = out_code.size() * 4;
+    std::printf("hen: spvdump %u begin %zu words, %zu bytes of GLSL, %s\n", id, out_code.size(),
+                glsl_bytes, stage);
+    char line[100];
+    for (std::size_t at = 0; at < size;) {
+        std::size_t n = 0;
+        for (; n < 76 && at < size; at += 3) {
+            const u32 v = (bytes[at] << 16) | (at + 1 < size ? bytes[at + 1] << 8 : 0) |
+                          (at + 2 < size ? bytes[at + 2] : 0);
+            line[n++] = digits[v >> 18];
+            line[n++] = digits[(v >> 12) & 63];
+            line[n++] = at + 1 < size ? digits[(v >> 6) & 63] : '=';
+            line[n++] = at + 2 < size ? digits[v & 63] : '=';
+        }
+        line[n] = 0;
+        std::printf("hen: spvdump %u %s\n", id, line);
+    }
+    std::printf("hen: spvdump %u end\n", id);
+}
+} // namespace
+#endif
+
 std::vector<u32> CompileGLSL(std::string_view code, vk::ShaderStageFlagBits stage,
                              std::string_view premable) {
     if (!InitializeCompiler()) {
         return {};
     }
+#if defined(__SWITCH__) && HEN_DEV
+    const auto hen_start = std::chrono::steady_clock::now();
+#endif
 
     EProfile profile = ECoreProfile;
     EShMessages messages =
@@ -216,11 +260,35 @@ std::vector<u32> CompileGLSL(std::string_view code, vk::ShaderStageFlagBits stag
     if (!spv_messages.empty()) {
         LOG_INFO(Render_Vulkan, "SPIR-V conversion messages: {}", spv_messages);
     }
+#if defined(__SWITCH__) && HEN_DEV
+    // --dump-spirv: every vertex shader of 2000 words or more, as base64 over the log (the
+    // ones the driver's compiler takes 150 to 700 ms over).
+    if (hen_dump_spirv == 1 && stage == vk::ShaderStageFlagBits::eVertex && out_code.size() >= 2000) {
+        HenDumpSpirv(out_code, code.size(), "vertex");
+    }
+    if (hen_pipe_log) {
+        std::printf("hen: spv: %s, %zu bytes of GLSL, %zu words of SPIR-V, %.1f ms\n",
+                    stage == vk::ShaderStageFlagBits::eVertex ? "vertex"
+                    : stage == vk::ShaderStageFlagBits::eFragment ? "fragment" : "geometry",
+                    code.size(), out_code.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              hen_start)
+                        .count());
+    }
+#endif
 
     return out_code;
 }
 
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
+#if defined(__SWITCH__) && HEN_DEV
+    // --dump-spirv-all: every module handed to the driver, whichever generator made it (the
+    // fragment shaders mostly come from the SPIR-V generator, not through glslang above).
+    // The collector reads the stage from the module itself.
+    if (hen_dump_spirv == 2) {
+        HenDumpSpirv(code, 0, "module");
+    }
+#endif
     const vk::ShaderModuleCreateInfo shader_info = {
         .codeSize = code.size() * sizeof(u32),
         .pCode = code.data(),

@@ -100,6 +100,10 @@ public:
     void ReleaseRenderer();
 
 private:
+    /// (Switch 2 port) Execute's body: on the GPU thread for the commands it takes over
+    /// (hen_gpu_thread.cpp), on the caller's otherwise.
+    void ExecuteNow(const Service::GSP::Command& command);
+
     void SubmitCmdList(u32 index);
 
     // Interrupt index must be 0 or 1 to signal the relative PSC interrupt.

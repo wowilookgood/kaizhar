@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/hen_crumb.h"
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -14,12 +15,19 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_debugger.h"
 #include "video_core/gpu_impl.h"
+#include "video_core/hen_gpu_thread.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_software/sw_blitter.h"
 #include "video_core/right_eye_disabler.h"
 #include "video_core/video_core.h"
+
+#ifdef __SWITCH__
+extern "C" int hen_gpu_thread; // hen/jit/hen_jit.c: --gpu-thread (see hen_gpu_thread.cpp)
+#else
+static constexpr int hen_gpu_thread = 0;
+#endif
 
 namespace VideoCore {
 
@@ -97,11 +105,31 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
+
+    // (Switch 2 port) --gpu-thread. Not with a debug context: its observers are called from
+    // the middle of command processing and expect the emulation thread.
+    if (hen_gpu_thread != 0 && !impl->debug_context) {
+        HenGpu::Start(HenGpu::Hooks{
+            .execute = [this](const Service::GSP::Command& command) { ExecuteNow(command); },
+            .invalidate = [this](PAddr addr,
+                                 u32 size) { impl->rasterizer->InvalidateRegion(addr, size); },
+            .deliver =
+                [this](Service::GSP::InterruptId id, u64 delay_ns) {
+                    if (impl->hen_direct_interrupt) {
+                        impl->hen_direct_interrupt(id, delay_ns);
+                    }
+                },
+        });
+    }
 }
 
-GPU::~GPU() = default;
+GPU::~GPU() {
+    // (before anything it uses goes: the queue is finished, the thread joined)
+    HenGpu::Stop();
+}
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
+    HEN_CRUMB("GPU::VirtualToPhysicalAddress");
     if (addr == 0) {
         return 0;
     }
@@ -126,23 +154,67 @@ PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
 }
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
+    HEN_CRUMB("GPU::SetInterruptHandler");
+    if (HenGpu::Active()) {
+        // The GPU thread must not signal: core timing and the kernel are the emulation
+        // thread's. What it finishes is noted and signalled from there (HenGpu::Poll).
+        HenGpu::Drain(HenGpu::WaitOther);
+        impl->hen_direct_interrupt = handler;
+        handler = [direct = handler](Service::GSP::InterruptId id, u64 delay_ns) {
+            if (HenGpu::OnThread()) {
+                HenGpu::PostInterrupt(id, delay_ns);
+            } else {
+                direct(id, delay_ns);
+            }
+        };
+    }
     impl->signal_interrupt = handler;
     impl->pica.SetInterruptHandler(handler);
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
+    HEN_CRUMB("GPU::FlushRegion");
+    HenGpu::Drain(HenGpu::WaitOther);
     impl->rasterizer->FlushRegion(addr, size);
 }
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
+    HEN_CRUMB("GPU::InvalidateRegion");
+    HenGpu::Drain(HenGpu::WaitOther);
     impl->rasterizer->InvalidateRegion(addr, size);
 }
 
 void GPU::ClearAll(bool flush) {
+    HEN_CRUMB("GPU::ClearAll");
+    HenGpu::Drain(HenGpu::WaitOther);
     impl->rasterizer->ClearAll(flush);
 }
 
 void GPU::Execute(const Service::GSP::Command& command) {
+    HEN_CRUMB("GPU::Execute");
+    if (HenGpu::Active()) {
+        using Service::GSP::CommandId;
+        switch (command.id) {
+        case CommandId::SubmitCmdList:
+        case CommandId::MemoryFill:
+        case CommandId::DisplayTransfer:
+        case CommandId::TextureCopy:
+            // The program carries on; the interrupt comes when the work is done. The whole
+            // command goes over, register writes included: the registers are the GPU
+            // thread's while it has work.
+            HenGpu::Queue(command);
+            return;
+        default:
+            // (a DMA request copies through the current process's page table and signals
+            // at once: here, after everything queued before it and its interrupts)
+            HenGpu::DrainAndDeliver(HenGpu::WaitRegs);
+            break;
+        }
+    }
+    ExecuteNow(command);
+}
+
+void GPU::ExecuteNow(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
 
@@ -257,6 +329,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    HEN_CRUMB("GPU::SetBufferSwap");
+    HenGpu::Drain(HenGpu::WaitOther); // (the right eye disabler's state, the frame's end)
     const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
     const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
 
@@ -287,11 +361,14 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
+    HEN_CRUMB("GPU::SetColorFill");
+    HenGpu::Drain(HenGpu::WaitOther);
     impl->pica.regs_lcd.color_fill_top = fill;
     impl->pica.regs_lcd.color_fill_bottom = fill;
 }
 
 u32 GPU::ReadReg(VAddr addr) {
+    HenGpu::DrainAndDeliver(HenGpu::WaitRegs); // (busy and finished bits: the work is done first)
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -314,6 +391,10 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    HEN_CRUMB("GPU::WriteReg");
+    // (a trigger written here runs on this thread and signals at once, as without the
+    // thread: after the interrupts of what was queued before it)
+    HenGpu::DrainAndDeliver(HenGpu::WaitRegs);
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -360,22 +441,33 @@ void GPU::WriteReg(VAddr addr, u32 data) {
 }
 
 VideoCore::RendererBase& GPU::Renderer() {
+    HEN_CRUMB("GPU::Renderer");
+    // (Switch 2 port) Whoever asks for the renderer or the PICA state from outside means to
+    // use it: settings, a title's start, a screenshot request, the memory system. The GPU
+    // thread itself never comes this way (it holds its own pointers).
+    HenGpu::Drain(HenGpu::WaitOther);
     return *impl->renderer;
 }
 
 Pica::PicaCore& GPU::PicaCore() {
+    HEN_CRUMB("GPU::PicaCore");
+    HenGpu::Drain(HenGpu::WaitOther);
     return impl->pica;
 }
 
 const Pica::PicaCore& GPU::PicaCore() const {
+    HEN_CRUMB("GPU::PicaCore");
     return impl->pica;
 }
 
 GraphicsDebugger& GPU::Debugger() {
+    HEN_CRUMB("GPU::Debugger");
     return impl->gpu_debugger;
 }
 
 void GPU::ApplyPerProgramSettings(u64 program_ID) {
+    HEN_CRUMB("GPU::ApplyPerProgramSettings");
+    HenGpu::Drain(HenGpu::WaitOther);
     auto hack = Common::Hacks::hack_manager.GetHack(
         Common::Hacks::HackType::ACCURATE_MULTIPLICATION, program_ID);
     bool use_accurate_mul = Settings::values.shaders_accurate_mul.GetValue();
@@ -396,6 +488,7 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
 }
 
 void GPU::SubmitCmdList(u32 index) {
+    HEN_CRUMB("GPU::SubmitCmdList");
     // Check if a command list was triggered.
     auto& config = impl->pica.regs.internal.pipeline.command_buffer;
     if (!config.trigger[index]) {
@@ -413,6 +506,7 @@ void GPU::SubmitCmdList(u32 index) {
 }
 
 void GPU::MemoryFill(u32 index, u32 intr_index) {
+    HEN_CRUMB("GPU::MemoryFill");
     // Check if a memory fill was triggered.
     auto& config = impl->pica.regs.memory_fill_config[index];
     if (!config.trigger) {
@@ -446,6 +540,7 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
 }
 
 void GPU::MemoryTransfer() {
+    HEN_CRUMB("GPU::MemoryTransfer");
     // Check if a transfer was triggered.
     auto& config = impl->pica.regs.display_transfer_config;
     if (!config.trigger.Value()) {
@@ -486,6 +581,13 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    // (Switch 2 port, --gpu-thread) The blank waits for the GPU thread: what the program
+    // submitted before it is in the frame that is swapped below, its interrupts are
+    // signalled before the blank's, and the swap, the frame limiter and what runs with it
+    // have the renderer to themselves. A GPU thread that is behind costs the emulation
+    // thread this wait and nothing else ("hen: gputhread:", vblank).
+    HenGpu::DrainAndDeliver(HenGpu::WaitVblank);
+
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
@@ -498,6 +600,8 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+    HEN_CRUMB("GPU::RecreateRenderer");
+    HenGpu::Drain(HenGpu::WaitOther);
     // Reset the renderer (this will destroy OpenGL resources)
     impl->renderer.reset();
 
@@ -537,6 +641,8 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
 }
 
 void GPU::ReleaseRenderer() {
+    HEN_CRUMB("GPU::ReleaseRenderer");
+    HenGpu::Drain(HenGpu::WaitOther);
     // Just reset the renderer to release OpenGL resources
     // Don't null out rasterizer pointer as it will become dangling
     impl->renderer.reset();
@@ -546,6 +652,8 @@ void GPU::ReleaseRenderer() {
 
 template <class Archive>
 void GPU::serialize(Archive& ar, const u32 file_version) {
+    HEN_CRUMB("GPU::serialize");
+    HenGpu::Drain(HenGpu::WaitOther);
     ar & impl->pica;
 }
 

@@ -1767,4 +1767,575 @@ std::string GenerateFragmentShader(const FSConfig& config, const UserConfig& use
     return module.Generate();
 }
 
+// ---------------------------------------------------------------------------------------------
+// (hen) The generic fragment shader. Everything below mirrors FragmentModule above, with the
+// configuration read from the uniform block instead of decided here: keep the two in step.
+// Not supported, and left to the generated shaders (GenericFragmentSupports): cube and shadow
+// textures, the procedural texture, gas, shadow rendering, logic operations emulated in the
+// shader, texture borders emulated in the shader, custom normal maps.
+
+bool GenericFragmentSupports(const FSConfig& config, const UserConfig& user) {
+    const auto type = config.texture.texture0_type.Value();
+    if (type != TextureType::Texture2D && type != TextureType::Projection2D &&
+        type != TextureType::Disabled) {
+        return false;
+    }
+    if (config.proctex.enable || user.use_custom_normal || config.framebuffer.shadow_rendering ||
+        config.framebuffer.logic_op != FramebufferRegs::LogicOp::Copy ||
+        config.texture.fog_mode == TexturingRegs::FogMode::Gas) {
+        return false;
+    }
+    for (const auto& border : config.texture.texture_border_color) {
+        if (border.raw != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void FillGenericFragmentConfig(const FSConfig& config, FSUniformData& data) {
+    using Sampler = LightingRegs::LightingSampler;
+    const auto& lighting = config.lighting;
+    const auto lighting_config = lighting.config.Value();
+    // Which texture units anything reads (a unit nothing reads is not sampled).
+    u32 used = 0;
+    const auto note_source = [&used](u32 source) {
+        if (source >= 3 && source <= 5) {
+            used |= 1u << (source - 3);
+        }
+    };
+    for (const auto& stage : config.texture.tev_stages) {
+        for (const u32 shift : {0u, 4u, 8u, 16u, 20u, 24u}) {
+            note_source((stage.sources_raw >> shift) & 0xF);
+        }
+    }
+    if (lighting.enable) {
+        if (lighting.bump_mode != LightingRegs::LightingBumpMode::None &&
+            lighting.bump_selector < 3) {
+            used |= 1u << lighting.bump_selector;
+        }
+        if (lighting.enable_shadow && lighting.shadow_selector < 3) {
+            used |= 1u << lighting.shadow_selector;
+        }
+    }
+    u32 flags = used;
+    if (lighting_config == LightingRegs::LightingConfig::Config7) {
+        flags |= 1u << 3;
+    }
+    const auto lut_used = [&](const LutConfig& lut, Sampler sampler) {
+        return lut.enable && LightingRegs::IsLightingSamplerSupported(lighting_config, sampler);
+    };
+    // (the spotlight table is always "enabled" in the configuration: only the support counts)
+    flags |= (lut_used(lighting.lut_d0, Sampler::Distribution0) ? 1u : 0u) << 4;
+    flags |= (lut_used(lighting.lut_d1, Sampler::Distribution1) ? 1u : 0u) << 5;
+    flags |= (LightingRegs::IsLightingSamplerSupported(lighting_config,
+                                                       Sampler::SpotlightAttenuation)
+                  ? 1u
+                  : 0u)
+             << 6;
+    flags |= (lut_used(lighting.lut_fr, Sampler::Fresnel) ? 1u : 0u) << 7;
+    flags |= (lut_used(lighting.lut_rr, Sampler::ReflectRed) ? 1u : 0u) << 8;
+    flags |= (lut_used(lighting.lut_rg, Sampler::ReflectGreen) ? 1u : 0u) << 9;
+    flags |= (lut_used(lighting.lut_rb, Sampler::ReflectBlue) ? 1u : 0u) << 10;
+
+    const auto as_int = [](u32 value) { return static_cast<s32>(value); };
+    data.hen_cfg[0] = {as_int(config.framebuffer.raw), as_int(config.texture.raw),
+                       as_int(lighting.raw), as_int(flags)};
+    for (std::size_t i = 0; i < 6; i++) {
+        const auto& stage = config.texture.tev_stages[i];
+        data.hen_cfg[1 + i] = {as_int(stage.sources_raw), as_int(stage.modifiers_raw),
+                               as_int(stage.ops_raw), as_int(stage.scales_raw)};
+    }
+    data.hen_cfg[7] = {as_int(lighting.lut_d0.raw), as_int(lighting.lut_d1.raw),
+                       as_int(lighting.lut_sp.raw), as_int(lighting.lut_fr.raw)};
+    data.hen_cfg[8] = {as_int(lighting.lut_rr.raw), as_int(lighting.lut_rg.raw),
+                       as_int(lighting.lut_rb.raw), 0};
+    data.hen_cfg[9] = {lighting.lights[0].raw, lighting.lights[1].raw, lighting.lights[2].raw,
+                       lighting.lights[3].raw};
+    data.hen_cfg[10] = {lighting.lights[4].raw, lighting.lights[5].raw, lighting.lights[6].raw,
+                        lighting.lights[7].raw};
+    data.hen_lut_scale[0] = {lighting.lut_d0.GetScale(), lighting.lut_d1.GetScale(),
+                             lighting.lut_sp.GetScale(), lighting.lut_fr.GetScale()};
+    data.hen_lut_scale[1] = {lighting.lut_rr.GetScale(), lighting.lut_rg.GetScale(),
+                             lighting.lut_rb.GetScale(), 0.0f};
+}
+
+std::string GenerateGenericFragmentShader(const Profile& profile) {
+    std::string out;
+    out.reserve(32 * 1024);
+    if (profile.has_separable_shaders) {
+        out += "#extension GL_ARB_separate_shader_objects : enable\n";
+    }
+    const bool barycentric = profile.has_fragment_shader_barycentric;
+    if (barycentric) {
+        out += "#extension GL_EXT_fragment_shader_barycentric : enable\n"
+               "#define pervertex pervertexEXT\n"
+               "#define gl_BaryCoord gl_BaryCoordEXT\n";
+    }
+    const auto input = [&](std::string_view var, Semantic location) {
+        if (profile.has_separable_shaders) {
+            out += fmt::format("layout (location = {}) ", static_cast<u32>(location));
+        }
+        out += fmt::format("in {};\n", var);
+    };
+    input("vec4 primary_color", Semantic::Color);
+    input("vec2 texcoord0", Semantic::Texcoord0);
+    input("vec2 texcoord1", Semantic::Texcoord1);
+    input("vec2 texcoord2", Semantic::Texcoord2);
+    input("float texcoord0_w", Semantic::Texcoord0_W);
+    input(barycentric ? "pervertex vec4 normquats[]" : "vec4 normquat", Semantic::Normquat);
+    input("vec3 view", Semantic::View);
+    out += "layout (location = 0) out vec4 color;\n\n";
+
+    // The uniform block of the generated shaders, with the configuration after it.
+    std::string block{FSUniformBlockDef};
+    const std::string_view last_member = "    vec4 blend_color;\n";
+    const auto at = block.find(last_member);
+    ASSERT(at != std::string::npos);
+    block.insert(at + last_member.size(), "    ivec4 hen_cfg[11];\n    vec4 hen_lut_scale[2];\n");
+    out += block;
+    out += "layout(set = 0, binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n"
+           "layout(set = 0, binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n"
+           "layout(set = 0, binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n"
+           "layout(set = 1, binding = 0) uniform sampler2D tex0;\n"
+           "layout(set = 1, binding = 1) uniform sampler2D tex1;\n"
+           "layout(set = 1, binding = 2) uniform sampler2D tex2;\n";
+
+    out += R"(
+vec3 quaternion_rotate(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+float byteround(float x) {
+    return round(x * 255.0) * (1.0 / 255.0);
+}
+vec3 byteround(vec3 x) {
+    return round(x * 255.0) * (1.0 / 255.0);
+}
+vec4 byteround(vec4 x) {
+    return round(x * 255.0) * (1.0 / 255.0);
+}
+float getLod(vec2 coord) {
+    vec2 d = max(abs(dFdx(coord)), abs(dFdy(coord)));
+    return log2(max(d.x, d.y));
+}
+float LookupLightingLUT(int lut_index, int index, float delta) {
+    vec2 entry = texelFetch(texture_buffer_lut_lf, lighting_lut_offset[lut_index >> 2][lut_index & 3] + index).rg;
+    return entry.r + entry.g * delta;
+}
+float LookupLightingLUTUnsigned(int lut_index, float pos) {
+    int index = int(clamp(floor(pos * 256.0), 0.f, 255.f));
+    float delta = pos * 256.0 - float(index);
+    return LookupLightingLUT(lut_index, index, delta);
+}
+float LookupLightingLUTSigned(int lut_index, float pos) {
+    int index = int(clamp(floor(pos * 128.0), -128.f, 127.f));
+    float delta = pos * 128.0 - float(index);
+    if (index < 0) index += 256;
+    return LookupLightingLUT(lut_index, index, delta);
+}
+bool AreQuaternionsOpposite(vec4 qa, vec4 qb) {
+    return (dot(qa, qb) < 0.0);
+}
+
+vec4 g_tex[4];
+vec4 g_primary;
+vec4 g_primary_fragment;
+vec4 g_secondary_fragment;
+vec4 g_buffer;
+vec4 g_output;
+
+// (GetSource)
+vec4 TevSource(int source, int stage) {
+    switch (source) {
+    case 0: return g_primary;
+    case 1: return g_primary_fragment;
+    case 2: return g_secondary_fragment;
+    case 3: return g_tex[0];
+    case 4: return g_tex[1];
+    case 5: return g_tex[2];
+    case 6: return g_tex[3];
+    case 13: return g_buffer;
+    case 14: return const_color[stage];
+    case 15: return g_output;
+    default: return vec4(0.0);
+    }
+}
+// (AppendColorModifier)
+vec3 ColorModifier(int modifier, vec4 s) {
+    switch (modifier) {
+    case 0: return s.rgb;
+    case 1: return vec3(1.0) - s.rgb;
+    case 2: return s.aaa;
+    case 3: return vec3(1.0) - s.aaa;
+    case 4: return s.rrr;
+    case 5: return vec3(1.0) - s.rrr;
+    case 8: return s.ggg;
+    case 9: return vec3(1.0) - s.ggg;
+    case 12: return s.bbb;
+    case 13: return vec3(1.0) - s.bbb;
+    default: return vec3(0.0);
+    }
+}
+// (AppendAlphaModifier)
+float AlphaModifier(int modifier, vec4 s) {
+    switch (modifier) {
+    case 0: return s.a;
+    case 1: return 1.0 - s.a;
+    case 2: return s.r;
+    case 3: return 1.0 - s.r;
+    case 4: return s.g;
+    case 5: return 1.0 - s.g;
+    case 6: return s.b;
+    case 7: return 1.0 - s.b;
+    default: return 0.0;
+    }
+}
+// (AppendColorCombiner)
+vec3 ColorCombiner(int op, vec3 r1, vec3 r2, vec3 r3) {
+    vec3 result;
+    switch (op) {
+    case 0: result = r1; break;
+    case 1: result = r1 * r2; break;
+    case 2: result = r1 + r2; break;
+    case 3: result = r1 + r2 - vec3(0.5); break;
+    case 4: result = mix(r2, r1, r3); break;
+    case 5: result = r1 - r2; break;
+    case 6:
+    case 7: result = vec3(dot(r1 - vec3(0.5), r2 - vec3(0.5)) * 4.0); break;
+    case 8: result = fma(r1, r2, r3); break;
+    case 9: result = min(r1 + r2, vec3(1.0)) * r3; break;
+    default: result = vec3(0.0); break;
+    }
+    return clamp(result, vec3(0.0), vec3(1.0));
+}
+// (AppendAlphaCombiner)
+float AlphaCombiner(int op, float r1, float r2, float r3) {
+    float result;
+    switch (op) {
+    case 0: result = r1; break;
+    case 1: result = r1 * r2; break;
+    case 2: result = r1 + r2; break;
+    case 3: result = r1 + r2 - 0.5; break;
+    case 4: result = mix(r2, r1, r3); break;
+    case 5: result = r1 - r2; break;
+    case 8: result = fma(r1, r2, r3); break;
+    case 9: result = min(r1 + r2, 1.0) * r3; break;
+    default: result = 0.0; break;
+    }
+    return clamp(result, 0.0, 1.0);
+}
+
+// (get_lut_value in WriteLighting)
+float LightingLutValue(int lut_sampler, int lut, bool two_sided, bool config7, vec3 normal,
+                       vec3 tangent, vec3 light_vector, vec3 half_vector, vec3 spot_dir) {
+    float index;
+    switch ((lut >> 2) & 7) {
+    case 0: index = dot(normal, normalize(half_vector)); break;
+    case 1: index = dot(normalize(view), normalize(half_vector)); break;
+    case 2: index = dot(normal, normalize(view)); break;
+    case 3: index = dot(light_vector, normal); break;
+    case 4: index = dot(light_vector, spot_dir); break;
+    case 5:
+        index = config7 ? dot(normalize(half_vector) - normal * dot(normal, normalize(half_vector)), tangent) : 0.0;
+        break;
+    default: index = 0.0; break;
+    }
+    if ((lut & 2) != 0) {
+        index = two_sided ? abs(index) : max(index, 0.0);
+        return LookupLightingLUTUnsigned(lut_sampler, index);
+    }
+    return LookupLightingLUTSigned(lut_sampler, index);
+}
+
+int LightWord(int index) {
+    return index < 4 ? hen_cfg[9][index] : hen_cfg[10][index - 4];
+}
+
+void main() {
+    int fb = hen_cfg[0].x;
+    int tx = hen_cfg[0].y;
+    int lt = hen_cfg[0].z;
+    int fl = hen_cfg[0].w;
+
+    g_primary = byteround(primary_color);
+    g_primary_fragment = vec4(0.0);
+    g_secondary_fragment = vec4(0.0);
+
+    int alpha_test = fb & 7;
+    if (alpha_test == 0) {
+        discard;
+    }
+
+    // (WriteScissor)
+    int scissor_mode = (fb >> 3) & 3;
+    if (scissor_mode != 0) {
+        bool inside = gl_FragCoord.x >= float(scissor_x1) && gl_FragCoord.y >= float(scissor_y1) &&
+                      gl_FragCoord.x < float(scissor_x2) && gl_FragCoord.y < float(scissor_y2);
+        if (scissor_mode == 3 ? !inside : inside) {
+            discard;
+        }
+    }
+
+    // (WriteDepth)
+)";
+    if (profile.has_minus_one_to_one_range) {
+        out += "    float z_over_w = -2.0 * gl_FragCoord.z + 1.0;\n";
+    } else {
+        out += "    float z_over_w = -gl_FragCoord.z;\n";
+    }
+    out += R"(    float depth = z_over_w * depth_scale + depth_offset;
+    if (((fb >> 5) & 1) == 0) {
+        depth /= gl_FragCoord.w;
+    }
+
+    // (DefineTexUnitSampler: each unit once, and only the units something reads)
+    g_tex[0] = vec4(0.0);
+    g_tex[1] = vec4(0.0);
+    g_tex[2] = vec4(0.0);
+    g_tex[3] = vec4(0.0);
+    int tex0_type = tx & 7;
+    if ((fl & 1) != 0 && tex0_type != 5) {
+        if (tex0_type == 3) {
+            g_tex[0] = textureProj(tex0, vec3(texcoord0, texcoord0_w));
+        } else {
+            g_tex[0] = textureLod(tex0, texcoord0, getLod(texcoord0 * vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);
+        }
+    }
+    if ((fl & 2) != 0) {
+        g_tex[1] = textureLod(tex1, texcoord1, getLod(texcoord1 * vec2(textureSize(tex1, 0))) + tex_lod_bias[1]);
+    }
+    if ((fl & 4) != 0) {
+        vec2 coord2 = ((tx >> 3) & 1) != 0 ? texcoord1 : texcoord2;
+        g_tex[2] = textureLod(tex2, coord2, getLod(coord2 * vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);
+    }
+
+    // (WriteLighting)
+    if ((lt & 1) != 0) {
+        vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
+        vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
+        vec3 refl_value = vec3(0.0);
+        float clamp_highlights = 1.0;
+        float geo_factor = 1.0;
+        bool config7 = (fl & 8) != 0;
+
+        int bump_mode = (lt >> 5) & 3;
+        int bump_selector = (lt >> 7) & 3;
+        vec3 surface_normal = vec3(0.0, 0.0, 1.0);
+        vec3 surface_tangent = vec3(1.0, 0.0, 0.0);
+        if (bump_mode == 1) {
+            surface_normal = 2.0 * g_tex[bump_selector].rgb - 1.0;
+            if (((lt >> 9) & 1) != 0) {
+                surface_normal.z = sqrt(max((1.0 - (surface_normal.x * surface_normal.x + surface_normal.y * surface_normal.y)), 0.0));
+            }
+        } else if (bump_mode == 2) {
+            surface_tangent = 2.0 * g_tex[bump_selector].rgb - 1.0;
+        }
+)";
+    if (barycentric) {
+        out += R"(
+        vec4 normquat_0 = normquats[0];
+        vec4 normquat_1 = mix(normquats[1], -normquats[1], bvec4(AreQuaternionsOpposite(normquats[0], normquats[1])));
+        vec4 normquat_2 = mix(normquats[2], -normquats[2], bvec4(AreQuaternionsOpposite(normquats[0], normquats[2])));
+        vec4 normquat = gl_BaryCoord.x * normquat_0 + gl_BaryCoord.y * normquat_1 + gl_BaryCoord.z * normquat_2;
+)";
+    }
+    out += R"(
+        vec4 normalized_normquat = normalize(normquat);
+        vec3 normal = quaternion_rotate(normalized_normquat, surface_normal);
+        vec3 tangent = quaternion_rotate(normalized_normquat, surface_tangent);
+
+        vec4 shadow = vec4(1.0);
+        if (((lt >> 17) & 1) != 0) {
+            shadow = g_tex[(lt >> 22) & 3];
+            if (((lt >> 20) & 1) != 0) {
+                shadow = vec4(1.0) - shadow;
+            }
+        }
+
+        int src_num = (lt >> 1) & 15;
+        for (int light_index = 0; light_index < src_num && light_index < 8; light_index++) {
+            int light = LightWord(light_index);
+            int num = light & 7;
+            // (as the generated shaders: the two-sided flag for a table is that of the light
+            // slot with this light's number)
+            bool lut_two_sided = ((LightWord(num) >> 4) & 1) != 0;
+
+            vec3 light_vector = ((light >> 3) & 1) != 0 ? light_src[num].position : light_src[num].position + view;
+            float light_distance = length(light_vector);
+            light_vector = normalize(light_vector);
+            vec3 spot_dir = light_src[num].spot_direction;
+            vec3 half_vector = normalize(view) + light_vector;
+
+            float dot_product = ((light >> 4) & 1) != 0 ? abs(dot(light_vector, normal)) : max(dot(light_vector, normal), 0.0);
+            if (((lt >> 10) & 1) != 0) {
+                clamp_highlights = sign(dot_product);
+            }
+
+            float spot_atten = 1.0;
+            if (((light >> 6) & 1) != 0 && (fl & 64) != 0) {
+                spot_atten = hen_lut_scale[0].z * LightingLutValue(8 + num, hen_cfg[7].z, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+            }
+
+            float dist_atten = 1.0;
+            if (((light >> 5) & 1) != 0) {
+                dist_atten = LookupLightingLUTUnsigned(16 + num, clamp(light_src[num].dist_atten_scale * light_distance + light_src[num].dist_atten_bias, 0.0, 1.0));
+            }
+
+            if (((light >> 7) & 3) != 0) {
+                geo_factor = dot(half_vector, half_vector);
+                geo_factor = geo_factor == 0.0 ? 0.0 : min(dot_product / geo_factor, 1.0);
+            }
+
+            float d0_lut_value = 1.0;
+            if ((fl & 16) != 0) {
+                d0_lut_value = hen_lut_scale[0].x * LightingLutValue(0, hen_cfg[7].x, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+            }
+            vec3 specular_0 = d0_lut_value * light_src[num].specular_0;
+            if (((light >> 7) & 1) != 0) {
+                specular_0 = specular_0 * geo_factor;
+            }
+
+            if ((fl & 256) != 0) {
+                refl_value.r = hen_lut_scale[1].x * LightingLutValue(6, hen_cfg[8].x, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+            } else {
+                refl_value.r = 1.0;
+            }
+            if ((fl & 512) != 0) {
+                refl_value.g = hen_lut_scale[1].y * LightingLutValue(5, hen_cfg[8].y, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+            } else {
+                refl_value.g = refl_value.r;
+            }
+            if ((fl & 1024) != 0) {
+                refl_value.b = hen_lut_scale[1].z * LightingLutValue(4, hen_cfg[8].z, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+            } else {
+                refl_value.b = refl_value.r;
+            }
+
+            float d1_lut_value = 1.0;
+            if ((fl & 32) != 0) {
+                d1_lut_value = hen_lut_scale[0].y * LightingLutValue(1, hen_cfg[7].y, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+            }
+            vec3 specular_1 = d1_lut_value * refl_value * light_src[num].specular_1;
+            if (((light >> 8) & 1) != 0) {
+                specular_1 = specular_1 * geo_factor;
+            }
+
+            if (light_index == src_num - 1 && (fl & 128) != 0) {
+                float fresnel = hen_lut_scale[0].w * LightingLutValue(3, hen_cfg[7].w, lut_two_sided, config7, normal, tangent, light_vector, half_vector, spot_dir);
+                if (((lt >> 15) & 1) != 0) {
+                    diffuse_sum.a = fresnel;
+                }
+                if (((lt >> 16) & 1) != 0) {
+                    specular_sum.a = fresnel;
+                }
+            }
+
+            bool light_shadow = ((light >> 9) & 1) != 0;
+            vec3 shadow_primary = (((lt >> 18) & 1) != 0 && light_shadow) ? shadow.rgb : vec3(1.0);
+            vec3 shadow_secondary = (((lt >> 19) & 1) != 0 && light_shadow) ? shadow.rgb : vec3(1.0);
+
+            diffuse_sum.rgb += ((light_src[num].diffuse * dot_product * shadow_primary) + light_src[num].ambient) * dist_atten * spot_atten;
+            specular_sum.rgb += (specular_0 + specular_1) * clamp_highlights * dist_atten * spot_atten * shadow_secondary;
+        }
+
+        if (((lt >> 21) & 1) != 0) {
+            if (((lt >> 15) & 1) != 0) {
+                diffuse_sum.a *= shadow.a;
+            }
+            if (((lt >> 16) & 1) != 0) {
+                specular_sum.a *= shadow.a;
+            }
+        }
+
+        diffuse_sum.rgb += lighting_global_ambient;
+        g_primary_fragment = clamp(diffuse_sum, vec4(0.0), vec4(1.0));
+        g_secondary_fragment = clamp(specular_sum, vec4(0.0), vec4(1.0));
+    }
+
+    // (WriteTevStage, six times)
+    g_buffer = vec4(0.0);
+    vec4 next_buffer = tev_combiner_buffer_color;
+    g_output = vec4(0.0);
+    int buffer_input = (tx >> 4) & 255;
+    for (int stage = 0; stage < 6; stage++) {
+        ivec4 st = hen_cfg[1 + stage];
+        int cs1 = st.x & 15, cs2 = (st.x >> 4) & 15, cs3 = (st.x >> 8) & 15;
+        int as1 = (st.x >> 16) & 15, as2 = (st.x >> 20) & 15, as3 = (st.x >> 24) & 15;
+        int cm1 = st.y & 15, cm2 = (st.y >> 4) & 15, cm3 = (st.y >> 8) & 15;
+        int am1 = (st.y >> 12) & 7, am2 = (st.y >> 16) & 7, am3 = (st.y >> 20) & 7;
+        int cop = st.z & 15, aop = (st.z >> 16) & 15;
+        int cscale = st.w & 3, ascale = (st.w >> 16) & 3;
+        float cmul = cscale < 3 ? float(1 << cscale) : 1.0;
+        float amul = ascale < 3 ? float(1 << ascale) : 1.0;
+        // (IsPassThroughTevStage)
+        bool pass_through = cop == 0 && aop == 0 && cs1 == 15 && as1 == 15 && cm1 == 0 && am1 == 0 && cmul == 1.0 && amul == 1.0;
+        if (!pass_through) {
+            if (stage == 0) {
+                // (the first stage has no previous one: a source that says Previous reads the
+                // third source)
+                if (cs1 == 15) cs1 = cs3;
+                if (cs2 == 15) cs2 = cs3;
+                if (as1 == 15) as1 = as3;
+                if (as2 == 15) as2 = as3;
+            }
+            vec3 c1 = ColorModifier(cm1, TevSource(cs1, stage));
+            vec3 c2 = ColorModifier(cm2, TevSource(cs2, stage));
+            vec3 c3 = ColorModifier(cm3, TevSource(cs3, stage));
+            vec3 color_output = byteround(ColorCombiner(cop, c1, c2, c3));
+            float alpha_output;
+            if (cop == 7) {
+                alpha_output = color_output[0];
+            } else {
+                float a1 = AlphaModifier(am1, TevSource(as1, stage));
+                float a2 = AlphaModifier(am2, TevSource(as2, stage));
+                float a3 = AlphaModifier(am3, TevSource(as3, stage));
+                alpha_output = byteround(AlphaCombiner(aop, a1, a2, a3));
+            }
+            g_output = vec4(clamp(color_output * cmul, vec3(0.0), vec3(1.0)), clamp(alpha_output * amul, 0.0, 1.0));
+        }
+        g_buffer = next_buffer;
+        if (stage < 4 && ((buffer_input >> stage) & 1) != 0) {
+            next_buffer.rgb = g_output.rgb;
+        }
+        if (stage < 4 && ((buffer_input >> (4 + stage)) & 1) != 0) {
+            next_buffer.a = g_output.a;
+        }
+    }
+
+    // (WriteAlphaTestCondition)
+    if (alpha_test >= 2) {
+        int alpha = int(g_output.a * 255.0);
+        bool fail;
+        switch (alpha_test) {
+        case 2: fail = alpha != alphatest_ref; break;
+        case 3: fail = alpha == alphatest_ref; break;
+        case 4: fail = alpha >= alphatest_ref; break;
+        case 5: fail = alpha > alphatest_ref; break;
+        case 6: fail = alpha <= alphatest_ref; break;
+        default: fail = alpha < alphatest_ref; break;
+        }
+        if (fail) {
+            discard;
+        }
+    }
+
+    // (WriteFog)
+    if (((tx >> 12) & 7) == 5) {
+        float fog_index = ((tx >> 15) & 1) != 0 ? (1.0 - float(depth)) * 128.0 : depth * 128.0;
+        float fog_i = clamp(floor(fog_index), 0.0, 127.0);
+        float fog_f = fog_index - fog_i;
+        vec2 fog_lut_entry = texelFetch(texture_buffer_lut_lf, int(fog_i) + fog_lut_offset).rg;
+        float fog_factor = fog_lut_entry.r + fog_lut_entry.g * fog_f;
+        fog_factor = clamp(fog_factor, 0.0, 1.0);
+        g_output.rgb = mix(fog_color.rgb, g_output.rgb, fog_factor);
+    }
+
+    gl_FragDepth = depth;
+    g_output = byteround(g_output);
+    color = g_output;
+}
+)";
+    return out;
+}
+
 } // namespace Pica::Shader::Generator::GLSL

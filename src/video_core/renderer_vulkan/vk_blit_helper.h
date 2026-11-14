@@ -34,6 +34,10 @@ public:
 
     bool BlitDepthStencil(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit);
 
+    /// (Switch 2 port) The same between a surface's own unscaled and scaled images, for
+    /// Surface::BlitScale where the depth format can't be blitted by the device.
+    bool BlitDepthStencilScale(Surface& surface, const VideoCore::TextureBlit& blit, bool up_scale);
+
     bool ConvertDS24S8ToRGBA8(Surface& source, Surface& dest, const VideoCore::TextureCopy& copy);
 
     bool DepthToBuffer(Surface& source, vk::Buffer buffer,

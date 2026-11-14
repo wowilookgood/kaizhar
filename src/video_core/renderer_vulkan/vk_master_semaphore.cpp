@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <mutex>
+#include "common/hen_stats.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
@@ -54,8 +55,11 @@ void MasterSemaphoreTimeline::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphoresKHR(&wait_info, WAIT_TIMEOUT) !=
-           vk::Result::eSuccess) {
+    {
+        HenGfxTimer hen_timer{HEN_GFX_GPU_WAIT};
+        while (instance.GetDevice().waitSemaphoresKHR(&wait_info, WAIT_TIMEOUT) !=
+               vk::Result::eSuccess) {
+        }
     }
     Refresh();
 }

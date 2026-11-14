@@ -472,6 +472,16 @@ bool Instance::CreateDevice() {
     const bool has_pipeline_creation_cache_control =
         add_extension(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME, is_nvidia,
                       "it is broken on Nvidia drivers");
+#ifdef __SWITCH__
+    // (Azahar's Switch 2 port) Pipelines from separately compiled parts, where the driver has it.
+    graphics_pipeline_library = add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                                add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                                physical_device
+                                    .getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                  vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+                                    .get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+                                    .graphicsPipelineLibrary;
+#endif
     const bool has_fragment_shader_barycentric =
         add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, is_moltenvk,
                       "the PerVertexKHR attribute is not supported by MoltenVK");
@@ -534,6 +544,17 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT{},
         vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{},
     };
+
+#ifdef __SWITCH__
+    vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT library_features{
+        .graphicsPipelineLibrary = true,
+    };
+    if (graphics_pipeline_library) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        library_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &library_features;
+    }
+#endif
 
 #define PROP_GET(structName, prop, property) property = properties_chain.get<structName>().prop;
 

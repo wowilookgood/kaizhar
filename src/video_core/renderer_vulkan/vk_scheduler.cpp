@@ -15,6 +15,10 @@
 MICROPROFILE_DEFINE(Vulkan_WaitForWorker, "Vulkan", "Wait for worker", MP_RGB(255, 192, 192));
 MICROPROFILE_DEFINE(Vulkan_Submit, "Vulkan", "Submit Exectution", MP_RGB(255, 192, 255));
 
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" void hen_blackbox_watch(void);
+#endif
+
 namespace Vulkan {
 
 namespace {
@@ -116,6 +120,9 @@ void Scheduler::DispatchWork() {
 
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
+#if defined(__SWITCH__) && HEN_DEV
+    hen_blackbox_watch(); // (hen/jit/hen_jit.c: sampled with the emulation thread)
+#endif
 
     const auto TryPopQueue{[this](auto& work) -> bool {
         if (work_queue.empty()) {

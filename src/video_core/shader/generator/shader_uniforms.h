@@ -61,9 +61,14 @@ struct FSUniformData {
     alignas(16) Common::Vec3f tex_lod_bias;
     alignas(16) Common::Vec4f tex_border_color[3];
     alignas(16) Common::Vec4f blend_color;
+    // (hen) The fragment configuration as data, for the generic fragment shader
+    // (glsl_fs_shader_gen.cpp, GenerateGenericFragmentShader). The generated shaders do not
+    // declare these: they sit after everything those read.
+    alignas(16) Common::Vec4i hen_cfg[11];
+    alignas(16) Common::Vec4f hen_lut_scale[2];
 };
 
-static_assert(sizeof(FSUniformData) == 0x530,
+static_assert(sizeof(FSUniformData) == 0x530 + 13 * 16,
               "The size of the UniformData does not match the structure in the shader");
 static_assert(sizeof(FSUniformData) < 16384,
               "UniformData structure must be less than 16kb as per the OpenGL spec");

@@ -34,6 +34,17 @@
 
 MICROPROFILE_DEFINE(Vulkan_RenderFrame, "Vulkan", "Render Frame", MP_RGB(128, 128, 64));
 
+#ifdef __SWITCH__
+extern "C" unsigned long long hen_present_gaps[6]; // hen/jit/hen_jit.c
+#if HEN_DEV
+extern "C" void hen_blackbox_dump(unsigned ms);
+#endif
+extern "C" void hen_boost_note_present(unsigned long long ns); // hen/jit/hen_jit.c
+/// The console is held the other way up (a flipped portrait layout): the finished picture is
+/// turned half a turn. citra_switch/switch_platform.c
+extern "C" bool sw_flipped(void);
+#endif
+
 namespace Vulkan {
 
 struct ScreenRectVertex {
@@ -1027,6 +1038,14 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
     const auto& top_screen = layout.top_screen;
     const auto& bottom_screen = layout.bottom_screen;
     draw_info.modelview = MakeOrthographicMatrix(layout.width, layout.height);
+#ifdef __SWITCH__
+    if (sw_flipped()) {
+        // Half a turn: x and y negated (their scale and offset). DrawCursor does the same.
+        for (const int i : {0, 3, 5, 7}) {
+            draw_info.modelview[i] = -draw_info.modelview[i];
+        }
+    }
+#endif
 
     draw_info.layer = 0;
 
@@ -1100,7 +1119,7 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
 
     // 12 vertices = 4 triangles (2 for vertical bar, 2 for horizontal bar)
     // clang-format off
-    const float vertices[] = {
+    float vertices[] = {
         // Vertical bar
         vl, vt,  vr, vt,  vr, vb,
         vl, vt,  vr, vb,  vl, vb,
@@ -1109,6 +1128,13 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
         hl, ht,  hr, hb,  hl, hb,
     };
     // clang-format on
+#ifdef __SWITCH__
+    if (sw_flipped()) { // half a turn, as the screens in DrawScreens
+        for (float& v : vertices) {
+            v = -v;
+        }
+    }
+#endif
 
     const u64 size = sizeof(vertices);
     auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
@@ -1147,7 +1173,45 @@ void RendererVulkan::SwapBuffers() {
     PrepareRendertarget();
     RenderScreenshot();
     isSecondaryWindow = false;
+#ifdef __SWITCH__
+    // (Switch 2 port) Every frame is shown: leaving frames unshown while the emulation is behind
+    // was tried twice (by a clock, and by asking the display) and was worse both times.
+    // What is here: the gaps between frames shown, and how long showing one took.
+    {
+        static std::chrono::steady_clock::time_point last_shown{};
+        const auto now = std::chrono::steady_clock::now();
+        // (the gaps between frames shown: what the eye gets, whichever thread was late)
+        if (last_shown.time_since_epoch().count() != 0) {
+            const unsigned long long gap_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - last_shown).count();
+            if (gap_us < 5'000'000) { // (not the title list, not a suspension)
+                hen_present_gaps[0]++;
+                hen_present_gaps[1] += gap_us > 40'000;
+                hen_present_gaps[2] += gap_us > 70'000;
+                hen_present_gaps[3] += gap_us > 120'000;
+                hen_present_gaps[4] = std::max(hen_present_gaps[4], gap_us);
+                if (gap_us > 40'000) {
+                    hen_present_gaps[5] += gap_us;
+                }
+#if HEN_DEV
+                if (gap_us > 70'000) {
+                    std::printf("hen: slow: %llu ms between two frames shown\n", gap_us / 1000);
+                    hen_blackbox_dump(static_cast<unsigned>(gap_us / 1000));
+                }
+#endif
+            }
+        }
+        last_shown = now;
+        RenderToWindow(main_present_window, layout, false);
+        // (how long showing it took: the loading boost's check for a held-up GPU)
+        hen_boost_note_present(static_cast<unsigned long long>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - now)
+                .count()));
+    }
+#else
     RenderToWindow(main_present_window, layout, false);
+#endif
 #ifndef ANDROID
     if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
         ASSERT(secondary_window);

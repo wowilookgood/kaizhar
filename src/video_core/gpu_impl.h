@@ -35,6 +35,9 @@ struct GPU::Impl {
     std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
+    /// (Switch 2 port, --gpu-thread) The handler itself; signal_interrupt then only notes
+    /// what the GPU thread finishes, for the emulation thread to signal through this.
+    Service::GSP::InterruptHandler hen_direct_interrupt;
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)

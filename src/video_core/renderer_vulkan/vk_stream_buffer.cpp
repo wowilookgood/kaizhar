@@ -62,6 +62,18 @@ u32 GetMemoryType(const vk::PhysicalDeviceMemoryProperties& properties, BufferTy
         return *preferred_type;
     }
 
+    // Memory that is read back wants to be cached far more than coherent: reads from uncached
+    // (write-combined) memory are slower by orders of magnitude (on Switch 2's driver the
+    // coherent host-visible type is uncached, and converting one 3DS framebuffer read from it
+    // took 34 ms), and the stream buffer flushes and invalidates non-coherent memory itself.
+    if (type == BufferType::Download) {
+        preferred_type = FindMemoryType(properties, vk::MemoryPropertyFlagBits::eHostVisible |
+                                                        vk::MemoryPropertyFlagBits::eHostCached);
+        if (preferred_type) {
+            return *preferred_type;
+        }
+    }
+
     // If not found, try removing flags one by one
     constexpr std::array remove_flags = {
         vk::MemoryPropertyFlagBits::eDeviceLocal,

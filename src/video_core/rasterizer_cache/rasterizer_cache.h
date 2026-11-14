@@ -4,9 +4,14 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
+#include "common/hen_stats.h"
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -42,6 +47,9 @@ RasterizerCache<T>::RasterizerCache(Memory::MemorySystem& memory_,
       dump_textures{Settings::values.dump_textures.GetValue()},
       use_custom_textures{Settings::values.custom_textures.GetValue()} {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
+#ifdef __SWITCH__
+    hen_dirty_pages_live = hen_dirty_pages.data();
+#endif
 
     // Create null handles for all cached resources
     void(slot_surfaces.insert(runtime, SurfaceParams{
@@ -97,6 +105,9 @@ RasterizerCache<T>::RasterizerCache(Memory::MemorySystem& memory_,
 
 template <class T>
 RasterizerCache<T>::~RasterizerCache() {
+#ifdef __SWITCH__
+    hen_dirty_pages_live = nullptr;
+#endif
     ClearAll(false);
 }
 
@@ -1161,6 +1172,7 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
     }
 
     const auto download_dest = dest_ptr.GetWriteBytes(flush_end - flush_start);
+    HenGfxTimer hen_timer{HEN_GFX_DOWNLOAD_ENCODE};
     EncodeTexture(flush_info, flush_start, flush_end, staging.mapped, download_dest,
                   runtime.NeedsConversion(surface));
 }
@@ -1260,6 +1272,9 @@ void RasterizerCache<T>::ClearAll(bool flush) {
     // Remove the whole cache without really looking at it.
     cached_pages -= flush_interval;
     dirty_regions.clear();
+    for (u64& word : hen_dirty_pages) {
+        __atomic_store_n(&word, 0, __ATOMIC_RELEASE);
+    }
     page_table.clear();
 }
 
@@ -1268,6 +1283,12 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
     if (size == 0) [[unlikely]] {
         return;
     }
+#ifdef __SWITCH__
+    // (nothing drawn to these pages is waiting to be written back: see hen_dirty_pages)
+    if (size <= 0x10000 && !HenDirtyAny(addr, size)) {
+        return;
+    }
+#endif
 
     const SurfaceInterval flush_interval(addr, addr + size);
     SurfaceRegions flushed_intervals;
@@ -1308,6 +1329,11 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
 
     // Reset dirty regions
     dirty_regions -= flushed_intervals;
+#ifdef __SWITCH__
+    for (const auto& flushed : flushed_intervals) {
+        HenDirtyRefresh(flushed.lower(), flushed.upper());
+    }
+#endif
 }
 
 template <class T>
@@ -1338,7 +1364,9 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         }
         // If the CPU is invalidating this region we want to remove it
         // to (likely) mark the memory pages as uncached
-        if (!region_owner_id && size <= 8) {
+        // (Switch 2 port: hen_invalidate_small stands for a run of such writes that the GPU
+        // thread was handed as one range, video_core/hen_gpu_thread.cpp)
+        if (!region_owner_id && (size <= 8 || hen_invalidate_small)) {
             FlushRegion(surface.addr, surface.size, surface_id);
             remove_surfaces.push_back(surface_id);
             return;
@@ -1353,8 +1381,14 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
 
     if (region_owner_id) {
         dirty_regions.set({invalid_interval, region_owner_id});
+#ifdef __SWITCH__
+        HenDirtySet(invalid_interval.lower(), invalid_interval.upper());
+#endif
     } else {
         dirty_regions.erase(invalid_interval);
+#ifdef __SWITCH__
+        HenDirtyRefresh(invalid_interval.lower(), invalid_interval.upper());
+#endif
     }
 
     for (const SurfaceId surface_id : remove_surfaces) {

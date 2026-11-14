@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include "common/swap.h"
+#include <type_traits>
+#include <array>
 #include <algorithm>
 #include <bit>
 #include <span>
@@ -196,12 +199,163 @@ constexpr void EncodePixel4(u32 x, u32 y, const u8* source_pixel, u8* dest_tile_
     }
 }
 
+/// (Switch 2 port) MortonInterleave(x, y) at [y * 8 + x], for MortonCopyTile's fast path.
+inline constexpr std::array<u8, 64> HEN_MORTON_TABLE = [] {
+    std::array<u8, 64> table{};
+    for (u32 ty = 0; ty < 8; ty++) {
+        for (u32 tx = 0; tx < 8; tx++) {
+            table[ty * 8 + tx] = static_cast<u8>(VideoCore::MortonInterleave(tx, ty));
+        }
+    }
+    return table;
+}();
+
+/// (Switch 2 port) ETC1's modifier table (as in video_core/texture/etc1.cpp).
+inline constexpr std::array<std::array<u8, 2>, 8> HEN_ETC1_MODIFIERS = {{
+    {2, 8}, {5, 17}, {9, 29}, {13, 42}, {18, 60}, {24, 80}, {33, 106}, {47, 183},
+}};
+
 template <bool morton_to_linear, PixelFormat format, bool converted>
 constexpr void MortonCopyTile(u32 stride, std::span<u8> tile_buffer, std::span<u8> linear_buffer) {
     constexpr u32 bytes_per_pixel = GetFormatBpp(format) / 8;
     constexpr u32 linear_bytes_per_pixel = converted ? 4 : GetFormatBytesPerPixel(format);
     constexpr bool is_compressed = format == PixelFormat::ETC1 || format == PixelFormat::ETC1A4;
     constexpr bool is_4bit = format == PixelFormat::I4 || format == PixelFormat::A4;
+
+    // (Switch 2 port) The 32-bit formats whose conversion is one word operation, without the
+    // per-pixel spans below: a 512x366 depth texture read back took 3.2 ms through them (17 ns
+    // a pixel), and Super Smash Bros. reads one back twice a frame in some scenes.
+    if constexpr (format == PixelFormat::D24S8 || format == PixelFormat::RGBA8) {
+        if (!std::is_constant_evaluated()) {
+            u8* const tile = tile_buffer.data();
+            u8* const linear = linear_buffer.data();
+            for (u32 y = 0; y < 8; y++) {
+                u8* const row = linear + static_cast<std::size_t>(7 - y) * stride * 4;
+                for (u32 x = 0; x < 8; x++) {
+                    u8* const tiled_pixel = tile + HEN_MORTON_TABLE[y * 8 + x] * 4;
+                    u32 value;
+                    if constexpr (morton_to_linear) {
+                        std::memcpy(&value, tiled_pixel, 4);
+                        if constexpr (format == PixelFormat::D24S8) {
+                            value = std::rotl(value, 8);
+                        } else if constexpr (converted) {
+                            value = Common::swap32(value);
+                        }
+                        std::memcpy(row + x * 4, &value, 4);
+                    } else {
+                        std::memcpy(&value, row + x * 4, 4);
+                        if constexpr (format == PixelFormat::D24S8) {
+                            value = std::rotr(value, 8);
+                        } else if constexpr (converted) {
+                            value = Common::swap32(value);
+                        }
+                        std::memcpy(tiled_pixel, &value, 4);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // (Switch 2 port) ETC1 by block: the two base colours and the tables of a 4x4 block are
+    // worked out once, not once a pixel through DecodePixelETC1 (which also calls out of line
+    // for every pixel). ETC1 is what most 3DS textures are stored as, and they are decoded on
+    // the emulation thread when a scene first uses them: of two 140 ms stalls at scene starts
+    // (Pokemon Omega Ruby, Super Smash Bros.), about a third of the samples were in here.
+    // Same results as DecodePixelETC1 and Pica::Texture::SampleETC1Subtile, bit for bit.
+    if constexpr (is_compressed && morton_to_linear) {
+        if (!std::is_constant_evaluated()) {
+            constexpr bool has_alpha = format == PixelFormat::ETC1A4;
+            constexpr std::size_t subtile_size = has_alpha ? 16 : 8;
+            const u8* const tile = tile_buffer.data();
+            u8* const linear = linear_buffer.data();
+            for (u32 sub = 0; sub < 4; sub++) {
+                const u8* block = tile + sub * subtile_size;
+                u64 alpha_bits = 0;
+                if constexpr (has_alpha) {
+                    std::memcpy(&alpha_bits, block, 8);
+                    block += 8;
+                }
+                u64 d;
+                std::memcpy(&d, block, 8);
+                const bool flip = (d >> 32 & 1) != 0;
+                int base[2][3];
+                if ((d >> 33 & 1) != 0) {
+                    const auto delta = [](u64 bits) {
+                        return static_cast<int>(bits & 7) - ((bits & 4) != 0 ? 8 : 0);
+                    };
+                    const int r = static_cast<int>(d >> 59 & 31), g = static_cast<int>(d >> 51 & 31),
+                              b = static_cast<int>(d >> 43 & 31);
+                    using Common::Color::Convert5To8;
+                    base[0][0] = Convert5To8(static_cast<u8>(r));
+                    base[0][1] = Convert5To8(static_cast<u8>(g));
+                    base[0][2] = Convert5To8(static_cast<u8>(b));
+                    base[1][0] = Convert5To8(static_cast<u8>(r + delta(d >> 56)));
+                    base[1][1] = Convert5To8(static_cast<u8>(g + delta(d >> 48)));
+                    base[1][2] = Convert5To8(static_cast<u8>(b + delta(d >> 40)));
+                } else {
+                    using Common::Color::Convert4To8;
+                    base[0][0] = Convert4To8(static_cast<u8>(d >> 60 & 15));
+                    base[0][1] = Convert4To8(static_cast<u8>(d >> 52 & 15));
+                    base[0][2] = Convert4To8(static_cast<u8>(d >> 44 & 15));
+                    base[1][0] = Convert4To8(static_cast<u8>(d >> 56 & 15));
+                    base[1][1] = Convert4To8(static_cast<u8>(d >> 48 & 15));
+                    base[1][2] = Convert4To8(static_cast<u8>(d >> 40 & 15));
+                }
+                const u8* const table[2] = {HEN_ETC1_MODIFIERS[d >> 37 & 7].data(),
+                                            HEN_ETC1_MODIFIERS[d >> 34 & 7].data()};
+                const u32 origin_x = (sub & 1) * 4, origin_y = (sub >> 1) * 4;
+                for (u32 lx = 0; lx < 4; lx++) {
+                    for (u32 ly = 0; ly < 4; ly++) {
+                        const u32 texel = 4 * lx + ly;
+                        const u32 half = (flip ? ly : lx) >= 2 ? 1 : 0;
+                        int modifier = table[half][d >> texel & 1];
+                        if ((d >> (16 + texel) & 1) != 0) {
+                            modifier = -modifier;
+                        }
+                        u8* const out =
+                            linear + (static_cast<std::size_t>(7 - (origin_y + ly)) * stride +
+                                      origin_x + lx) * 4;
+                        out[0] = static_cast<u8>(std::clamp(base[half][0] + modifier, 0, 255));
+                        out[1] = static_cast<u8>(std::clamp(base[half][1] + modifier, 0, 255));
+                        out[2] = static_cast<u8>(std::clamp(base[half][2] + modifier, 0, 255));
+                        if constexpr (has_alpha) {
+                            out[3] = Common::Color::Convert4To8(
+                                static_cast<u8>(alpha_bits >> (4 * texel) & 0xF));
+                        } else {
+                            out[3] = 255;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // (Switch 2 port) Every other format a pixel at a time, with the same DecodePixel and
+    // EncodePixel as the loop below but plain pointers and the table: the loop below took
+    // about 17 ns a pixel, and a final smash in Super Smash Bros. that makes the renderer
+    // write a colour surface back to memory every frame spent 17 ms a frame in it.
+    if constexpr (!is_compressed && !is_4bit) {
+        if (!std::is_constant_evaluated()) {
+            u8* const tile = tile_buffer.data();
+            u8* const linear = linear_buffer.data();
+            for (u32 y = 0; y < 8; y++) {
+                u8* const row =
+                    linear + static_cast<std::size_t>(7 - y) * stride * linear_bytes_per_pixel;
+                for (u32 x = 0; x < 8; x++) {
+                    u8* const tiled_pixel = tile + HEN_MORTON_TABLE[y * 8 + x] * bytes_per_pixel;
+                    u8* const linear_pixel = row + x * linear_bytes_per_pixel;
+                    if constexpr (morton_to_linear) {
+                        DecodePixel<format, converted>(tiled_pixel, linear_pixel);
+                    } else {
+                        EncodePixel<format, converted>(linear_pixel, tiled_pixel);
+                    }
+                }
+            }
+            return;
+        }
+    }
 
     for (u32 y = 0; y < 8; y++) {
         for (u32 x = 0; x < 8; x++) {

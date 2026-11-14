@@ -73,6 +73,12 @@ private:
     void SyncAndUploadLUTsLF();
 
     /// Syncs all enabled PICA texture units
+#ifdef __SWITCH__
+    /// (hen) Binds the generic fragment shader's pipeline for the current draw, with the
+    /// configuration in the uniforms; false if it does not support the draw or is not ready.
+    bool HenDrawGeneric();
+#endif
+
     void SyncTextureUnits(const Framebuffer* framebuffer);
 
     /// Syncs all utility textures in the fragment shader.
@@ -119,6 +125,7 @@ private:
     RenderManager& renderpass_cache;
     DescriptorUpdateQueue& update_queue;
     PipelineCache pipeline_cache;
+    bool hen_fallback_draw{}; // (Switch 2 port) the next software draw stands in for a pipeline still compiling
     TextureRuntime runtime;
     RasterizerCache res_cache;
 

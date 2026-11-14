@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include "common/hash.h"
 #include "common/thread_worker.h"
 #include "video_core/pica/regs_pipeline.h"
@@ -310,6 +312,15 @@ struct Shader : public Common::AsyncHandle {
     std::string program;
 };
 
+#ifdef __SWITCH__
+/// (hen) Destroys the pipeline parts kept for reuse (vk_graphics_pipeline.cpp); no build may
+/// be running.
+void HenDestroyPipelineParts(vk::Device device);
+#endif
+
+/// (hen) The id of the generic fragment shader in a pipeline's shader ids ("generic").
+inline constexpr u64 HEN_GENERIC_FS_ID = 0x0067656e65726963ull;
+
 class GraphicsPipeline : public Common::AsyncHandle {
 public:
     explicit GraphicsPipeline(const Instance& instance, RenderManager& renderpass_cache,
@@ -318,13 +329,22 @@ public:
                               Common::ThreadWorker* worker);
     ~GraphicsPipeline();
 
-    bool TryBuild(bool wait_built);
+    bool TryBuild(bool wait_built, bool fast_lane = false);
+
+    /// (Switch 2 port) The workers for pipelines that must not queue behind the slow ones.
+    static inline Common::ThreadWorker* hen_fast_worker{};
 
     bool Build(bool fail_on_compile_required = false);
 
     [[nodiscard]] vk::Pipeline Handle() const noexcept {
         return *pipeline;
     }
+
+    // (Switch 2 port) While this pipeline compiles: whether its draws are shaded on the CPU
+    // (1) or left out (2, since hen_cpu_denied), decided once so that an object is not drawn
+    // in one frame and missing in the next. vk_rasterizer.cpp, AccelerateDrawBatchInternal.
+    u8 hen_cpu_choice{};
+    std::chrono::steady_clock::time_point hen_cpu_denied{};
 
 private:
     const Instance& instance;

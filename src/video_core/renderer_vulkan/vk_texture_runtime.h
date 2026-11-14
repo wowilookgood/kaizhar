@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <span>
 #include "video_core/rasterizer_cache/framebuffer_base.h"
 #include "video_core/rasterizer_cache/rasterizer_cache_base.h"
@@ -172,6 +174,20 @@ private:
     BlitHelper blit_helper;
     StreamBuffer upload_buffer;
     StreamBuffer download_buffer;
+    /// (Switch 2 port) The last depth read-backs, for Surface::Download: by guest address and
+    /// part, not by surface object (a program may read several parts a frame, and a surface
+    /// may be made anew every frame).
+    struct HenDepthLag {
+        const u8* data{};
+        u32 addr{};
+        u32 size{};
+        u32 level{};
+        u32 left{}, top{}, right{}, bottom{};
+        u64 tick{};
+        std::chrono::steady_clock::time_point time{};
+    };
+    std::array<HenDepthLag, 8> hen_lags;
+    StreamBuffer depth_lag_buffer; // (Switch 2 port) Surface::Download, depth read by the program every frame
     u32 num_swapchain_images;
 };
 

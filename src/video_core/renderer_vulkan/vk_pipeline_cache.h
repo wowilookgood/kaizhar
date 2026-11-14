@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include <bitset>
 
 #include "video_core/rasterizer_interface.h"
@@ -67,7 +69,16 @@ public:
                      const VideoCore::DiskResourceLoadCallback& callback = {});
 
     /// Binds a pipeline using the provided information
-    bool BindPipeline(PipelineInfo& info, bool wait_built = false);
+    /// standin (Switch 2 port): the draw's vertices were shaded on the CPU, so the pipeline has
+    /// the trivial vertex shader. With --substitute, when such a pipeline is not ready yet the
+    /// last one bound with the same state and another fragment shader is used in its place.
+    bool BindPipeline(PipelineInfo& info, bool wait_built = false, bool fast_lane = false,
+                      bool standin = false);
+
+    /// (Switch 2 port) The pipeline the last BindPipeline that returned false was for.
+    GraphicsPipeline* HenPendingPipeline() const {
+        return hen_pending_pipeline;
+    }
 
     Pica::Shader::Generator::ExtraVSConfig CalcExtraConfig(
         const Pica::Shader::Generator::PicaVSConfig& config);
@@ -84,6 +95,22 @@ public:
 
     /// Binds a passthrough geometry shader
     void UseTrivialGeometryShader();
+
+    /// (hen) The pipeline with the generic fragment shader for a draw whose vertices were
+    /// shaded on the CPU (the trivial vertex shader is current), or null if it is not ready:
+    /// the first one for a pair of render target formats is built by a worker.
+    GraphicsPipeline* HenGenericPipeline(PipelineInfo& info);
+    /// (hen) Binds it (after the configuration is in the uniforms).
+    bool HenBindGeneric(PipelineInfo& info, GraphicsPipeline* pipeline);
+    void HenDropUnbuiltGeneric();
+    /// (hen) Called for every draw: the first one to a pair of render target formats starts
+    /// the generic pipeline for them on a worker, so it is there (about 200 ms later) before
+    /// a draw needs it. Whatever vertex shader is current will do: the slow part is the
+    /// fragment shader's, kept for every pipeline that follows.
+    void HenSeedGeneric(const PipelineInfo& info);
+    const Pica::Shader::Profile& HenProfile() const {
+        return profile;
+    }
 
     /// Binds a fragment shader generated from PICA state
     void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user);
@@ -112,6 +139,9 @@ private:
     void SaveDriverPipelineDiskCache();
 
     /// Loads the shader disk cache
+    /// Loads the disk cache if no cache is current yet
+    void EnsureDiskCache();
+
     void LoadDiskCache(const std::atomic_bool& stop_loading = std::atomic_bool{false},
                        const VideoCore::DiskResourceLoadCallback& callback = {});
 
@@ -151,6 +181,16 @@ private:
     Common::ThreadWorker shader_workers;
     PipelineInfo current_info{};
     GraphicsPipeline* current_pipeline{};
+    GraphicsPipeline* hen_pending_pipeline{};
+    /// (hen) The generic fragment shader (GenerateGenericFragmentShader) and its pipelines, by
+    /// state. Kept apart from the disk cache's: they are not the program's own and must not be
+    /// written to its files.
+    std::unordered_map<u64, std::unique_ptr<GraphicsPipeline>> hen_generic_pipelines;
+    GraphicsPipeline* hen_forced_pipeline{};
+    /// (the first generic pipeline for each pair of render target formats)
+    std::unordered_map<u64, GraphicsPipeline*> hen_generic_targets;
+    u64 hen_generic_seeded = 0;
+    std::unordered_map<u64, GraphicsPipeline*> hen_substitutes; ///< by state without the fragment shader
     std::array<DescriptorHeap, NumDescriptorHeaps> descriptor_heaps;
     std::array<vk::DescriptorSet, NumRasterizerSets> bound_descriptor_sets{};
     std::array<u32, NumDynamicOffsets> offsets{};
@@ -159,6 +199,7 @@ private:
     std::array<Shader*, MAX_SHADER_STAGES> current_shaders;
 
     Shader trivial_vertex_shader;
+    Shader hen_generic_fragment_shader;
 
     u64 current_program_id{0};
     std::vector<std::shared_ptr<ShaderDiskCache>> disk_caches;

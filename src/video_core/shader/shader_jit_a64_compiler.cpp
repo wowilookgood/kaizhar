@@ -865,7 +865,7 @@ void JitShader::Compile_EMIT(Instruction instr) {
     CBNZ(XSCRATCH0, have_emitter);
 
     ABI_PushRegisters(*this, PersistentCallerSavedRegs());
-    MOVP2R(ABI_PARAM1, reinterpret_cast<const void*>("Execute EMIT on VS"));
+    MOV(ABI_PARAM1, static_cast<u64>(reinterpret_cast<std::uintptr_t>("Execute EMIT on VS"))); // (absolute: see CallFarFunction)
     CallFarFunction(*this, LogCritical);
     ABI_PopRegisters(*this, PersistentCallerSavedRegs());
     B(end);
@@ -887,7 +887,7 @@ void JitShader::Compile_SETE(Instruction instr) {
     CBNZ(XSCRATCH0, have_emitter);
 
     ABI_PushRegisters(*this, PersistentCallerSavedRegs());
-    MOVP2R(ABI_PARAM1, reinterpret_cast<const void*>("Execute SETEMIT on VS"));
+    MOV(ABI_PARAM1, static_cast<u64>(reinterpret_cast<std::uintptr_t>("Execute SETEMIT on VS"))); // (absolute: see CallFarFunction)
     CallFarFunction(*this, LogCritical);
     ABI_PopRegisters(*this, PersistentCallerSavedRegs());
     B(end);
@@ -1043,11 +1043,11 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
     code_mem = std::make_unique<oaknut::CodeBlock>(code_size);
     code_mem->unprotect();
 
-    program = reinterpret_cast<CompiledShader*>(reinterpret_cast<std::byte*>(code_mem->ptr()) +
+    program = reinterpret_cast<CompiledShader*>(reinterpret_cast<std::byte*>(code_mem->xptr()) +
                                                 program_offset);
 
     // Copy to executable memory
-    std::memcpy(code_mem->ptr(), code_vec.data(), code_vec.size() * sizeof(u32));
+    std::memcpy(code_mem->wptr(), code_vec.data(), code_vec.size() * sizeof(u32));
 
     // Memory is ready to execute
     code_mem->protect();
