@@ -1,0 +1,34 @@
+diff --git a/src/assert.cpp b/src/assert.cpp
+index 8772439..4f4532d 100644
+--- a/src/assert.cpp
++++ b/src/assert.cpp
+@@ -9,10 +9,29 @@
+ 
+ #include <fmt/format.h>
+ 
++// Azahar's Switch 2 port: while the JIT compiles blocks the program hasn't reached (dynarmic's
++// AddressSpace::HenEmitAhead), some of them data rather than code, a failed assertion means
++// "leave this block" rather than a bug: thrown, for the JIT to catch.
++extern "C" {
++int hen_assert_throws = 0;
++}
++// The same for a whole thread (the JIT's translation worker, which only ever translates blocks
++// the program hasn't reached).
++static thread_local bool hen_assert_throws_here = false;
++extern "C" void hen_assert_throws_on_this_thread(void) {
++    hen_assert_throws_here = true;
++}
++
+ namespace mcl::detail {
+ 
+ [[noreturn]] void assert_terminate_impl(const char* expr_str, fmt::string_view msg, fmt::format_args args)
+ {
++    if (hen_assert_throws_here) {
++        throw 1;  // (before the shared flag: another thread sets and clears that one)
++    }
++    if (hen_assert_throws) {
++        throw 1;
++    }
+     fmt::print(stderr, "assertion failed: {}\nMessage:", expr_str);
+     fmt::vprint(stderr, msg, args);
+     std::fflush(stderr);

@@ -1,0 +1,73 @@
+diff --git a/include/cryptopp/config_os.h b/include/cryptopp/config_os.h
+index a08864f..a31cab3 100644
+--- a/include/cryptopp/config_os.h
++++ b/include/cryptopp/config_os.h
+@@ -39,7 +39,8 @@
+ #endif
+ 
+ // Unix and Linux platforms
+-#if defined(__unix__) || defined(__MACH__) || defined(__NetBSD__) || defined(__sun)
++// (Switch 2 homebrew, newlib on Horizon: POSIX-like; random numbers from arc4random, osrng.cpp)
++#if defined(__unix__) || defined(__MACH__) || defined(__NetBSD__) || defined(__sun) || defined(__SWITCH__)
+ #define CRYPTOPP_UNIX_AVAILABLE
+ #endif
+ 
+diff --git a/src/core/cpu.cpp b/src/core/cpu.cpp
+index bb756ca..e9f235c 100644
+--- a/src/core/cpu.cpp
++++ b/src/core/cpu.cpp
+@@ -1165,6 +1165,12 @@ void DetectArmFeatures()
+ {
+ #ifndef CRYPTOPP_DISABLE_ASM
+ 
++#if defined(__SWITCH__)
++	// Switch 2 homebrew: Horizon has no auxv to query and no signals for the
++	// SIGILL probes. The console's CPU has these (the toolchain already
++	// compiles with +crc+crypto).
++	g_hasARMv7 = g_hasNEON = g_hasCRC32 = g_hasPMULL = g_hasAES = g_hasSHA1 = g_hasSHA2 = true;
++#else
+ 	// The CPU_ProbeXXX's return false for OSes which
+ 	// can't tolerate SIGILL-based probes
+ 	g_hasARMv7 = CPU_QueryARMv7() || CPU_ProbeARMv7();
+@@ -1178,6 +1184,7 @@ void DetectArmFeatures()
+ 	g_hasSHA3 = CPU_QuerySHA3(); // || CPU_ProbeSHA3();
+ 	g_hasSM3 = CPU_QuerySM3(); // || CPU_ProbeSM3();
+ 	g_hasSM4 = CPU_QuerySM4(); // || CPU_ProbeSM4();
++#endif  // __SWITCH__
+ 
+ #if defined(_SC_LEVEL1_DCACHE_LINESIZE)
+ 	// Glibc does not implement on some platforms. The runtime returns 0 instead of error.
+diff --git a/src/random/osrng.cpp b/src/random/osrng.cpp
+index ac2236a..67cb7b6 100644
+--- a/src/random/osrng.cpp
++++ b/src/random/osrng.cpp
+@@ -27,7 +27,7 @@
+ // based on ChaCha20. The ChaCha20 generator is seeded from /dev/random,
+ // so we can't completely avoid the blocking.
+ // https://www.freebsd.org/cgi/man.cgi?query=arc4random_buf.
+-#ifdef __FreeBSD__
++#if defined(__FreeBSD__) || defined(__SWITCH__)  // Switch: no /dev/urandom; newlib has arc4random
+ # define DONT_USE_O_NOFOLLOW 1
+ # define USE_FREEBSD_ARC4RANDOM 1
+ # include <stdlib.h>
+@@ -255,6 +255,12 @@ void NonblockingRng::GenerateBlock(byte *output, size_t size)
+ # endif
+ #endif
+ 
++#ifdef __SWITCH__
++// No /dev/random on Horizon: the same source as NonblockingRng.
++BlockingRng::BlockingRng() : m_fd(-1) {}
++BlockingRng::~BlockingRng() {}
++void BlockingRng::GenerateBlock(byte *output, size_t size) { arc4random_buf(output, size); }
++#else
+ BlockingRng::BlockingRng()
+ {
+ #ifndef DONT_USE_O_NOFOLLOW
+@@ -295,6 +301,7 @@ void BlockingRng::GenerateBlock(byte *output, size_t size)
+ 			sleep(1);
+ 	}
+ }
++#endif  // __SWITCH__
+ 
+ #endif  // BLOCKING_RNG_AVAILABLE
+ 

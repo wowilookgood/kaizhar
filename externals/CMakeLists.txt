@@ -317,7 +317,12 @@ else()
 endif()
 
 # OpenSSL
-if (USE_SYSTEM_OPENSSL)
+if (NINTENDO_SWITCH)
+    # Switch 2: no TLS library (LibreSSL doesn't build for libnx, and the console stays offline).
+    # hen/compat has the one OpenSSL function the core needs without TLS (RAND_bytes); the 3DS
+    # HTTP service can't make HTTPS requests (http_c.cpp).
+    set(OPENSSL_LIBRARIES "")
+elseif (USE_SYSTEM_OPENSSL)
     find_package(OpenSSL 1.1)
     set(OPENSSL_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
 else()
@@ -358,8 +363,12 @@ else()
     target_include_directories(httplib INTERFACE ./httplib)
     target_disable_warnings(httplib)
 endif()
-target_compile_options(httplib INTERFACE -DCPPHTTPLIB_OPENSSL_SUPPORT)
-target_link_libraries(httplib INTERFACE ${OPENSSL_LIBRARIES})
+if (NINTENDO_SWITCH)
+    target_include_directories(httplib INTERFACE ${PROJECT_SOURCE_DIR}/hen/compat)
+else()
+    target_compile_options(httplib INTERFACE -DCPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(httplib INTERFACE ${OPENSSL_LIBRARIES})
+endif()
 
 if (UNIX AND NOT APPLE)
     add_subdirectory(gamemode EXCLUDE_FROM_ALL)

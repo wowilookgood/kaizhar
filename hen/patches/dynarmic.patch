@@ -1,0 +1,2958 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925..15be90e 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include "dynarmic/backend/arm64/a32_address_space.h"
+ 
++#include "dynarmic/backend/arm64/fpsr_manager.h"
++
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+ #include "dynarmic/backend/arm64/abi.h"
+ #include "dynarmic/backend/arm64/devirtualize.h"
+@@ -17,9 +19,74 @@
+ #include "dynarmic/interface/A32/config.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+ #include "dynarmic/ir/opt/passes.h"
++#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
++#include <cstdio>
++
++// Azahar's Switch 2 port (hen/jit/hen_jit.c): statistics, and a switch for comparing.
++#if defined(__SWITCH__)
++extern "C" void hen_jit_note_lookup(void);
++extern "C" int hen_inline_exclusive;  // --no-inline-exclusive
++#if HEN_DEV
++extern "C" int hen_jit_trace;
++#else
++static const int hen_jit_trace = 0;
++#endif
++extern "C" int hen_fast_dispatch;
++extern "C" int hen_fold_cond_branch;  // --no-fold-cond-branch (A32::TranslationOptions::fold_cond_branch)
++extern "C" int hen_compact_links;     // --no-compact-links (EmitConfig::hen_compact_links)
++extern "C" int hen_link_table;
++#else
++static void hen_jit_note_lookup() {}
++static const int hen_inline_exclusive = 0;
++static const int hen_jit_trace = 0;
++static int hen_fast_dispatch = 1;
++static const int hen_fold_cond_branch = 0;
++static const int hen_compact_links = 0;
++static const int hen_link_table = 0;
++#endif
++
++// Development builds: counters of how generated code leaves a block (hen/jit/hen_jit.c).
++#if defined(__SWITCH__) && HEN_DEV
++extern "C" int hen_exit_counts;  // --no-exit-counts
++extern "C" unsigned long long hen_exit_count[8];
++#else
++static const int hen_exit_counts = 0;
++static unsigned long long hen_exit_count[8];
++#endif
++
++extern "C" const unsigned hen_a32_regs_offset = offsetof(Dynarmic::Backend::Arm64::A32JitState, regs);
+ 
+ namespace Dynarmic::Backend::Arm64 {
+ 
++// (Azahar's Switch 2 port) Live FPSR (fpsr_manager.cpp): the host register's bits into the
++// state before a call into the emulator, and the register zeroed after it.
++static void HenFoldFpsr(oaknut::CodeGenerator& code, oaknut::WReg w, oaknut::XReg x) {
++    using namespace oaknut::util;
++    if (!FpsrManager::Live()) {
++        return;
++    }
++    code.LDR(w, Xstate, offsetof(A32JitState, fpsr));
++    code.MRS(x, oaknut::SystemReg::FPSR);
++    code.ORR(w, w, x.toW());
++    code.STR(w, Xstate, offsetof(A32JitState, fpsr));
++}
++static void HenZeroFpsr(oaknut::CodeGenerator& code) {
++    using namespace oaknut::util;
++    if (FpsrManager::Live()) {
++        code.MSR(oaknut::SystemReg::FPSR, XZR);
++    }
++}
++
++// (Azahar's Switch 2 port, hen_exit_counts) One more on hen_exit_count[kind]: a plain add, the
++// emulated cores run on one thread. Uses Xscratch0 and X0.
++static void HenCountExit(oaknut::CodeGenerator& code, int kind) {
++    using namespace oaknut::util;
++    code.MOV(Xscratch0, mcl::bit_cast<u64>(&hen_exit_count[kind]));
++    code.LDR(X0, Xscratch0);
++    code.ADD(X0, X0, 1);
++    code.STR(X0, Xscratch0);
++}
++
+ template<auto mfp, typename T>
+ static void* EmitCallTrampoline(oaknut::CodeGenerator& code, T* this_) {
+     using namespace oaknut::util;
+@@ -54,10 +121,12 @@ static void* EmitWrappedReadCallTrampoline(oaknut::CodeGenerator& code, T* this_
+ 
+     void* target = code.xptr<void*>();
+     ABI_PushRegisters(code, save_regs, 0);
++    HenFoldFpsr(code, W0, X1);
+     code.LDR(X0, l_this);
+     code.MOV(X1, Xscratch0);
+     code.LDR(Xscratch0, l_addr);
+     code.BLR(Xscratch0);
++    HenZeroFpsr(code);
+     code.MOV(Xscratch0, X0);
+     ABI_PopRegisters(code, save_regs, 0);
+     code.RET();
+@@ -109,11 +178,13 @@ static void* EmitWrappedWriteCallTrampoline(oaknut::CodeGenerator& code, T* this
+ 
+     void* target = code.xptr<void*>();
+     ABI_PushRegisters(code, save_regs, 0);
++    HenFoldFpsr(code, W0, X1);
+     code.LDR(X0, l_this);
+     code.MOV(X1, Xscratch0);
+     code.MOV(X2, Xscratch1);
+     code.LDR(Xscratch0, l_addr);
+     code.BLR(Xscratch0);
++    HenZeroFpsr(code);
+     ABI_PopRegisters(code, save_regs, 0);
+     code.RET();
+ 
+@@ -158,11 +229,52 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
+ A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
+         : AddressSpace(conf.code_cache_size)
+         , conf(conf) {
++    hen_pc_offset = offsetof(A32JitState, regs) + 15 * sizeof(u32);
++    if (conf.page_table && conf.read_page_table) {
++        // (what one ADD or SUB with an immediate reaches: emit_arm64_memory.cpp)
++        const s64 offset = static_cast<s64>(mcl::bit_cast<u64>(conf.page_table) - mcl::bit_cast<u64>(conf.read_page_table));
++        ASSERT_MSG(offset != 0 && (offset & 0xfff) == 0 && offset > -(s64(1) << 24) && offset < (s64(1) << 24), "read_page_table is too far from page_table");
++    }
++    ClearDispatchTable();
+     EmitPrelude();
+ }
+ 
+ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+-    IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions});
++    IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions, hen_fold_cond_branch != 0});
++
++    Optimization::PolyfillPass(ir_block, {});
++    Optimization::NamingPass(ir_block);
++    if (conf.HasOptimization(OptimizationFlag::GetSetElimination)) {
++        Optimization::A32GetSetElimination(ir_block, {.convert_nzc_to_nz = true});
++        Optimization::DeadCodeElimination(ir_block);
++    }
++    if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
++        Optimization::A32ConstantMemoryReads(ir_block, conf.callbacks);
++        Optimization::ConstantPropagation(ir_block);
++        Optimization::DeadCodeElimination(ir_block);
++    }
++    Optimization::IdentityRemovalPass(ir_block);
++    Optimization::VerificationPass(ir_block);
++
++    return ir_block;
++}
++
++// For the translation worker: as GenerateIR, but the program's code is read through HenReadCode.
++IR::Block A32AddressSpace::HenGenerateIRQuiet(IR::LocationDescriptor descriptor) const {
++    if (conf.page_table == nullptr || conf.absolute_offset_page_table) {
++        throw 1;  // (no quiet way to read code)
++    }
++    struct QuietCallbacks final : A32::TranslateCallbacks {
++        explicit QuietCallbacks(const A32AddressSpace& self) : self(self) {}
++        std::optional<std::uint32_t> MemoryReadCode(A32::VAddr vaddr) override { return self.HenReadCode(vaddr); }
++        bool PreCodeReadHook(bool, A32::VAddr, A32::IREmitter&) override { return true; }
++        void PreCodeTranslationHook(bool, A32::VAddr, A32::IREmitter&) override {}
++        std::uint64_t GetTicksForCode(bool is_thumb, A32::VAddr vaddr, std::uint32_t instruction) override {
++            return self.conf.callbacks->GetTicksForCode(is_thumb, vaddr, instruction);
++        }
++        const A32AddressSpace& self;
++    } quiet{*this};
++    IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, &quiet, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions, hen_fold_cond_branch != 0});
+ 
+     Optimization::PolyfillPass(ir_block, {});
+     Optimization::NamingPass(ir_block);
+@@ -182,7 +294,23 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+ }
+ 
+ void A32AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges) {
+-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
++    HenEmuLock hen_lock{*this};
++    const auto descriptors = block_ranges.InvalidateRanges(ranges);
++    // (Two lines in the log around the larger ones: a crash leaves no report here, and what
++    // the program had just done is the only evidence.)
++#if HEN_DEV
++    const bool say = descriptors.size() >= 64;
++#else
++    const bool say = false;
++#endif
++    if (say) {
++        std::printf("hen: jit: invalidating %zu blocks in %zu ranges\n", descriptors.size(),
++                    static_cast<std::size_t>(boost::icl::interval_count(ranges)));
++    }
++    InvalidateBasicBlocks(descriptors);
++    if (say) {
++        std::printf("hen: jit: invalidated\n");
++    }
+ }
+ 
+ void A32AddressSpace::EmitPrelude() {
+@@ -221,6 +349,7 @@ void A32AddressSpace::EmitPrelude() {
+     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A32::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
+ 
+     oaknut::Label return_from_run_code, l_return_to_dispatcher;
++    oaknut::Label hen_halted, hen_out_of_ticks;  // (hen_exit_counts: return_from_run_code, counted)
+ 
+     prelude_info.run_code = code.xptr<PreludeInfo::RunCodeFuncType>();
+     {
+@@ -230,7 +359,7 @@ void A32AddressSpace::EmitPrelude() {
+         code.MOV(Xstate, X1);
+         code.MOV(Xhalt, X2);
+         if (conf.page_table) {
+-            code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.page_table));
++            code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.read_page_table ? conf.read_page_table : conf.page_table));
+         }
+         if (conf.fastmem_pointer) {
+             code.MOV(Xfastmem, *conf.fastmem_pointer);
+@@ -254,6 +383,7 @@ void A32AddressSpace::EmitPrelude() {
+         code.MRS(Xscratch1, oaknut::SystemReg::FPCR);
+         code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpcr));
+         code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++        HenZeroFpsr(code);
+ 
+         code.LDAR(Wscratch0, Xhalt);
+         code.CBNZ(Wscratch0, return_from_run_code);
+@@ -269,7 +399,7 @@ void A32AddressSpace::EmitPrelude() {
+         code.MOV(Xstate, X1);
+         code.MOV(Xhalt, X2);
+         if (conf.page_table) {
+-            code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.page_table));
++            code.MOV(Xpagetable, mcl::bit_cast<u64>(conf.read_page_table ? conf.read_page_table : conf.page_table));
+         }
+         if (conf.fastmem_pointer) {
+             code.MOV(Xfastmem, *conf.fastmem_pointer);
+@@ -292,6 +422,7 @@ void A32AddressSpace::EmitPrelude() {
+         code.MRS(Xscratch1, oaknut::SystemReg::FPCR);
+         code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpcr));
+         code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++        HenZeroFpsr(code);
+ 
+         oaknut::Label step_hr_loop;
+         code.l(step_hr_loop);
+@@ -309,21 +440,58 @@ void A32AddressSpace::EmitPrelude() {
+         oaknut::Label l_this, l_addr;
+ 
+         code.LDAR(Wscratch0, Xhalt);
+-        code.CBNZ(Wscratch0, return_from_run_code);
++        code.CBNZ(Wscratch0, hen_exit_counts ? hen_halted : return_from_run_code);
+ 
+         if (conf.enable_cycle_counting) {
+             code.CMP(Xticks, 0);
+-            code.B(LE, return_from_run_code);
++            code.B(LE, hen_exit_counts ? hen_out_of_ticks : return_from_run_code);
++        }
++
++        // (Azahar's Switch 2 port) The block for the current location, from the dispatch table
++        // (address_space.h) if it is there.
++        oaknut::Label l_table, slow;
++        if (hen_fast_dispatch) {
++            static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
++            static_assert(dispatch_table_size == 0x10000 && sizeof(DispatchEntry) == 16);
++            code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++            code.LSR(W1, W0, 2);
++            code.EOR(W1, W1, W0, LSR, 14);
++            code.LSR(X2, X0, 32);
++            code.EOR(W1, W1, W2);
++            code.AND(W1, W1, 0xffff);
++            code.LDR(X2, l_table);
++            code.ADD(X2, X2, X1, LSL, 4);
++            code.LDP(Xscratch0, Xscratch1, X2);
++            code.CMP(X0, Xscratch0);
++            code.B(NE, slow);
++            code.BR(Xscratch1);
++        }
++        code.l(slow);
++        if (hen_exit_counts) {
++            HenCountExit(code, 7);
+         }
+ 
++        HenFoldFpsr(code, W0, X1);
+         code.LDR(X0, l_this);
+         code.MOV(X1, Xstate);
+         code.LDR(Xscratch0, l_addr);
+         code.BLR(Xscratch0);
++        HenZeroFpsr(code);
+         code.BR(X0);
+ 
+         const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
+-            return self.GetOrEmit(context.GetLocationDescriptor());
++            const IR::LocationDescriptor descriptor = context.GetLocationDescriptor();
++            if (hen_jit_trace) {
++                std::printf("L  %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++            }
++            const CodePtr entry_point = self.HenGetOrDefer(descriptor);
++            hen_jit_note_lookup();
++            if (entry_point == self.hen_defer_stub) {
++                return entry_point;  // (not a block: nothing for the table)
++            }
++            // (GetOrEmit may have emptied the table: written after it.)
++            self.dispatch_table[DispatchIndex(descriptor.Value())] = {descriptor.Value(), entry_point};
++            return entry_point;
+         };
+ 
+         code.align(8);
+@@ -331,12 +499,16 @@ void A32AddressSpace::EmitPrelude() {
+         code.dx(mcl::bit_cast<u64>(this));
+         code.l(l_addr);
+         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
++        code.l(l_table);
++        code.dx(mcl::bit_cast<u64>(dispatch_table.get()));
+     }
+ 
+     prelude_info.return_from_run_code = code.xptr<void*>();
+     {
+         code.l(return_from_run_code);
+ 
++        HenFoldFpsr(code, Wscratch0, Xscratch1);
++
+         if (conf.enable_cycle_counting) {
+             code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
+             code.SUB(X1, X1, Xticks);
+@@ -356,13 +528,52 @@ void A32AddressSpace::EmitPrelude() {
+         code.RET();
+     }
+ 
++    // (Azahar's Switch 2 port) Where a lookup sends the program when the block isn't compiled
++    // and is to be interpreted (AddressSpace::HenGetOrDefer): leave, saying so.
++    hen_defer_stub = code.xptr<CodePtr>();
++    {
++        oaknut::Label defer_hr_loop;
++        code.l(defer_hr_loop);
++        code.LDAXR(Wscratch0, Xhalt);
++        code.ORR(Wscratch0, Wscratch0, static_cast<u32>(HaltReason::UserDefined2));  // (UserDefined1 is HaltExecution's default)
++        code.STLXR(Wscratch1, Wscratch0, Xhalt);
++        code.CBNZ(Wscratch1, defer_hr_loop);
++        code.B(return_from_run_code);
++    }
++
++    // (Azahar's Switch 2 port, hen_exit_counts) Where a block's exit goes instead of straight
++    // to the dispatcher, by kind (emit_arm64.h, LinkTarget::Hen...; AddressSpace::Link), and
++    // the dispatcher's two ways out of generated code. Indices: hen/jit/hen_jit.c.
++    if (hen_exit_counts) {
++        prelude_info.hen_exit_predicted = code.xptr<void*>();
++        HenCountExit(code, 0);
++        code.BR(Xscratch1);
++        const auto to_dispatcher = [&](int kind) {
++            void* const stub = code.xptr<void*>();
++            HenCountExit(code, kind);
++            code.B(prelude_info.return_to_dispatcher);
++            return stub;
++        };
++        prelude_info.hen_exit_return = to_dispatcher(1);
++        prelude_info.hen_exit_indirect = to_dispatcher(2);
++        prelude_info.hen_exit_other = to_dispatcher(3);
++        prelude_info.hen_exit_unlinked = to_dispatcher(4);
++        code.l(hen_halted);
++        HenCountExit(code, 5);
++        code.B(return_from_run_code);
++        code.l(hen_out_of_ticks);
++        HenCountExit(code, 6);
++        code.B(return_from_run_code);
++    }
++
+     code.align(8);
+     code.l(l_return_to_dispatcher);
+     code.dx(mcl::bit_cast<u64>(prelude_info.return_to_dispatcher));
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
+-    mem.invalidate_all();
++    // (only the prelude: where code memory is mapped piece by piece, the whole buffer would be)
++    mem.invalidate(mem.xptr(), static_cast<size_t>(code.offset()));
+     ProtectCodeMemory();
+ }
+ 
+@@ -387,6 +598,7 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+         .absolute_offset_page_table = conf.absolute_offset_page_table,
+         .detect_misaligned_access_via_page_table = conf.detect_misaligned_access_via_page_table,
+         .only_detect_misalignment_via_page_table_on_page_boundary = conf.only_detect_misalignment_via_page_table_on_page_boundary,
++        .hen_write_page_table_offset = conf.page_table && conf.read_page_table ? static_cast<s64>(mcl::bit_cast<u64>(conf.page_table) - mcl::bit_cast<u64>(conf.read_page_table)) : 0,
+ 
+         .fastmem_pointer = conf.fastmem_pointer,
+         .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
+@@ -411,6 +623,13 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+         .coprocessors = conf.coprocessors,
+ 
+         .very_verbose_debugging_output = conf.very_verbose_debugging_output,
++
++        .hen_exclusive_addresses = hen_inline_exclusive && conf.global_monitor ? mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, 0)) : 0,
++        .hen_exclusive_value = hen_inline_exclusive && conf.global_monitor ? mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)) : 0,
++        .hen_exclusive_processors = conf.global_monitor ? GetExclusiveMonitorProcessorCount(conf.global_monitor) : 0,
++        .hen_exclusive_processor_id = conf.processor_id,
++
++        .hen_compact_links = hen_compact_links != 0 && hen_link_table != 0,
+     };
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.h b/src/dynarmic/backend/arm64/a32_address_space.h
+index 3b9e9fb..c7f0322 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.h
++++ b/src/dynarmic/backend/arm64/a32_address_space.h
+@@ -5,6 +5,7 @@
+ 
+ #pragma once
+ 
++#include <cstring>
+ #include "dynarmic/backend/arm64/address_space.h"
+ #include "dynarmic/backend/block_range_information.h"
+ #include "dynarmic/interface/A32/config.h"
+@@ -26,6 +27,24 @@ protected:
+ 
+     void EmitPrelude();
+     EmitConfig GetEmitConfig() override;
++    /// The program's code straight from the page table where there is one: quiet (a miss is
++    /// no error) and usable from the translation worker's thread.
++    std::optional<u32> HenReadCode(u32 vaddr) const override {
++        if (conf.page_table != nullptr && !conf.absolute_offset_page_table) {
++            const std::uint8_t* const page = (*conf.page_table)[vaddr >> A32::UserConfig::PAGE_BITS];
++            if (page == nullptr) {
++                return std::nullopt;
++            }
++            u32 value;
++            std::memcpy(&value, page + (vaddr & ((u32(1) << A32::UserConfig::PAGE_BITS) - 1) & ~u32(3)), sizeof(value));
++            return value;
++        }
++        return conf.callbacks->MemoryReadCode(vaddr);
++    }
++    IR::Block HenGenerateIRQuiet(IR::LocationDescriptor descriptor) const override;
++public:
++    ~A32AddressSpace() override { HenStopWorker(); }
++protected:
+     void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) override;
+ 
+     const A32::UserConfig conf;
+diff --git a/src/dynarmic/backend/arm64/a32_core.h b/src/dynarmic/backend/arm64/a32_core.h
+index 86f6f28..5b9b57f 100644
+--- a/src/dynarmic/backend/arm64/a32_core.h
++++ b/src/dynarmic/backend/arm64/a32_core.h
+@@ -8,6 +8,14 @@
+ #include "dynarmic/backend/arm64/a32_address_space.h"
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+ 
++#include <cstdio>
++#if defined(__SWITCH__) && HEN_DEV
++extern "C" int hen_jit_trace;
++#define hen_jit_trace_core hen_jit_trace
++#else
++#define hen_jit_trace_core 0
++#endif
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
+ class A32Core final {
+@@ -16,7 +24,13 @@ public:
+ 
+     HaltReason Run(A32AddressSpace& process, A32JitState& thread_ctx, volatile u32* halt_reason) {
+         const auto location_descriptor = thread_ctx.GetLocationDescriptor();
+-        const auto entry_point = process.GetOrEmit(location_descriptor);
++        if (hen_jit_trace_core) {
++            std::printf("R1 %016llx\n", static_cast<unsigned long long>(location_descriptor.Value()));
++        }
++        const auto entry_point = process.HenGetOrDefer(location_descriptor);
++        if (hen_jit_trace_core) {
++            std::printf("R2 %p%s\n", static_cast<const void*>(entry_point), entry_point == process.hen_defer_stub ? " stub" : "");
++        }
+         return process.prelude_info.run_code(entry_point, &thread_ctx, halt_reason);
+     }
+ 
+diff --git a/src/dynarmic/backend/arm64/a32_interface.cpp b/src/dynarmic/backend/arm64/a32_interface.cpp
+index 6b38c41..1009bfa 100644
+--- a/src/dynarmic/backend/arm64/a32_interface.cpp
++++ b/src/dynarmic/backend/arm64/a32_interface.cpp
+@@ -126,6 +126,36 @@ struct Jit::Impl final {
+         ASSERT_FALSE("Unimplemented");
+     }
+ 
++    size_t HenUpgradeLinks(u64 deadline_ns, size_t max_sites) {
++        return current_address_space.HenUpgradeLinks(deadline_ns, max_sites);
++    }
++
++    bool HenPeekDefer() {
++        ASSERT(!jit_interface->is_executing);
++        // Anything Run() deals with on entry (a cache invalidation asked for, a halt): not here.
++        if (Atomic::Load(&halt_reason) != 0) {
++            return false;
++        }
++        const CodePtr entry = current_address_space.HenGetOrDefer(current_state.GetLocationDescriptor(), true);
++        return entry != nullptr && entry == current_address_space.hen_defer_stub;
++    }
++
++    size_t HenCompileFrontier(u64 deadline_ns) {
++        return current_address_space.HenCompileFrontier(deadline_ns);
++    }
++
++    void HenSetTag(u16 tag) {
++        current_address_space.hen_tag = tag;
++    }
++
++    size_t HenPrecompile(const void* blocks, u8* state, size_t count, u64 deadline_ns, size_t* compiled) {
++        return current_address_space.HenPrecompile(static_cast<const AddressSpace::HenBlock*>(blocks), state, count, deadline_ns, compiled);
++    }
++
++    void HenSetList(const void* blocks, u8* state, size_t count) {
++        current_address_space.HenSetList(static_cast<const AddressSpace::HenBlock*>(blocks), state, count);
++    }
++
+ private:
+     void PerformRequestedCacheInvalidation(HaltReason hr) {
+         if (Has(hr, HaltReason::CacheInvalidation)) {
+@@ -232,6 +262,30 @@ void Jit::ClearExclusiveState() {
+     impl->ClearExclusiveState();
+ }
+ 
++std::size_t Jit::HenUpgradeLinks(std::uint64_t deadline_ns, std::size_t max_sites) {
++    return impl->HenUpgradeLinks(deadline_ns, max_sites);
++}
++
++bool Jit::HenPeekDefer() {
++    return impl->HenPeekDefer();
++}
++
++std::size_t Jit::HenCompileFrontier(std::uint64_t deadline_ns) {
++    return impl->HenCompileFrontier(deadline_ns);
++}
++
++void Jit::HenSetTag(std::uint16_t tag) {
++    impl->HenSetTag(tag);
++}
++
++std::size_t Jit::HenPrecompile(const void* blocks, std::uint8_t* state, std::size_t count, std::uint64_t deadline_ns, std::size_t* compiled) {
++    return impl->HenPrecompile(blocks, state, count, deadline_ns, compiled);
++}
++
++void Jit::HenSetList(const void* blocks, std::uint8_t* state, std::size_t count) {
++    impl->HenSetList(blocks, state, count);
++}
++
+ void Jit::DumpDisassembly() const {
+     impl->DumpDisassembly();
+ }
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae77..fd9a4e8 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -3,7 +3,10 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <algorithm>
+ #include <cstdio>
++#include <thread>
++#include <vector>
+ 
+ #include <mcl/bit_cast.hpp>
+ 
+@@ -18,12 +21,37 @@
+ #include "dynarmic/common/llvm_disassemble.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+ 
++#if defined(__SWITCH__)
++extern "C" int hen_link_table;  // Azahar's hen/jit/hen_jit.c
++extern "C" int hen_direct_links;  // --no-direct-links
++extern "C" void hen_jit_note_link(int kind);
++extern "C" void hen_jit_note_link_upgrades(unsigned long long count);
++extern "C" void hen_jit_note_compact(int kind, unsigned long long count);  // (kinds: hen/jit/hen_jit.c)
++#else
++static const int hen_link_table = 0;
++static const int hen_direct_links = 0;
++static void hen_jit_note_link(int) {}
++static void hen_jit_note_link_upgrades(unsigned long long) {}
++static void hen_jit_note_compact(int, unsigned long long) {}
++#endif
++
++#if defined(__SWITCH__) && HEN_DEV
++extern "C" void hen_jit_note_block_ticks(unsigned ticks, int folded);  // (for "hen: code:" and the "hen: exits:" estimate)
++#else
++static void hen_jit_note_block_ticks(unsigned, int) {}
++#endif
++
++extern "C" int hen_bump; // (Azahar, hen/jit/hen_jit.c: --jit-bump)
++extern "C" int hen_publish_early;
++extern "C" void hen_jit_note_early_publish(void);
++extern "C" void hen_jit_note_wake_skipped(void);
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
+ AddressSpace::AddressSpace(size_t code_cache_size)
+         : code_cache_size(code_cache_size)
+         , mem(code_cache_size)
+-        , code(mem.ptr(), mem.ptr())
++        , code(mem.wptr(), mem.xptr())
+         , fastmem_manager(exception_handler) {
+     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
+ 
+@@ -33,7 +61,402 @@ AddressSpace::AddressSpace(size_t code_cache_size)
+     });
+ }
+ 
+-AddressSpace::~AddressSpace() = default;
++AddressSpace::~AddressSpace() {
++    HenStopWorker();
++}
++
++// (Azahar's Switch 2 port) Translation on a second thread.
++//
++// Compiling a block is two steps: translating the program's instructions to IR and optimising
++// that (about 92% of the time: measured 1573 ms against 133 ms for 36,000 blocks), then
++// emitting host code from the IR. Only the second touches the code cache. So a worker thread
++// translates the blocks that compiled blocks branch to, before the program gets there, and
++// the emulation thread only emits. The worker reads the program's memory while the program
++// may be changing it, so a translation carries a hash of the code it was made from and is
++// used only if the code still hashes the same (HenTakeTranslation); anything else is
++// translated again on the spot, as before.
++#if defined(__SWITCH__)
++extern "C" void hen_assert_throws_on_this_thread(void);  // mcl's assert.cpp
++extern "C" int hen_translation_worker;                   // Azahar's hen/jit/hen_jit.c
++extern "C" void hen_jit_note_translation(unsigned made, unsigned used, unsigned stale);
++extern "C" void hen_jit_worker_started(void);
++extern "C" void hen_jit_worker_creating(void);
++extern "C" int hen_jit_alias_active(void);  // code stays mapped while it is updated (kaiHEN 0.01)
++extern "C" int hen_worker_depth_limit;      // --jit-worker-depth
++extern "C" unsigned long long hen_jit_now_ns(void);
++extern "C" int hen_emu_ahead;               // --jit-ahead
++#if HEN_DEV
++extern "C" int hen_jit_trace;  // --jit-trace: what each thread is translating, for finding a crash
++#define HEN_TRACE(...) do { if (hen_jit_trace) { std::printf(__VA_ARGS__); } } while (0)
++#else
++#define HEN_TRACE(...) do { } while (0)
++#endif
++#else
++#define HEN_TRACE(...) do { } while (0)
++static void hen_jit_worker_started() {}
++static void hen_jit_worker_creating() {}
++static void hen_assert_throws_on_this_thread() {}
++static const int hen_translation_worker = 0;
++static void hen_jit_note_translation(unsigned, unsigned, unsigned) {}
++static int hen_jit_alias_active() { return 0; }
++static const int hen_worker_depth_limit = 0;
++static unsigned long long hen_jit_now_ns() { return 0; }
++static const int hen_emu_ahead = 0;
++#endif
++
++#if defined(__SWITCH__)
++extern "C" void hen_jit_note_lock(unsigned long long ns);
++unsigned long long AddressSpace::HenLockClock() { return hen_jit_now_ns(); }
++void AddressSpace::HenLockNote(unsigned long long ns) { hen_jit_note_lock(ns); }
++#else
++unsigned long long AddressSpace::HenLockClock() { return 0; }
++void AddressSpace::HenLockNote(unsigned long long) {}
++#endif
++
++// (Azahar's Switch 2 port) Compiling on a second thread (hen_translation_worker == 3).
++//
++// Since kaiHEN 0.01, code memory stays mapped while it is updated (hen_jit.c: the update goes
++// through the HEN's writable view), so new code can be added while the program runs old code. And
++// with block links in a table (hen_link_table), compiling a block changes no code that exists.
++// So the worker does all of it for the blocks ahead of the program: translating, emitting and
++// publishing, about 50 us a block plus about 80 us a batch that the emulation thread no longer
++// spends. The emulation thread compiles only what it misses, with a few blocks ahead.
++//
++// The rules:
++//   - hen_compile_mutex is held for everything that reads or changes the block tables, the
++//     code cursor or the link slots, on either thread. Generated code holds nothing: it reads
++//     only link slots and the dispatch table.
++//   - A block is in no table the emulation thread can see until its code is published: the
++//     worker keeps the mutex from emitting a batch until after publishing it.
++//   - Stores to link slots that code already running may read wait until after the publish
++//     (hen_deferred_slots): a slot must never lead to code that isn't there yet.
++//   - The worker ends its batch when the emulation thread wants the mutex (hen_emu_waiting).
++//   - The worker never clears the cache and stops adding to it well before it is full.
++//   - The worker reads the program's code through HenReadCode, not the emulator's callbacks
++//     (they follow the emulation thread's current process). Code it reads while the program
++//     is still writing it is caught as on hardware: the program flushes the instruction cache
++//     after writing code, which invalidates the block.
++bool AddressSpace::HenWorkerCompiles() const {
++    return hen_translation_worker == 3 && hen_link_table && hen_tag != 0xffff && hen_jit_alias_active();
++}
++
++void AddressSpace::HenWorkerCompileBatch() {
++    constexpr size_t batch = 8;
++    size_t compiled = 0;
++    // (2026-11-13, --no-jit-publish-early) A block the program keeps coming back to (asked
++    // for again after hen_bump visits: hen_worker_hot) is compiled before everything else and
++    // published at once, not when the batch is full: a loop reaches its visit limit within
++    // about a batch's length, and the emulation thread then compiled the block itself or
++    // waited for this lock (Kid Icarus' first five seconds: 520 such compiles, 100 ms of
++    // waits). The first version ended the batch when the list of asked-for blocks was empty:
++    // it never is in a title's first seconds (44 batches in a run).
++    bool hot_done = false;
++    {
++        std::scoped_lock big{hen_compile_mutex};
++        hen_on_worker = true;
++        protect_deferred = true;
++        while (compiled < batch && hen_emu_waiting.load(std::memory_order_relaxed) == 0) {
++            IR::LocationDescriptor descriptor{0};
++            bool queued = false, hot = false;
++            {
++                std::scoped_lock lock{hen_worker_mutex};
++                if (hen_worker_stop) {
++                    break;
++                }
++                if (hot_done && hen_worker_hot.empty()) {
++                    hen_jit_note_early_publish();
++                    break;
++                }
++                if (!hen_worker_hot.empty()) {
++                    descriptor = hen_worker_hot.back();
++                    hen_worker_hot.pop_back();
++                    queued = true;
++                    hot = true;
++                } else if (!hen_worker_todo.empty()) {
++                    descriptor = hen_worker_todo.back();  // newest first: nearest to where the program is
++                    hen_worker_todo.pop_back();
++                    queued = true;
++                }
++            }
++            size_t from_list = SIZE_MAX;
++            if (!queued && hen_list_blocks != nullptr) {
++                // Nothing the program asked for is waiting: the saved list, in its order (what
++                // the program ran last time first). Code that isn't there yet (a module loaded
++                // later) is looked at again every two seconds.
++                if (hen_list_next >= hen_list_count && hen_list_retry && hen_jit_now_ns() >= hen_list_repass_ns) {
++                    hen_list_next = 0;
++                    hen_list_retry = false;
++                    hen_list_repass_ns = hen_jit_now_ns() + 2'000'000'000ull;
++                }
++                while (hen_list_next < hen_list_count && GetRemainingSize() >= 16 * 1024 * 1024) {
++                    const size_t i = hen_list_next++;
++                    if (hen_list_state[i] == 1) {
++                        continue;
++                    }
++                    const IR::LocationDescriptor listed{hen_list_blocks[i].descriptor};
++                    if (Get(listed)) {
++                        hen_list_state[i] = 1;
++                        continue;
++                    }
++                    u32 hash;
++                    if (!HenHash(static_cast<u32>(hen_list_blocks[i].descriptor), hen_list_blocks[i].words, hash) || hash != hen_list_blocks[i].hash) {
++                        hen_list_state[i] = 2;
++                        hen_list_retry = true;
++                        continue;
++                    }
++                    descriptor = listed;
++                    from_list = i;
++                    queued = true;
++                    break;
++                }
++            }
++            if (!queued) {
++                // Nothing near the program is waiting: outwards from all compiled blocks, as the
++                // emulation thread did in its idle time (HenCompileFrontier), while the cache
++                // is less than half full.
++                constexpr size_t speculation_limit = 80 * 1024 * 1024;
++                if (hen_frontier.empty() || static_cast<size_t>(code.offset()) > speculation_limit || !HenWorkerCompiles()) {
++                    hen_frontier_work.store(false);
++                    break;
++                }
++                descriptor = hen_frontier.front();
++                hen_frontier.pop_front();
++            }
++            if ((descriptor.Value() & (u64(4) << 32)) || Get(descriptor)) {
++                std::scoped_lock lock{hen_worker_mutex};
++                hen_worker_seen.erase(descriptor);
++                continue;
++            }
++            if (!HenWorkerCompiles() || GetRemainingSize() < 16 * 1024 * 1024) {
++                std::scoped_lock lock{hen_worker_mutex};
++                hen_worker_todo.clear();
++            hen_worker_hot.clear();
++                hen_worker_seen.clear();
++                hen_frontier_work.store(false);
++                break;
++            }
++            EmittedBlockInfo info;
++            // (recorded as speculation unless the program asked for it, or the list says it ran)
++            const bool speculative = from_list != SIZE_MAX ? (hen_list_blocks[from_list].tag & 0x8000) != 0 : !queued;
++            const bool emitted = HenEmitAhead(descriptor, &info, speculative);
++            if (from_list != SIZE_MAX) {
++                hen_list_state[from_list] = emitted ? 1 : 2;
++            }
++            if (emitted) {
++                compiled++;
++                hot_done |= hot;
++                std::scoped_lock lock{hen_worker_mutex};
++                hen_worker_seen.erase(descriptor);  // (it may be wanted again after an invalidation)
++            }
++            // (a refusal stays in hen_worker_seen: not tried again)
++        }
++        protect_deferred = false;
++        if (compiled != 0) {
++            ProtectCodeMemory();  // published: the code is there for every thread
++        }
++        {
++            std::scoped_lock lookup{hen_lookup_mutex};
++            for (const auto& [location, entry] : hen_batch_new) {
++                hen_published.insert_or_assign(location, entry);
++            }
++        }
++        hen_batch_new.clear();
++        for (const auto& [slot, entry, entry_or_dispatcher] : hen_deferred_slots) {
++            (*slot)[1] = entry_or_dispatcher;
++            (*slot)[0] = entry;
++        }
++        hen_deferred_slots.clear();
++        hen_on_worker = false;
++    }
++    if (compiled != 0) {
++        hen_jit_note_translation(static_cast<unsigned>(compiled), 0, 0);
++    }
++    // (the mutex isn't fair: let the emulation thread have it)
++    while (hen_emu_waiting.load(std::memory_order_relaxed) != 0) {
++        std::this_thread::yield();
++    }
++}
++
++void AddressSpace::HenSetList(const HenBlock* blocks, u8* state, size_t count) {
++    HenEmuLock hen_lock{*this};
++    hen_list_blocks = blocks;
++    hen_list_state = state;
++    hen_list_count = blocks ? count : 0;
++    hen_list_next = 0;
++    hen_list_retry = false;
++    hen_list_repass_ns = 0;
++    if (blocks != nullptr && hen_worker_started && !hen_frontier_work.exchange(true)) {
++        hen_worker_wake.notify_one();
++    }
++}
++
++void AddressSpace::HenStopWorker() {
++    if (!hen_worker_started) {
++        return;
++    }
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        hen_worker_stop = true;
++    }
++    hen_worker_wake.notify_all();
++    pthread_join(hen_worker, nullptr);
++    hen_worker_started = false;
++}
++
++void AddressSpace::HenQueueTranslation(IR::LocationDescriptor descriptor) {
++    if (!hen_translation_worker || hen_tag == 0xffff) {
++        return;
++    }
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        if (hen_worker_stop || !hen_worker_seen.insert(descriptor).second) {
++            return;
++        }
++        // (bounded: a program that never reaches most of these shouldn't hold their IR for ever)
++        if (hen_worker_seen.size() > 60000) {
++            hen_worker_seen.clear();
++            hen_worker_done.clear();
++            hen_worker_todo.clear();
++            hen_worker_hot.clear();
++            hen_worker_seen.insert(descriptor);
++        }
++        hen_worker_todo.push_back(descriptor);
++        if (!hen_worker_started) {
++            // (its own stack size: the default is small for the translator and its passes)
++            pthread_attr_t attr;
++            pthread_attr_init(&attr);
++            pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
++            hen_jit_worker_creating();
++            hen_worker_started = pthread_create(
++                                     &hen_worker, &attr,
++                                     [](void* self) -> void* {
++                                         static_cast<AddressSpace*>(self)->HenWorkerMain();
++                                         return nullptr;
++                                     },
++                                     this) == 0;
++            pthread_attr_destroy(&attr);
++            if (!hen_worker_started) {
++                hen_worker_todo.clear();
++            hen_worker_hot.clear();
++                return;
++            }
++        }
++        if (!hen_worker_asleep && hen_publish_early) {
++            hen_jit_note_wake_skipped();
++            return;
++        }
++    }
++    hen_worker_wake.notify_one();
++}
++
++void AddressSpace::HenWorkerMain() {
++    hen_assert_throws_on_this_thread();
++    hen_jit_worker_started();
++    constexpr u32 window_words = 96;  // blocks longer than this are left to the emulation thread
++    for (;;) {
++        IR::LocationDescriptor descriptor{0};
++        {
++            std::unique_lock lock{hen_worker_mutex};
++            // (asleep, under the lock: who adds work then wakes it only if it is; a system
++            // call for every new block while it was busy anyway was 14% of the emulation
++            // thread's time in Kid Icarus' first gaps)
++            hen_worker_asleep = true;
++            hen_worker_wake.wait(lock, [this] { return hen_worker_stop || !hen_worker_todo.empty() || !hen_worker_hot.empty() || (hen_translation_worker == 3 && hen_frontier_work.load()); });
++            hen_worker_asleep = false;
++            if (hen_worker_stop) {
++                return;
++            }
++            if (hen_translation_worker == 3) {
++                lock.unlock();
++                HenWorkerCompileBatch();
++                continue;
++            }
++            // Newest first: nearest to where the program is.
++            descriptor = hen_worker_todo.back();
++            hen_worker_todo.pop_back();
++        }
++        if (descriptor.Value() & (u64(4) << 32)) {
++            continue;  // (A32: a single-stepping block)
++        }
++        const u32 pc = static_cast<u32>(descriptor.Value());
++        const std::optional<u32> first_word = HenReadCode(pc & ~u32(3));
++        if (!first_word || *first_word == 0) {
++            // Not there (yet): let it be asked for again later.
++            std::scoped_lock lock{hen_worker_mutex};
++            hen_worker_seen.erase(descriptor);
++            continue;
++        }
++        // The code must not change while it is being translated: the same hash of a window
++        // over it before and after.
++        u32 before = 0, after = 0;
++        const bool readable = HenHash(pc, window_words, before);
++        std::unique_ptr<HenTranslated> made;
++        HEN_TRACE("w+ %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++        try {
++            IR::Block block = HenGenerateIRQuiet(descriptor);
++            const IR::LocationDescriptor end = block.EndLocation();
++            const u32 end_pc = static_cast<u32>(end.Value());
++            const u32 words = end_pc > pc ? (end_pc + 3) / 4 - pc / 4 : 0;
++            u32 hash = 0;
++            if (readable && words != 0 && words <= window_words && HenHash(pc, window_words, after) && after == before && HenHash(pc, words, hash)) {
++                made = std::unique_ptr<HenTranslated>(new HenTranslated{std::move(block), end, words, hash});
++            }
++        } catch (int) {
++            // (what was there wasn't code)
++            HEN_TRACE("w! %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++        }
++        HEN_TRACE("w- %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++        if (made) {
++            hen_jit_note_translation(1, 0, 0);
++            std::scoped_lock lock{hen_worker_mutex};
++            // A bound on what is held. A translation nobody takes stays here, and an IR block
++            // keeps its whole instruction pool: 230 KiB each with dynarmic's pool size, which
++            // ran Ocarina of Time out of memory 1.3 s in when nothing was being taken (11,000
++            // held). The pool is smaller here now (ir/basic_block.cpp), and old ones go.
++            if (hen_worker_done.size() >= 2048) {
++                hen_worker_done.clear();
++                hen_worker_seen.clear();
++            }
++            hen_worker_seen.insert(descriptor);
++            hen_worker_done.insert_or_assign(descriptor, std::move(made));
++        }
++        // (a refusal stays in hen_worker_seen: not tried again)
++    }
++}
++
++bool AddressSpace::HenHasTranslation(IR::LocationDescriptor descriptor) {
++    // (mode 1: the worker translates but nothing of it is used, for telling whether a fault
++    // comes from the worker running at all or from using what it made)
++    if (hen_translation_worker != 2) {
++        return false;
++    }
++    std::scoped_lock lock{hen_worker_mutex};
++    return hen_worker_done.contains(descriptor);
++}
++
++std::unique_ptr<AddressSpace::HenTranslated> AddressSpace::HenTakeTranslation(IR::LocationDescriptor descriptor) {
++    if (hen_translation_worker != 2) {
++        return nullptr;
++    }
++    std::unique_ptr<HenTranslated> made;
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        const auto found = hen_worker_done.find(descriptor);
++        if (found == hen_worker_done.end()) {
++            return nullptr;
++        }
++        made = std::move(found.value());
++        hen_worker_done.erase(found);
++        hen_worker_seen.erase(descriptor);  // (it may be asked for again after an invalidation)
++    }
++    u32 hash = 0;
++    if (!HenHash(static_cast<u32>(descriptor.Value()), made->words, hash) || hash != made->hash) {
++        hen_jit_note_translation(0, 0, 1);
++        return nullptr;
++    }
++    hen_jit_note_translation(0, 1, 0);
++    return made;
++}
+ 
+ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
+     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
+@@ -60,17 +483,409 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
+     return nullptr;
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" void hen_jit_note_compile(unsigned long long ir_ns, unsigned long long emit_ns, unsigned blocks);
++extern "C" unsigned long long hen_jit_now_ns(void);
++// A lookup that had to take the compile lock: kind 0 the block was there after all (the worker
++// had it in its batch), 1 it was queued for the worker, 2 it was a known branch target not
++// queued, 3 no block had named it (reached by an indirect jump or from outside).
++extern "C" void hen_jit_note_miss(int kind, unsigned long long lock_ns, unsigned long long total_ns);
++extern "C" void hen_jit_note_split(unsigned long long translate_ns, unsigned long long emit_ns);
++extern "C" void hen_jit_note_emit_parts(unsigned long long a, unsigned long long b, unsigned long long c, unsigned long long d, unsigned long long e, unsigned long long f);
++namespace {
++struct CompileTimer {
++    unsigned long long ir = 0, emit = 0, mark = hen_jit_now_ns();
++    unsigned blocks = 0;
++    void IrDone() {
++        const auto now = hen_jit_now_ns();
++        ir += now - mark;
++        mark = now;
++    }
++    void EmitDone() {
++        const auto now = hen_jit_now_ns();
++        emit += now - mark;
++        mark = now;
++        blocks++;
++    }
++    ~CompileTimer() {
++        hen_jit_note_compile(ir, emit, blocks);
++    }
++};
++}  // namespace
++#else
++namespace {
++struct CompileTimer {
++    void IrDone() {}
++    void EmitDone() {}
++};
++}  // namespace
++#endif
++
++#if defined(__SWITCH__)
++extern "C" int hen_tier;        // --jit-tier N: visits before the emulation thread compiles (0: off)
++extern "C" int hen_tier_force;  // the next unknown block is compiled at once (the interpreter refused it)
++extern "C" void hen_jit_note_tier(int kind);
++#else
++static const int hen_tier = 0;
++static int hen_tier_force = 0;
++static void hen_jit_note_tier(int) {}
++#endif
++
++// Interpreter first. A miss costs the emulation thread a translation, an emission, a wait for
++// the compile lock and a code update: about 330 us in Super Smash Bros., where there were
++// 33,000 in the first minute. Azahar's interpreter runs a block in well under a microsecond,
++// so a block is interpreted until the worker has compiled it; one that comes round hen_tier
++// times first is compiled here, so a loop can't stay in the interpreter.
++//
++// peek (the caller is interpreting a run of blocks and asks about the next one, see
++// A32::Jit::HenPeekDefer): the same visit, counted and queued once, when the answer is
++// hen_defer_stub; where this would compile instead, nothing is touched and the answer is
++// nullptr, and the caller comes back through the generated code's entry without peek.
++CodePtr AddressSpace::HenGetOrDefer(IR::LocationDescriptor descriptor, bool peek) {
++    if (hen_tier <= 0 || hen_defer_stub == nullptr || !HenWorkerCompiles()) {
++        return peek ? nullptr : GetOrEmit(descriptor);
++    }
++    // The first block of an address space is compiled here: its code memory, the dispatcher
++    // and this stub included, is first made executable by a code update, and the worker's first
++    // one would come after the program had already jumped there. (Core 1's JIT crashed so.)
++    if (!hen_tier_ready) {
++        if (peek) {
++            return nullptr;
++        }
++        const CodePtr entry = GetOrEmit(descriptor);
++        hen_tier_ready = true;
++        return entry;
++    }
++    {
++        std::scoped_lock lookup{hen_lookup_mutex};
++        if (const auto found = hen_published.find(descriptor); found != hen_published.end()) {
++            return found->second;
++        }
++    }
++    if (hen_tier_force) {
++        if (peek) {
++            return nullptr;
++        }
++        hen_tier_force = 0;
++        hen_jit_note_tier(2);
++        return GetOrEmit(descriptor);
++    }
++    if (hen_visits.size() > 400000) {
++        hen_visits.clear();
++    }
++    u16& visits = hen_visits[descriptor];
++    if (visits >= hen_tier) {
++        if (peek) {
++            return nullptr;  // (the count stays: the lookup that follows compiles it)
++        }
++        hen_visits.erase(descriptor);
++        hen_jit_note_tier(1);
++        return GetOrEmit(descriptor);
++    }
++    if (visits++ == 0) {
++        HenQueueTranslation(descriptor);
++    } else if (hen_bump > 0 && visits == hen_bump && hen_worker_started) {
++        // (--jit-bump N) Still not compiled after N visits: to the top of the worker's list
++        // again. The list is taken newest first, so a loop the program entered before a run of
++        // other new code sinks under it and goes on being interpreted. (A second copy in the
++        // list does no harm: the worker skips what is compiled.)
++        bool asleep;
++        {
++            std::scoped_lock lock{hen_worker_mutex};
++            (hen_publish_early ? hen_worker_hot : hen_worker_todo).push_back(descriptor);
++            asleep = hen_worker_asleep || !hen_publish_early;
++        }
++        if (asleep) {
++            hen_worker_wake.notify_one();
++        } else {
++            hen_jit_note_wake_skipped();
++        }
++    }
++    hen_jit_note_tier(0);
++    return hen_defer_stub;
++}
++
+ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
++    {
++        std::scoped_lock lookup{hen_lookup_mutex};
++        if (const auto found = hen_published.find(descriptor); found != hen_published.end()) {
++            return found->second;
++        }
++    }
++    const auto hen_m0 = hen_jit_now_ns();
++    HenEmuLock hen_lock{*this};
++    const auto hen_m1 = hen_jit_now_ns();
+     if (CodePtr block_entry = Get(descriptor)) {
++        hen_jit_note_miss(0, hen_m1 - hen_m0, 0);
+         return block_entry;
+     }
++    struct HenMissNote {
++        int kind;
++        unsigned long long lock_ns, start;
++        ~HenMissNote() { hen_jit_note_miss(kind, lock_ns, hen_jit_now_ns() - start); }
++    } hen_miss_note{3, hen_m1 - hen_m0, hen_m1};
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        if (hen_worker_seen.contains(descriptor)) {
++            hen_miss_note.kind = 1;
++        } else if (hen_known_targets.contains(descriptor)) {
++            hen_miss_note.kind = 2;
++        }
++    }
++    // With the compile worker, only a few blocks ahead here: the rest are its.
++    const size_t ahead_blocks = HenWorkerCompiles() ? static_cast<size_t>(hen_emu_ahead) : compile_ahead_blocks;
++
++    CompileTimer timer;
++    // The wanted block: from the worker's translation if it has one (see "Translation on a
++    // second thread"), translated here otherwise.
++    const auto make_wanted = [&]() -> EmittedBlockInfo {
++        HEN_TRACE("M  %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++        hen_emit_wanted = true;
++        if (std::unique_ptr<HenTranslated> made = HenTakeTranslation(descriptor)) {
++            timer.IrDone();
++            HenRecord(descriptor, made->end);
++            EmittedBlockInfo info = Emit(std::move(made->block));
++            hen_emit_wanted = false;
++            timer.EmitDone();
++            return info;
++        }
++        IR::Block ir_block = GenerateIR(descriptor);
++        timer.IrDone();
++        HenRecord(descriptor, ir_block.EndLocation());
++        EmittedBlockInfo info = Emit(std::move(ir_block));
++        hen_emit_wanted = false;
++        timer.EmitDone();
++        return info;
++    };
++    if (ahead_blocks == 0) {
++        return make_wanted().entry_point;
++    }
+ 
+-    IR::Block ir_block = GenerateIR(descriptor);
+-    const EmittedBlockInfo block_info = Emit(std::move(ir_block));
+-    return block_info.entry_point;
++    // Compile ahead (see compile_ahead_blocks): the wanted block, then breadth-first the blocks
++    // it links to. Emit() clears the cache when it runs low, which would drop the blocks of this
++    // batch, so stop well before that.
++    protect_deferred = true;
++    const EmittedBlockInfo first = make_wanted();
++    std::vector<IR::LocationDescriptor> pending;
++    for (const auto& [target, relocations] : first.block_relocations) {
++        pending.push_back(target);
++    }
++    // The blocks the wanted one branches to, breadth-first. One translated here counts against
++    // compile_ahead_blocks; one the worker has translated already only needs emitting and
++    // doesn't (up to a limit on the whole batch). The batch is one code update either way.
++    //
++    // Two other arrangements were measured in Super Smash Bros. and were worse than no worker
++    // at all: emitting everything the worker had finished at each miss (419,000 blocks emitted
++    // against 222,000, first intervals 24% and 54%), and leaving every block not yet
++    // translated to the worker (152,733 updates against 22,826, each costing as much as
++    // translating a block and a half).
++    size_t extra = 0, free_extra = 0;
++    for (size_t i = 0; i < pending.size() && extra < ahead_blocks && free_extra < 96; i++) {
++        if (GetRemainingSize() < 2 * 1024 * 1024) {
++            break;
++        }
++        if (Get(pending[i])) {
++            continue;
++        }
++        const bool translated = hen_translation_worker && hen_tag != 0xffff && HenHasTranslation(pending[i]);
++        EmittedBlockInfo next;
++        if (!HenEmitAhead(pending[i], &next)) {
++            continue;
++        }
++        timer.IrDone();
++        timer.EmitDone();
++        if (translated) {
++            free_extra++;
++        } else {
++            extra++;
++        }
++        for (const auto& [target, relocations] : next.block_relocations) {
++            pending.push_back(target);
++        }
++    }
++    protect_deferred = false;
++    ProtectCodeMemory();
++    return first.entry_point;
++}
++
++#if defined(__SWITCH__)
++extern "C" void hen_jit_record_block(unsigned tag, unsigned long long descriptor, unsigned words, unsigned hash);
++#endif
++
++extern "C" int hen_assert_throws;  // mcl's assert.cpp
++
++bool AddressSpace::HenEmitAhead(IR::LocationDescriptor descriptor, EmittedBlockInfo* out, bool speculative) {
++    if (hen_not_code.contains(descriptor)) {
++        return false;
++    }
++    // Memory that isn't there or is still zero (a module not loaded yet) would compile, to
++    // code that is wrong once the module is loaded: wait until the program gets there.
++    const std::optional<u32> first_word = HenReadCode(static_cast<u32>(descriptor.Value()) & ~u32(3));
++    if (!first_word || *first_word == 0) {
++        return false;
++    }
++    const auto start = code.offset();
++    if (!hen_on_worker) {  // (the worker's thread always throws: hen_assert_throws_on_this_thread)
++        hen_assert_throws = 1;
++    }
++    HEN_TRACE("m+ %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++    try {
++        IR::LocationDescriptor end{0};
++        if (std::unique_ptr<HenTranslated> made = HenTakeTranslation(descriptor)) {
++            end = made->end;
++            *out = Emit(std::move(made->block));
++        } else {
++            // (timed apart: the CompileTimer in GetOrEmit can't see inside this call, and
++            // counted all of it as translation)
++            const auto t0 = hen_jit_now_ns();
++            IR::Block ir_block = hen_on_worker ? HenGenerateIRQuiet(descriptor) : GenerateIR(descriptor);
++            const auto t1 = hen_jit_now_ns();
++            end = ir_block.EndLocation();
++            *out = Emit(std::move(ir_block));
++            if (!hen_on_worker) {
++                hen_jit_note_split(t1 - t0, hen_jit_now_ns() - t1);
++            }
++        }
++        if (!hen_on_worker) {
++            hen_assert_throws = 0;
++        }
++        HenRecord(descriptor, end, speculative);
++        HEN_TRACE("m- %016llx%s\n", static_cast<unsigned long long>(descriptor.Value()), hen_on_worker ? " w" : "");
++        return true;
++    } catch (int) {
++        HEN_TRACE("m! %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++        // The translator or an emitter gave up (an instruction the backend doesn't have, which
++        // real programs don't use): the bytes weren't code. If the program does get there, the
++        // normal path compiles it and reports the problem.
++        code.set_offset(start);
++        if (!hen_on_worker) {
++            hen_assert_throws = 0;
++            hen_not_code.insert(descriptor);
++        }
++        return false;
++    }
++}
++
++bool AddressSpace::HenHash(u32 pc, u32 words, u32& hash) const {
++    u32 h = 2166136261u;
++    for (u32 i = 0; i < words; i++) {
++        const std::optional<u32> word = HenReadCode((pc & ~u32(3)) + 4 * i);
++        if (!word) {
++            return false;
++        }
++        h = (h ^ *word) * 16777619u;
++        h ^= h >> 15;
++    }
++    hash = h;
++    return true;
++}
++
++void AddressSpace::HenRecord(IR::LocationDescriptor descriptor, IR::LocationDescriptor end_location, bool speculative) const {
++#if defined(__SWITCH__)
++    if (hen_tag == 0xffff) {
++        return;
++    }
++    const u32 pc = static_cast<u32>(descriptor.Value());
++    const u32 end = static_cast<u32>(end_location.Value());
++    if (descriptor.Value() & (u64(4) << 32)) {
++        return;  // (A32: a single-stepping block)
++    }
++    if (end <= pc) {
++        return;
++    }
++    const u32 words = (end + 3) / 4 - pc / 4;
++    u32 hash;
++    if (words > 0xffff || !HenHash(pc, words, hash)) {
++        return;
++    }
++    hen_jit_record_block(speculative ? hen_tag | 0x8000u : hen_tag, descriptor.Value(), words, hash);
++#else
++    (void)descriptor;
++    (void)end_location;
++    (void)speculative;
++#endif
++}
++
++size_t AddressSpace::HenCompileFrontier(u64 deadline_ns) {
++    size_t compiled = 0;
++#if defined(__SWITCH__)
++    if (HenWorkerCompiles()) {
++        return 0;  // (the worker does this, without waiting for idle time)
++    }
++    HenEmuLock hen_lock{*this};
++    // A cache that fills up is thrown away whole: speculation only gets the first part of it.
++    constexpr size_t speculation_limit = 24 * 1024 * 1024;
++    protect_deferred = true;
++    // (In small batches: making a batch executable takes time after the deadline check.)
++    while (!hen_frontier.empty() && compiled < 48) {
++        if (hen_jit_now_ns() >= deadline_ns || static_cast<size_t>(code.offset()) > speculation_limit || GetRemainingSize() < 8 * 1024 * 1024) {
++            break;
++        }
++        const IR::LocationDescriptor descriptor = hen_frontier.front();
++        hen_frontier.pop_front();
++        if (Get(descriptor)) {
++            continue;
++        }
++        EmittedBlockInfo info;
++        if (HenEmitAhead(descriptor, &info, true)) {
++            compiled++;
++        }
++    }
++    protect_deferred = false;
++    if (compiled != 0) {
++        ProtectCodeMemory();
++    }
++#else
++    (void)deadline_ns;
++#endif
++    return compiled;
++}
++
++size_t AddressSpace::HenPrecompile(const HenBlock* blocks, u8* state, size_t count, u64 deadline_ns, size_t* compiled) {
++    size_t i = 0;
++    *compiled = 0;
++#if defined(__SWITCH__)
++    HenEmuLock hen_lock{*this};
++    protect_deferred = true;
++    for (; i < count; i++) {
++        if (state[i] == 1) {
++            continue;
++        }
++        // (Emit() clears the whole cache when it runs low: keep well away from that.)
++        if (hen_jit_now_ns() >= deadline_ns || GetRemainingSize() < 4 * 1024 * 1024) {
++            break;
++        }
++        const IR::LocationDescriptor descriptor{blocks[i].descriptor};
++        if (Get(descriptor)) {
++            state[i] = 1;
++            continue;
++        }
++        u32 hash;
++        if (!HenHash(static_cast<u32>(blocks[i].descriptor), blocks[i].words, hash) || hash != blocks[i].hash) {
++            state[i] = 2;
++            continue;
++        }
++        EmittedBlockInfo info;
++        if (!HenEmitAhead(descriptor, &info, (blocks[i].tag & 0x8000) != 0)) {
++            state[i] = 2;
++            continue;
++        }
++        state[i] = 1;
++        ++*compiled;
++    }
++    protect_deferred = false;
++    if (*compiled != 0) {
++        ProtectCodeMemory();
++    }
++#else
++    (void)blocks, (void)state, (void)count, (void)deadline_ns;
++#endif
++    return i;
+ }
+ 
+ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
++    HenEmuLock hen_lock{*this};
++    ClearDispatchTable();
+     UnprotectCodeMemory();
+ 
+     for (const auto& descriptor : descriptors) {
+@@ -82,29 +897,75 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+         // Unlink before removal because InvalidateBasicBlocks can be called within a fastmem callback,
+         // and the currently executing block may have references to itself which need to be unlinked.
+         RelinkForDescriptor(descriptor, nullptr);
++        HenTombstone(descriptor, iter->second);
+ 
+         block_entries.erase(iter);
++        {
++            std::scoped_lock lookup{hen_lookup_mutex};
++            hen_published.erase(descriptor);
++        }
+     }
+ 
+     ProtectCodeMemory();
+ }
+ 
++#if defined(__SWITCH__)
++extern "C" void hen_jit_note_cache_clear(void);  // statistics (Azahar's hen/jit/hen_jit.c)
++#endif
++
++void AddressSpace::ClearDispatchTable() {
++    if (!dispatch_table) {
++        dispatch_table = std::make_unique<DispatchEntry[]>(dispatch_table_size);
++    }
++    for (size_t i = 0; i < dispatch_table_size; i++) {
++        dispatch_table[i] = {~u64(0), nullptr};
++    }
++}
++
+ void AddressSpace::ClearCache() {
++    HenEmuLock hen_lock{*this};
++#if defined(__SWITCH__)
++    hen_jit_note_cache_clear();
++#endif
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        hen_worker_todo.clear();
++            hen_worker_hot.clear();
++        hen_worker_seen.clear();
++    }
+     block_entries.clear();
++    {
++        std::scoped_lock lookup{hen_lookup_mutex};
++        hen_published.clear();
++    }
+     reverse_block_entries.clear();
+     block_infos.clear();
+     block_references.clear();
++    hen_link_slot_of.clear();
++    hen_link_slots.clear();
++    hen_link_stub_of.clear();
++    hen_stub_next = hen_stub_end = hen_stub_dirty = nullptr;
++    hen_tombstoned.clear();
++    hen_pending_sites.clear();
++    hen_ready_targets.clear();
++    hen_ready_count.store(0);
++    hen_depth_of.clear();
++    ClearDispatchTable();
++    hen_frontier.clear();
+     code.set_offset(prelude_info.end_of_prelude);
++    mem.rewind(static_cast<size_t>(prelude_info.end_of_prelude));
+ }
+ 
+ void AddressSpace::DumpDisassembly() const {
+-    for (u32* ptr = mem.ptr(); ptr < code.xptr<u32*>(); ptr++) {
++    for (u32* ptr = mem.wptr(); ptr < code.wptr<u32*>(); ptr++) {
+         std::printf("%s", Common::DisassembleAArch64(*ptr, mcl::bit_cast<u64>(ptr)).c_str());
+     }
+ }
+ 
+ size_t AddressSpace::GetRemainingSize() {
+-    return code_cache_size - static_cast<size_t>(code.offset());
++    const size_t usable = std::min(code_cache_size, mem.usable_size());
++    const size_t used = static_cast<size_t>(code.offset());
++    return usable > used ? usable - used : 0;
+ }
+ 
+ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+@@ -114,19 +975,79 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+ 
+     UnprotectCodeMemory();
+ 
++    // (how far this block is from one the program asked for: see hen_worker_depth)
++    if (!hen_emit_wanted) {
++        const auto known = hen_depth_of.find(block.Location());
++        hen_emit_depth = known != hen_depth_of.end() ? known->second : u8(255);
++    } else {
++        hen_emit_depth = 0;
++    }
++    hen_depth_of.erase(block.Location());
++
++    // (A32 in ARM state, bit 32 clear: only the translator's folded conditional branch,
++    // fold_cond_branch, ends a block in Term::If there)
++    const IR::Terminal hen_terminal = block.GetTerminal();
++    const bool hen_folded = (block.Location().Value() & (u64(1) << 32)) == 0 && boost::get<IR::Term::If>(&hen_terminal) != nullptr;
++    hen_jit_note_block_ticks(static_cast<unsigned>(block.CycleCount()), hen_folded);
++    const auto hen_t0 = hen_jit_now_ns();
+     EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
++    const auto hen_t1 = hen_jit_now_ns();
++    hen_jit_note_compact(4, block_info.size);
+ 
+     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
++    if (hen_on_worker) {
++        hen_batch_new.emplace_back(block.Location(), block_info.entry_point);  // (seen once published)
++    } else {
++        std::scoped_lock lookup{hen_lookup_mutex};
++        hen_published.insert_or_assign(block.Location(), block_info.entry_point);
++    }
+     ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
+     ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
++    const auto hen_t2 = hen_jit_now_ns();
+ 
+     Link(block_info);
+     RelinkForDescriptor(block.Location(), block_info.entry_point);
++    const auto hen_t3 = hen_jit_now_ns();
++
++#if defined(__SWITCH__)
++    if (hen_tag != 0xffff && hen_known_targets.size() < 2000000) {
++        for (const auto& [target, relocations] : block_info.block_relocations) {
++            hen_known_targets.insert(target);
++        }
++    }
++    if (hen_tag != 0xffff && hen_frontier.size() < 100000) {
++        for (const auto& [target, relocations] : block_info.block_relocations) {
++            if (!block_entries.contains(target)) {
++                hen_frontier.push_back(target);
++                if (hen_translation_worker == 3 && hen_worker_started && !hen_frontier_work.exchange(true)) {
++                    hen_worker_wake.notify_one();
++                }
++                // The worker only gets targets within hen_worker_depth branches of a block the
++                // program asked for. Without the limit it translated, and the emulation thread
++                // then emitted, everything reachable: 419,000 blocks in Super Smash Bros. where
++                // 222,000 had been compiled before, and the first seconds ran at 24%.
++                const u8 depth = static_cast<u8>(std::min<unsigned>(hen_emit_depth + 1u, 255u));
++                const auto known = hen_depth_of.find(target);
++                if (known == hen_depth_of.end()) {
++                    hen_depth_of.emplace(target, depth);
++                } else if (depth < known->second) {
++                    known.value() = depth;
++                }
++                if (hen_translation_worker == 3 ? depth <= hen_worker_depth_limit : depth <= hen_worker_depth) {
++                    HenQueueTranslation(target);
++                }
++            }
++        }
++    }
++#endif
+ 
++    const auto hen_t4 = hen_jit_now_ns();
+     mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+     ProtectCodeMemory();
++    const auto hen_t5 = hen_jit_now_ns();
+ 
+     RegisterNewBasicBlock(block, block_info);
++    hen_jit_note_emit_parts(hen_t1 - hen_t0, hen_t2 - hen_t1, hen_t3 - hen_t2, hen_t4 - hen_t3, hen_t5 - hen_t4, hen_jit_now_ns() - hen_t5);
+ 
+     return block_info;
+ }
+@@ -136,12 +1057,28 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, target] : block_info.relocations) {
+-        CodeGenerator c{mem.ptr(), mem.ptr()};
++        CodeGenerator c{mem.wptr(), mem.xptr()};
+         c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
+ 
+         switch (target) {
+         case LinkTarget::ReturnToDispatcher:
+-            c.B(prelude_info.return_to_dispatcher);
++            c.B(prelude_info.hen_exit_other ? prelude_info.hen_exit_other : prelude_info.return_to_dispatcher);
++            break;
++        case LinkTarget::HenReturnPredicted:
++            if (prelude_info.hen_exit_predicted) {
++                c.B(prelude_info.hen_exit_predicted);
++            } else {
++                c.BR(Xscratch1);
++            }
++            break;
++        case LinkTarget::HenReturnToDispatcher:
++            c.B(prelude_info.hen_exit_return ? prelude_info.hen_exit_return : prelude_info.return_to_dispatcher);
++            break;
++        case LinkTarget::HenIndirectToDispatcher:
++            c.B(prelude_info.hen_exit_indirect ? prelude_info.hen_exit_indirect : prelude_info.return_to_dispatcher);
++            break;
++        case LinkTarget::HenUnlinkedToDispatcher:
++            c.B(prelude_info.hen_exit_unlinked ? prelude_info.hen_exit_unlinked : prelude_info.return_to_dispatcher);
+             break;
+         case LinkTarget::ReturnFromRunCode:
+             c.B(prelude_info.return_from_run_code);
+@@ -267,8 +1204,326 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+ 
+     for (auto [target_descriptor, list] : block_info.block_relocations) {
+         block_references[target_descriptor].insert(block_info.entry_point);
+-        LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
++        if (hen_link_table) {
++            HenWriteLinkSites(block_info.entry_point, target_descriptor, list);
++        } else {
++            LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
++        }
++    }
++}
++
++// (Azahar's Switch 2 port) Block links through a table in ordinary memory.
++//
++// Upstream links a block to its target by rewriting an instruction in the block, whenever the
++// target is compiled or invalidated. Where code memory can't be writable while it is
++// executable (kaiHEN), each such rewrite means unmapping and mapping the cell of code memory
++// the block is in (~0.45 ms), and over half of all code updates in a large game were rewrites
++// of old blocks (measured in Super Smash Bros.: 10,539 of 18,651). Here a link site loads its
++// target from the target's slot instead: written once with the block, never rewritten, and
++// linking or unlinking is a store to the slot. Code memory is then only ever appended to.
++//
++// A slot is two words: [0] the target's entry point or 0 (a branch site falls through to the
++// dispatcher on 0), [1] the entry point or the dispatcher (what a return-stack push stores).
++std::array<u64, 2>* AddressSpace::HenLinkSlot(IR::LocationDescriptor target) {
++    if (const auto found = hen_link_slot_of.find(target); found != hen_link_slot_of.end()) {
++        return found->second;
++    }
++    const CodePtr entry = Get(target);
++    hen_link_slots.push_back({mcl::bit_cast<u64>(entry),
++                              mcl::bit_cast<u64>(entry ? static_cast<const void*>(entry)
++                                                       : static_cast<const void*>(prelude_info.return_to_dispatcher))});
++    std::array<u64, 2>* const slot = &hen_link_slots.back();
++    hen_link_slot_of.emplace(target, slot);
++    return slot;
++}
++
++/// What a B at site can reach (+-128 MiB, less the last instruction either way).
++static bool HenBranchReaches(CodePtr site, CodePtr target) {
++    const s64 distance = static_cast<s64>(mcl::bit_cast<u64>(target)) - static_cast<s64>(mcl::bit_cast<u64>(site));
++    return distance > -(s64(1) << 27) && distance < (s64(1) << 27);
++}
++
++// (Azahar's Switch 2 port) Compact link sites (hen_compact_links; emit_arm64_a32.cpp).
++//
++// A link site in the slot form is six instructions, and what an unlinked exit does is three
++// or four more: nine or ten words at every exit of every block, of which one runs once the
++// site is a direct branch. They sat between the blocks' code, so half of what the processor
++// fetched around a hot block was never executed (176 bytes a block, 3 or 4 instructions of the
++// program). A compact site is one instruction in the block:
++//
++//     B target        the target is compiled and within reach
++//     B stub          otherwise
++//
++// and the stub is the old site and its unlinked exit, once per target instead of once per
++// site, written here and not by the block's emitter:
++//
++//     stub:  MOVZ/MOVK/MOVK X16, the target's link slot
++//            LDR  X16, [X16]
++//            CBZ  X16, unlinked
++//            BR   X16
++//  unlinked: MOVZ/MOVK W16, the target's program counter
++//            STR  W16, [Xstate, pc]
++//            B    return_to_dispatcher (or its exit counter)
++//
++// Stubs lie in runs of their own (16 KiB taken from the code cursor when a run is full), so
++// they don't share cache lines or pages with blocks; where old code is costly to change (no
++// writable view of mapped code: hen_jit.c's pieces), a stub follows the block that first needs it.
++//
++// What may change in code that is running, and who changes it:
++//   - A stub is written once, before any site that leads to it can run, and never again.
++//     What it does changes through the link slot it reads: data, as before.
++//   - A site changes once, from "B stub" to "B target": one instruction, written by the
++//     emulation thread (HenUpgradeLinks) under hen_compile_mutex when the target is published.
++//     Before and after are both right at any moment: the stub reads the slot, which already
++//     holds the target. There is no way back: when the target is invalidated its slot is
++//     zeroed (stub: unlinked exit) and its first instructions become the same unlinked exit
++//     (HenTombstone), which is where "B target" then leads.
++//   - The compile worker writes only code that isn't published yet (new blocks, new stubs) and
++//     link slots (deferred to after the publish, as before).
++CodePtr AddressSpace::HenLinkStub(IR::LocationDescriptor target, CodePtr site) {
++    using namespace oaknut;
++    using namespace oaknut::util;
++
++    if (const auto found = hen_link_stub_of.find(target); found != hen_link_stub_of.end() && HenBranchReaches(site, found->second)) {
++        return found->second;
++    }
++    constexpr size_t stub_bytes = 10 * sizeof(u32);
++    if (hen_stub_next == nullptr || static_cast<size_t>(hen_stub_end - hen_stub_next) < stub_bytes || !HenBranchReaches(site, hen_stub_next)) {
++        // A new run, from the code cursor: right after the block being linked.
++        HenFlushLinkStubs();
++        const size_t run = hen_jit_alias_active() ? 400 * stub_bytes : stub_bytes;
++        hen_stub_next = hen_stub_dirty = code.xptr<CodePtr>();
++        hen_stub_end = hen_stub_next + run;
++        code.set_offset(code.offset() + static_cast<std::ptrdiff_t>(run));
++    }
++    const CodePtr stub = hen_stub_next;
++    hen_stub_next += stub_bytes;
++    ASSERT(HenBranchReaches(site, stub));
++
++    const u64 slot = mcl::bit_cast<u64>(HenLinkSlot(target));
++    ASSERT(slot < (u64(1) << 48));
++    const u32 pc = static_cast<u32>(target.Value());
++    CodeGenerator c{mem.wptr(), mem.xptr()};
++    c.set_xptr(reinterpret_cast<u32*>(stub));
++    c.dw(0xD2800000u | (0u << 21) | (static_cast<u32>(slot & 0xffff) << 5) | 16u);          // MOVZ X16, #slot[15:0]
++    c.dw(0xF2800000u | (1u << 21) | (static_cast<u32>((slot >> 16) & 0xffff) << 5) | 16u);  // MOVK X16, #slot[31:16], LSL #16
++    c.dw(0xF2800000u | (2u << 21) | (static_cast<u32>((slot >> 32) & 0xffff) << 5) | 16u);  // MOVK X16, #slot[47:32], LSL #32
++    c.LDR(Xscratch0, Xscratch0);
++    c.dw(0xB4000000u | (2u << 5) | 16u);                                                    // CBZ X16, +8
++    c.BR(Xscratch0);
++    c.dw(0x52800000u | ((pc & 0xffff) << 5) | 16u);                                         // MOVZ W16, #pc[15:0]
++    c.dw(0x72a00000u | (((pc >> 16) & 0xffff) << 5) | 16u);                                 // MOVK W16, #pc[31:16], LSL #16
++    c.STR(Wscratch0, Xstate, hen_pc_offset);
++    c.B(prelude_info.hen_exit_unlinked ? prelude_info.hen_exit_unlinked : prelude_info.return_to_dispatcher);
++    ASSERT(c.xptr<CodePtr>() == stub + stub_bytes);
++
++    hen_link_stub_of.insert_or_assign(target, stub);
++    hen_jit_note_compact(3, 1);
++    return stub;
++}
++
++/// The stubs written since the last call are reported as changed code (one range: they are
++/// written in address order within a run). Before anything that leads to them can run:
++/// ProtectCodeMemory calls this.
++void AddressSpace::HenFlushLinkStubs() {
++    if (hen_stub_dirty != nullptr && hen_stub_next > hen_stub_dirty) {
++        mem.invalidate(reinterpret_cast<u32*>(hen_stub_dirty), static_cast<size_t>(hen_stub_next - hen_stub_dirty));
++    }
++    hen_stub_dirty = hen_stub_next;
++}
++
++void AddressSpace::HenWriteLinkSites(const CodePtr entry_point, IR::LocationDescriptor target, const std::vector<BlockRelocation>& block_relocations_list) {
++    using namespace oaknut;
++    using namespace oaknut::util;
++
++    const u64 slot = mcl::bit_cast<u64>(HenLinkSlot(target));
++    ASSERT(slot < (u64(1) << 48));
++    // Direct links (hen_direct_links). A slot costs a data load on every block transition,
++    // from a table of megabytes laid out in compile order: measured at a fifth of the
++    // emulation thread's time in a title's steady state, and one of the larger stalls in
++    // generated code. When the target already exists as this block is written, the site is a
++    // plain branch (or the target's address, for a return-stack push) instead. Such a site is
++    // never rewritten: when its target is invalidated, the target's own first instructions
++    // become a jump to the dispatcher (HenTombstone), so code memory stays append-only apart
++    // from that one write per invalidated block.
++    const CodePtr direct = hen_direct_links ? Get(target) : nullptr;
++    for (auto [ptr_offset, type] : block_relocations_list) {
++        CodeGenerator c{mem.wptr(), mem.xptr()};
++        c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
++        if (type == BlockRelocationType::BranchCompact) {
++            // One instruction (see HenLinkStub): to the target if it is there, to its stub
++            // otherwise. HenUpgradeLinks turns the second into the first, and nothing ever
++            // turns it back (an invalidated target gets HenTombstone).
++            const CodePtr site = entry_point + ptr_offset;
++            if (direct && HenBranchReaches(site, direct)) {
++                c.B((void*)direct);
++                hen_jit_note_link(0);
++                hen_jit_note_compact(0, 1);
++                continue;
++            }
++            c.B((void*)HenLinkStub(target, site));
++            hen_jit_note_link(1);
++            hen_jit_note_compact(1, 1);
++            if (hen_direct_links) {
++                hen_pending_sites[target].push_back({site, type, entry_point});
++            }
++            continue;
++        }
++        if (direct) {
++            const s64 distance = static_cast<s64>(mcl::bit_cast<u64>(direct)) - static_cast<s64>(mcl::bit_cast<u64>(entry_point + ptr_offset));
++            if (type == BlockRelocationType::Branch && distance > -(s64(1) << 27) && distance < (s64(1) << 27)) {
++                c.B((void*)direct);
++                hen_jit_note_link(0);
++                continue;  // (the five instructions after it are never reached)
++            }
++            if (type == BlockRelocationType::MoveToScratch1) {
++                c.ADRL(Xscratch1, (void*)direct);
++                c.NOP();
++                c.NOP();
++                hen_jit_note_link(0);
++                continue;
++            }
++        }
++        hen_jit_note_link(1);
++        if (hen_direct_links) {
++            hen_pending_sites[target].push_back({entry_point + ptr_offset, type, entry_point});
++        }
++        // (always three instructions: MOVZ and two MOVKs, encoded by hand so that a zero
++        // chunk doesn't change their number or which bits they set)
++        const auto load_address = [&c](XReg reg, u64 address) {
++            const u32 rd = static_cast<u32>(reg.index());
++            c.dw(0xD2800000u | (0u << 21) | (static_cast<u32>(address & 0xffff) << 5) | rd);
++            c.dw(0xF2800000u | (1u << 21) | (static_cast<u32>((address >> 16) & 0xffff) << 5) | rd);
++            c.dw(0xF2800000u | (2u << 21) | (static_cast<u32>((address >> 32) & 0xffff) << 5) | rd);
++        };
++        switch (type) {
++        case BlockRelocationType::Branch: {
++            Label unlinked;
++            load_address(Xscratch0, slot);
++            c.LDR(Xscratch0, Xscratch0);
++            c.CBZ(Xscratch0, unlinked);
++            c.BR(Xscratch0);
++            c.l(unlinked);
++            break;
++        }
++        case BlockRelocationType::MoveToScratch1:
++            load_address(Xscratch1, slot + 8);
++            c.LDR(Xscratch1, Xscratch1);
++            break;
++        default:
++            ASSERT_FALSE("Invalid BlockRelocationType");
++        }
++    }
++}
++
++// (Azahar's Switch 2 port) Most links point forward, to a block compiled after the one that
++// branches to it, so their sites are written in the slot form (HenWriteLinkSites). This turns
++// them into direct branches once the target exists: a few hundred sites a call, from the
++// emulation thread between frames (HenBlockList::UpgradeLinks). Safe there because generated
++// code runs on that thread only, and a link site contains no call, so the thread is never in
++// the middle of one while it is out here. Returns the number of sites rewritten.
++size_t AddressSpace::HenUpgradeLinks(u64 deadline_ns, size_t max_sites) {
++    using namespace oaknut;
++    using namespace oaknut::util;
++
++    size_t done = 0;
++#if defined(__SWITCH__)
++    // (the count, not the vector: the worker adds to the vector under the lock this thread
++    // doesn't hold yet, and taking the lock every frame would cut its batches short)
++    if (!hen_direct_links || !hen_link_table || hen_ready_count.load(std::memory_order_relaxed) == 0) {
++        return 0;
++    }
++    // (Not worth a wait: when the worker has the lock, try again next frame, and only after
++    // half a second of that ask it to end its batch.)
++    std::unique_lock hen_lock{hen_compile_mutex, std::try_to_lock};
++    if (!hen_lock.owns_lock()) {
++        if (++hen_upgrade_skips < 30) {
++            return 0;
++        }
++        hen_emu_waiting.fetch_add(1, std::memory_order_relaxed);
++        hen_lock.lock();
++        hen_emu_waiting.fetch_sub(1, std::memory_order_relaxed);
++    }
++    hen_upgrade_skips = 0;
++    bool open = false;
++    while (!hen_ready_targets.empty() && done < max_sites && hen_jit_now_ns() < deadline_ns) {
++        const IR::LocationDescriptor target = hen_ready_targets.back();
++        hen_ready_targets.pop_back();
++        const auto pending = hen_pending_sites.find(target);
++        if (pending == hen_pending_sites.end()) {
++            continue;
++        }
++        const CodePtr target_ptr = Get(target);
++        if (!target_ptr) {
++            continue;  // (invalidated since: the sites wait for the next time it is compiled)
++        }
++        for (const HenSlotSite& site : pending->second) {
++            const bool branch = site.type == BlockRelocationType::Branch || site.type == BlockRelocationType::BranchCompact;
++            if (branch && !HenBranchReaches(site.site, target_ptr)) {
++                continue;
++            }
++            // (a site in the first four instructions of a block invalidated since: those are
++            // the block's tombstone now, and must stay it)
++            if (static_cast<size_t>(site.site - site.block) < 4 * sizeof(u32) && hen_tombstoned.contains(site.block)) {
++                hen_jit_note_compact(5, 1);
++                continue;
++            }
++            if (!open) {
++                UnprotectCodeMemory();
++                open = true;
++            }
++            CodeGenerator c{mem.wptr(), mem.xptr()};
++            c.set_xptr(reinterpret_cast<u32*>(site.site));
++            if (branch) {
++                // (one instruction: "B stub" or the slot form's first, to "B target")
++                c.B((void*)target_ptr);
++                mem.invalidate(reinterpret_cast<u32*>(site.site), sizeof(u32));
++                if (site.type == BlockRelocationType::BranchCompact) {
++                    hen_jit_note_compact(2, 1);
++                }
++            } else {
++                c.ADRL(Xscratch1, (void*)target_ptr);
++                c.NOP();
++                c.NOP();
++                mem.invalidate(reinterpret_cast<u32*>(site.site), 4 * sizeof(u32));
++            }
++            done++;
++        }
++        hen_pending_sites.erase(pending);
++    }
++    if (open) {
++        ProtectCodeMemory();
++    }
++    hen_ready_count.store(hen_ready_targets.size(), std::memory_order_relaxed);
++    hen_jit_note_link_upgrades(done);
++#endif
++    return done;
++}
++
++// (Azahar's Switch 2 port) See the direct links in HenWriteLinkSites: an invalidated block's
++// first four instructions become "set the program counter, go to the dispatcher", which is
++// what an unlinked site does. Sites that branch straight to the block, and return-stack
++// entries that hold its address, then end up at whatever the dispatcher finds for that
++// location. The rest of the block's state (the upper location descriptor) is already what
++// the block expects whenever something branches to it.
++void AddressSpace::HenTombstone(IR::LocationDescriptor descriptor, CodePtr entry_point) {
++    using namespace oaknut;
++    using namespace oaknut::util;
++
++    if (!hen_direct_links || !hen_link_table) {
++        return;
+     }
++    const auto info = block_infos.find(entry_point);
++    ASSERT(info != block_infos.end() && info->second.size >= 4 * sizeof(u32));
++    CodeGenerator c{mem.wptr(), mem.xptr()};
++    c.set_xptr(reinterpret_cast<u32*>(entry_point));
++    const u32 pc = static_cast<u32>(descriptor.Value());
++    c.dw(0x52800000u | ((pc & 0xffff) << 5) | 16u);                 // MOVZ W16, #lo
++    c.dw(0x72a00000u | (((pc >> 16) & 0xffff) << 5) | 16u);         // MOVK W16, #hi, LSL #16
++    c.STR(Wscratch0, Xstate, hen_pc_offset);
++    c.B(prelude_info.return_to_dispatcher);
++    mem.invalidate(reinterpret_cast<u32*>(entry_point), 4 * sizeof(u32));
++    hen_tombstoned.insert(entry_point);
+ }
+ 
+ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
+@@ -276,7 +1531,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, type] : block_relocations_list) {
+-        CodeGenerator c{mem.ptr(), mem.ptr()};
++        CodeGenerator c{mem.wptr(), mem.xptr()};
+         c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+ 
+         switch (type) {
+@@ -301,6 +1556,26 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+ }
+ 
+ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
++    if (hen_link_table) {
++        // (no code is rewritten: see HenLinkSlot)
++        if (const auto found = hen_link_slot_of.find(target_descriptor); found != hen_link_slot_of.end()) {
++            const u64 entry = mcl::bit_cast<u64>(target_ptr);
++            const u64 entry_or_dispatcher = mcl::bit_cast<u64>(target_ptr ? static_cast<const void*>(target_ptr)
++                                                                          : static_cast<const void*>(prelude_info.return_to_dispatcher));
++            if (target_ptr && hen_direct_links && hen_pending_sites.contains(target_descriptor)) {
++                hen_ready_targets.push_back(target_descriptor);  // (for HenUpgradeLinks)
++                hen_ready_count.fetch_add(1, std::memory_order_relaxed);
++            }
++            if (hen_on_worker && target_ptr) {
++                // (code already running may read this slot, and the target isn't published yet)
++                hen_deferred_slots.emplace_back(found->second, entry, entry_or_dispatcher);
++            } else {
++                (*found->second)[0] = entry;
++                (*found->second)[1] = entry_or_dispatcher;
++            }
++        }
++        return;
++    }
+     for (auto code_ptr : block_references[target_descriptor]) {
+         if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
+             const EmittedBlockInfo& block_info = block_iter->second;
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 835566b..6596a20 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -5,7 +5,16 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <atomic>
++#include <tuple>
++#include <condition_variable>
++#include <mutex>
++#include <pthread.h>
++#include <vector>
++#include <deque>
+ #include <map>
++#include <memory>
+ #include <optional>
+ 
+ #include <mcl/stdint.hpp>
+@@ -28,6 +37,10 @@ public:
+     virtual ~AddressSpace();
+ 
+     virtual IR::Block GenerateIR(IR::LocationDescriptor) const = 0;
++    /// (Azahar's Switch 2 port) The same for the translation worker's thread: reading the
++    /// program's code without going through the embedder's callbacks, which aren't made for a
++    /// second thread. Default: no such reading, so no worker translations.
++    virtual IR::Block HenGenerateIRQuiet(IR::LocationDescriptor) const { throw 1; }
+ 
+     CodePtr Get(IR::LocationDescriptor descriptor);
+ 
+@@ -38,6 +51,16 @@ public:
+     CodePtr ReverseGetEntryPoint(CodePtr host_pc);
+ 
+     CodePtr GetOrEmit(IR::LocationDescriptor descriptor);
++    /// (Azahar's Switch 2 port) Interpreter first: the block if it is compiled; otherwise it
++    /// is queued for the compile worker and the answer is hen_defer_stub, which leaves the
++    /// generated code with HaltReason::UserDefined2 so the caller can interpret the block.
++    /// A block asked for more than hen_tier times is compiled here after all.
++    /// peek: only ask (hen_defer_stub: interpret it, the visit is counted; anything else: enter
++    /// the generated code as usual, nothing was counted).
++    CodePtr HenGetOrDefer(IR::LocationDescriptor descriptor, bool peek = false);
++    CodePtr hen_defer_stub = nullptr;
++    bool hen_tier_ready = false;
++    tsl::robin_map<IR::LocationDescriptor, u16> hen_visits;
+ 
+     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
+ 
+@@ -45,12 +68,138 @@ public:
+ 
+     void DumpDisassembly() const;
+ 
++    // Azahar's Switch 2 port: a table the dispatcher looks compiled blocks up in without
++    // leaving generated code (the backend had no fast dispatch: every indirect branch that the
++    // return stack doesn't predict went through GetOrEmit and its hash map). Direct mapped;
++    // emptied when blocks are invalidated.
++    struct DispatchEntry {
++        u64 descriptor;
++        CodePtr entry_point;
++    };
++    static constexpr size_t dispatch_table_size = 0x10000;
++    static size_t DispatchIndex(u64 descriptor) {
++        const u32 pc = static_cast<u32>(descriptor);
++        return ((pc >> 2) ^ (pc >> 14) ^ static_cast<u32>(descriptor >> 32)) & (dispatch_table_size - 1);
++    }
++    std::unique_ptr<DispatchEntry[]> dispatch_table;
++    void ClearDispatchTable();
++
++    // Azahar's Switch 2 port: the blocks compiled are listed and kept between sessions, and a
++    // later session compiles them before the program gets to them (Azahar's
++    // core/arm/dynarmic/hen_block_list.cpp).
++    struct HenBlock {
++        u64 descriptor;
++        u32 hash;   ///< of the guest code the block was made from
++        u16 words;  ///< of guest code, from the block's address rounded down to 4
++        u16 tag;    ///< which JIT (hen_tag)
++    };
++    u16 hen_tag = 0xffff;  ///< 0xffff: not listed
++    /// Compiles the blocks not compiled yet whose guest code still has the listed hash, until
++    /// the deadline. state, per block: 0 to do, 1 done, 2 its code isn't there (yet).
++    /// @returns how many entries were looked at; *compiled: how many were compiled
++    size_t HenPrecompile(const HenBlock* blocks, u8* state, size_t count, u64 deadline_ns, size_t* compiled);
++    /// The saved list for the compile worker to work through (after what the program asks
++    /// for, before speculation), in place of HenPrecompile on the emulation thread. The arrays
++    /// stay the caller's: call with nullptr before changing or freeing them.
++    void HenSetList(const HenBlock* blocks, u8* state, size_t count);
++    const HenBlock* hen_list_blocks = nullptr;
++    u8* hen_list_state = nullptr;
++    size_t hen_list_count = 0, hen_list_next = 0;
++    bool hen_list_retry = false;
++    u64 hen_list_repass_ns = 0;
++
++    /// Compiles blocks the program hasn't reached yet, outwards from the compiled ones along
++    /// their branches, until the deadline (the caller's idle time). Listed with the tag's top
++    /// bit set: not known to be used. Stops while the cache is more than about half full.
++    /// @returns the number of blocks compiled
++    size_t HenCompileFrontier(u64 deadline_ns);
++    size_t HenUpgradeLinks(u64 deadline_ns, size_t max_sites);
++
+ protected:
++    virtual std::optional<u32> HenReadCode(u32) const { return std::nullopt; }
++    bool HenHash(u32 pc, u32 words, u32& hash) const;
++    void HenRecord(IR::LocationDescriptor descriptor, IR::LocationDescriptor end, bool speculative = false) const;
++    /// Compiles a block the program hasn't reached. False (and nothing changed) if it can't be
++    /// compiled: what is at a branch target isn't always code.
++    bool HenEmitAhead(IR::LocationDescriptor descriptor, EmittedBlockInfo* out, bool speculative = false);
++    /// Branch targets of compiled blocks that aren't compiled themselves: what the program is
++    /// likely to run next. HenCompileFrontier works through them.
++    std::deque<IR::LocationDescriptor> hen_frontier;
++    tsl::robin_set<IR::LocationDescriptor> hen_not_code;
++
++    /// The translation worker (address_space.cpp, "Translation on a second thread"). A derived
++    /// class stops it in its destructor (the worker calls GenerateIR).
++    struct HenTranslated {
++        IR::Block block;
++        IR::LocationDescriptor end;
++        u32 words;
++        u32 hash;
++    };
++    void HenStopWorker();
++    void HenQueueTranslation(IR::LocationDescriptor descriptor);
++    /// The worker's translation of a block, if it has one that still matches the program's code.
++    std::unique_ptr<HenTranslated> HenTakeTranslation(IR::LocationDescriptor descriptor);
++    bool HenHasTranslation(IR::LocationDescriptor descriptor);
++    void HenWorkerMain();
++    pthread_t hen_worker{};
++    bool hen_worker_started = false;
++    bool hen_worker_asleep = false;  // (under hen_worker_mutex)
++    std::mutex hen_worker_mutex;
++    std::condition_variable hen_worker_wake;
++    bool hen_worker_stop = false;
++    std::vector<IR::LocationDescriptor> hen_worker_hot;  // asked for again (hen_bump visits): first, and published at once
++    std::vector<IR::LocationDescriptor> hen_worker_todo;                                  // newest last
++    tsl::robin_set<IR::LocationDescriptor> hen_worker_seen;                               // queued, in work, done or refused
++    tsl::robin_map<IR::LocationDescriptor, std::unique_ptr<HenTranslated>> hen_worker_done;
++    /// Branches between a block the program asked for and a block not compiled yet (the least
++    /// seen); the worker translates up to hen_worker_depth.
++    static constexpr u8 hen_worker_depth = 255;  // (no limit: only blocks the emulation thread emitted have their targets queued)
++
++    /// The compile worker (address_space.cpp, "Compiling on a second thread"): everything
++    /// that changes or reads the blocks takes this, on either thread.
++    std::recursive_mutex hen_compile_mutex;
++    std::atomic<int> hen_emu_waiting{0};  ///< the emulation thread wants the mutex: the worker ends its batch
++    bool hen_on_worker = false;           ///< (under the mutex) the worker is compiling a batch
++    /// Link-slot stores of the worker's batch, made once its code has been published.
++    std::vector<std::tuple<std::array<u64, 2>*, u64, u64>> hen_deferred_slots;
++    /// The published blocks, for the emulation thread's lookups: under hen_lookup_mutex, which
++    /// is only ever held for a lookup or a few inserts, so a lookup of a block that exists
++    /// never waits for the worker's batch.
++    std::mutex hen_lookup_mutex;
++    tsl::robin_map<IR::LocationDescriptor, CodePtr> hen_published;
++    /// Every location a compiled block has named as a branch target (for the miss statistics).
++    tsl::robin_set<IR::LocationDescriptor> hen_known_targets;
++    std::vector<std::pair<IR::LocationDescriptor, CodePtr>> hen_batch_new;
++    /// The frontier has blocks for the worker (it takes them when nothing nearer is queued).
++    std::atomic<bool> hen_frontier_work{false};
++    bool HenWorkerCompiles() const;
++    void HenWorkerCompileBatch();
++    static unsigned long long HenLockClock();
++    static void HenLockNote(unsigned long long ns);
++    struct HenEmuLock {
++        explicit HenEmuLock(AddressSpace& self_) : self(self_) {
++            const auto t0 = HenLockClock();
++            self.hen_emu_waiting.fetch_add(1, std::memory_order_relaxed);
++            self.hen_compile_mutex.lock();
++            self.hen_emu_waiting.fetch_sub(1, std::memory_order_relaxed);
++            HenLockNote(HenLockClock() - t0);
++        }
++        ~HenEmuLock() { self.hen_compile_mutex.unlock(); }
++        AddressSpace& self;
++    };
++    tsl::robin_map<IR::LocationDescriptor, u8> hen_depth_of;
++    u8 hen_emit_depth = 255;
++    bool hen_emit_wanted = false;
++
+     virtual EmitConfig GetEmitConfig() = 0;
+     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
+ 
+     void ProtectCodeMemory() {
+ #if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__)
++        if (protect_deferred) {
++            return;  // GetOrEmit protects once, after its whole batch
++        }
++        HenFlushLinkStubs();
+         mem.protect();
+ #endif
+     }
+@@ -66,9 +215,43 @@ protected:
+     void Link(EmittedBlockInfo& block);
+     void LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list);
+     void RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr);
++    std::array<u64, 2>* HenLinkSlot(IR::LocationDescriptor target);
++    void HenTombstone(IR::LocationDescriptor descriptor, CodePtr entry_point);
++    struct HenSlotSite {
++        CodePtr site;
++        BlockRelocationType type;
++        CodePtr block;  ///< the block the site is in (its entry point)
++    };
++    /// Compact link sites (EmitConfig::hen_compact_links): see HenLinkStub in address_space.cpp.
++    CodePtr HenLinkStub(IR::LocationDescriptor target, CodePtr site);
++    void HenFlushLinkStubs();
++    tsl::robin_map<IR::LocationDescriptor, CodePtr> hen_link_stub_of;
++    CodePtr hen_stub_next = nullptr, hen_stub_end = nullptr;  ///< the room left in the current run of stubs
++    CodePtr hen_stub_dirty = nullptr;                         ///< stubs from here to hen_stub_next are written, not yet reported
++    /// Invalidated blocks whose first instructions HenTombstone wrote over: a link site there
++    /// is no longer a link site.
++    tsl::robin_set<CodePtr> hen_tombstoned;
++    /// Link sites written in the slot form, by target, and the targets compiled since.
++    tsl::robin_map<IR::LocationDescriptor, std::vector<HenSlotSite>> hen_pending_sites;
++    std::vector<IR::LocationDescriptor> hen_ready_targets;
++    std::atomic<size_t> hen_ready_count{0};
++    unsigned hen_upgrade_skips = 0;
++    size_t hen_pc_offset = 0;  // (of the program counter in the state: set by the A32 address space)
++    void HenWriteLinkSites(const CodePtr entry_point, IR::LocationDescriptor target, const std::vector<BlockRelocation>& block_relocations_list);
+ 
+     FakeCall FastmemCallback(u64 host_pc);
+ 
++    // Where making code executable is expensive (Switch 2 homebrew: a remap through a system
++    // service per change, see Azahar's hen/jit/hen_jit.c), GetOrEmit also compiles the blocks the
++    // new block links to, up to this many, and makes them all executable at once.
++    static constexpr size_t compile_ahead_blocks =
++#if defined(__SWITCH__)
++        24;
++#else
++        0;
++#endif
++    bool protect_deferred = false;
++
+     const size_t code_cache_size;
+     oaknut::CodeBlock mem;
+     oaknut::CodeGenerator code;
+@@ -79,6 +262,9 @@ protected:
+     std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
+     tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
+     tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
++    // (Azahar's Switch 2 port) Link slots: see HenLinkSlot in address_space.cpp.
++    std::deque<std::array<u64, 2>> hen_link_slots;
++    tsl::robin_map<IR::LocationDescriptor, std::array<u64, 2>*> hen_link_slot_of;
+ 
+     ExceptionHandler exception_handler;
+     FastmemManager fastmem_manager;
+@@ -91,6 +277,13 @@ protected:
+         RunCodeFuncType step_code;
+         void* return_to_dispatcher;
+         void* return_from_run_code;
++        // (Azahar's Switch 2 port) Counting entries to the dispatcher (emit_arm64.h,
++        // LinkTarget::Hen...); null: not counted. hen_exit_other is ReturnToDispatcher's.
++        void* hen_exit_predicted = nullptr;
++        void* hen_exit_return = nullptr;
++        void* hen_exit_indirect = nullptr;
++        void* hen_exit_unlinked = nullptr;
++        void* hen_exit_other = nullptr;
+ 
+         void* read_memory_8;
+         void* read_memory_16;
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
+index 1ecb542..69a9ce2 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64.cpp
+@@ -16,6 +16,12 @@
+ #include "dynarmic/ir/microinstruction.h"
+ #include "dynarmic/ir/opcodes.h"
+ 
++#if defined(__SWITCH__)
++extern "C" int hen_link_table;  // Azahar's hen/jit/hen_jit.c
++#else
++static const int hen_link_table = 0;
++#endif
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
+ using namespace oaknut::util;
+@@ -250,7 +256,7 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+         }
+     }
+ 
+-    fpsr_manager.Spill();
++    fpsr_manager.EndOfBlock();
+ 
+     reg_alloc.AssertNoMoreUses();
+ 
+@@ -262,6 +268,11 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+         deferred_emit();
+     }
+     code.BRK(0);
++    // (Azahar's Switch 2 port: a block is never shorter than the four instructions
++    // AddressSpace::HenTombstone writes over its start)
++    while (static_cast<size_t>(code.xptr<CodePtr>() - ebi.entry_point) < 4 * sizeof(u32)) {
++        code.BRK(0);
++    }
+ 
+     ebi.size = code.xptr<CodePtr>() - ebi.entry_point;
+     return ebi;
+@@ -277,10 +288,24 @@ void EmitBlockLinkRelocation(oaknut::CodeGenerator& code, EmitContext& ctx, cons
+     switch (type) {
+     case BlockRelocationType::Branch:
+         code.NOP();
++        // (Azahar's Switch 2 port: see hen_link_table in address_space.cpp) room for the
++        // table form: three moves, a load, a test and a branch.
++        if (hen_link_table) {
++            for (int i = 0; i < 5; i++) {
++                code.NOP();
++            }
++        }
++        break;
++    case BlockRelocationType::BranchCompact:
++        code.NOP();  // (written by AddressSpace::HenWriteLinkSites before the block can run)
+         break;
+     case BlockRelocationType::MoveToScratch1:
+         code.BRK(0);
+         code.NOP();
++        if (hen_link_table) {
++            code.NOP();
++            code.NOP();
++        }
+         break;
+     default:
+         UNREACHABLE();
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index 58ccb0e..b018123 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -81,6 +81,13 @@ enum class LinkTarget {
+     GetCNTPCT,
+     AddTicks,
+     GetTicksRemaining,
++    // (Azahar's Switch 2 port) Exits to the dispatcher by kind, so that a development build
++    // can count them (A32AddressSpace::EmitPrelude); otherwise each is ReturnToDispatcher.
++    // HenReturnPredicted is the return stack buffer's hit: a jump to Xscratch1.
++    HenReturnPredicted,
++    HenReturnToDispatcher,
++    HenIndirectToDispatcher,
++    HenUnlinkedToDispatcher,
+ };
+ 
+ struct Relocation {
+@@ -91,6 +98,10 @@ struct Relocation {
+ enum class BlockRelocationType {
+     Branch,
+     MoveToScratch1,
++    /// (Azahar's Switch 2 port, EmitConfig::hen_compact_links) A link site of one instruction:
++    /// a branch to the target, or to the target's stub (AddressSpace::HenLinkStub) while the
++    /// target is not compiled or out of a branch's reach. Nothing falls through it.
++    BranchCompact,
+ };
+ 
+ struct BlockRelocation {
+@@ -130,6 +141,9 @@ struct EmitConfig {
+     bool absolute_offset_page_table;
+     u8 detect_misaligned_access_via_page_table;
+     bool only_detect_misalignment_via_page_table_on_page_boundary;
++    /// (Azahar's Switch 2 port) Not 0: Xpagetable holds the table that reads use, and the
++    /// table for everything else is this many bytes from it (A32::UserConfig::read_page_table).
++    s64 hen_write_page_table_offset = 0;
+ 
+     // Fastmem
+     std::optional<u64> fastmem_pointer;
+@@ -161,6 +175,19 @@ struct EmitConfig {
+ 
+     // Debugging
+     bool very_verbose_debugging_output;
++
++    // (Azahar's Switch 2 port) 32-bit exclusive reads and writes inline (emit_arm64_memory.cpp):
++    // the exclusive monitor's address array, this processor's value slot, and the counts.
++    // Zero: through the callbacks, as upstream.
++    u64 hen_exclusive_addresses = 0;
++    u64 hen_exclusive_value = 0;
++    size_t hen_exclusive_processors = 0;
++    size_t hen_exclusive_processor_id = 0;
++
++    /// (Azahar's Switch 2 port) Link sites of one instruction (BlockRelocationType::BranchCompact),
++    /// with what an unlinked exit does kept out of the path through the block: needs the
++    /// address space's link table (hen_link_table). A32 only.
++    bool hen_compact_links = false;
+ };
+ 
+ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const EmitConfig& emit_conf, FastmemManager& fastmem_manager);
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 909dde7..c81abee 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -58,9 +58,43 @@ static void EmitSetUpperLocationDescriptor(oaknut::CodeGenerator& code, EmitCont
+     }
+ }
+ 
++// (Azahar's Switch 2 port, EmitConfig::hen_compact_links) What a block's exit to a known
++// location costs on the way through:
++//   LinkBlock:      CMP Xticks, 0; B.LE fail; B <target or its stub>
++//   LinkBlockFast:  B <target or its stub>
++// "fail" (set the program counter, go to the dispatcher) is emitted after the block's code,
++// with the other deferred parts; an exit whose target is not compiled goes through the
++// target's stub, which the address space keeps away from the blocks (HenLinkStub). Without
++// the option a site is six instructions with the unlinked exit's three or four after it, all
++// between this block's code and whatever follows it.
++static void EmitUnlinkedExit(oaknut::CodeGenerator& code, EmitContext& ctx, u32 pc) {
++    code.MOV(Wscratch0, pc);
++    code.STR(Wscratch0, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
++    EmitRelocation(code, ctx, LinkTarget::HenUnlinkedToDispatcher);
++}
++
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+     EmitSetUpperLocationDescriptor(code, ctx, terminal.next, initial_location);
+ 
++    const u32 next_pc = A32::LocationDescriptor{terminal.next}.PC();
++
++    if (ctx.conf.hen_compact_links && ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
++        SharedLabel fail = GenSharedLabel();
++        if (ctx.conf.enable_cycle_counting) {
++            code.CMP(Xticks, 0);
++            code.B(LE, *fail);
++        } else {
++            code.LDAR(Wscratch0, Xhalt);
++            code.CBNZ(Wscratch0, *fail);
++        }
++        EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::BranchCompact);
++        ctx.deferred_emits.emplace_back([&code, &ctx, fail, next_pc] {
++            code.l(*fail);
++            EmitUnlinkedExit(code, ctx, next_pc);
++        });
++        return;
++    }
++
+     oaknut::Label fail;
+ 
+     if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+@@ -76,21 +110,22 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
+     }
+ 
+     code.l(fail);
+-    code.MOV(Wscratch0, A32::LocationDescriptor{terminal.next}.PC());
+-    code.STR(Wscratch0, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++    EmitUnlinkedExit(code, ctx, next_pc);
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+     EmitSetUpperLocationDescriptor(code, ctx, terminal.next, initial_location);
+ 
+     if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
++        if (ctx.conf.hen_compact_links) {
++            // (the site always leads somewhere: nothing after it)
++            EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::BranchCompact);
++            return;
++        }
+         EmitBlockLinkRelocation(code, ctx, terminal.next, BlockRelocationType::Branch);
+     }
+ 
+-    code.MOV(Wscratch0, A32::LocationDescriptor{terminal.next}.PC());
+-    code.STR(Wscratch0, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++    EmitUnlinkedExit(code, ctx, A32::LocationDescriptor{terminal.next}.PC());
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+@@ -110,16 +145,16 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
+ 
+         code.CMP(X0, Xscratch0);
+         code.B(NE, fail);
+-        code.BR(Xscratch1);
++        EmitRelocation(code, ctx, LinkTarget::HenReturnPredicted);  // (BR Xscratch1, or counted first)
+ 
+         code.l(fail);
+     }
+ 
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++    EmitRelocation(code, ctx, LinkTarget::HenReturnToDispatcher);
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool) {
+-    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
++    EmitRelocation(code, ctx, LinkTarget::HenIndirectToDispatcher);
+ 
+     // TODO: Implement FastDispatchHint optimization
+ }
+@@ -654,7 +689,7 @@ template<>
+ void EmitIR<IR::Opcode::A32GetFpscr>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+     auto Wfpscr = ctx.reg_alloc.WriteW(inst);
+     RegAlloc::Realize(Wfpscr);
+-    ctx.fpsr.Spill();
++    ctx.fpsr.Sync();
+ 
+     static_assert(offsetof(A32JitState, fpsr) + sizeof(u32) == offsetof(A32JitState, fpsr_nzcv));
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+index 339e2c5..d644378 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -250,8 +250,11 @@ void EmitDetectMisalignedVAddr(oaknut::CodeGenerator& code, EmitContext& ctx, oa
+ // May use Xscratch1 as scratch register
+ // Address to read/write = [ret0 + ret1], ret0 is always Xscratch0 and ret1 is either Xaddr or Xscratch1
+ // Trashes NZCV
++// (Azahar's Switch 2 port) read: a plain read, which looks in the table Xpagetable holds;
++// anything else (a write, an exclusive access) looks in the table for writes, which is the
++// same one unless the embedder gave two (EmitConfig::hen_write_page_table_offset).
+ template<size_t bitsize>
+-std::pair<oaknut::XReg, oaknut::XReg> InlinePageTableEmitVAddrLookup(oaknut::CodeGenerator& code, EmitContext& ctx, oaknut::XReg Xaddr, const SharedLabel& fallback) {
++std::pair<oaknut::XReg, oaknut::XReg> InlinePageTableEmitVAddrLookup(oaknut::CodeGenerator& code, EmitContext& ctx, oaknut::XReg Xaddr, const SharedLabel& fallback, bool read = false) {
+     const size_t valid_page_index_bits = ctx.conf.page_table_address_space_bits - page_bits;
+     const size_t unused_top_bits = 64 - ctx.conf.page_table_address_space_bits;
+ 
+@@ -265,7 +268,16 @@ std::pair<oaknut::XReg, oaknut::XReg> InlinePageTableEmitVAddrLookup(oaknut::Cod
+         code.B(NE, *fallback);
+     }
+ 
+-    code.LDR(Xscratch0, Xpagetable, Xscratch0, LSL, 3);
++    if (const s64 offset = ctx.conf.hen_write_page_table_offset; offset != 0 && !read) {
++        if (offset > 0) {
++            code.ADD(Xscratch1, Xpagetable, static_cast<u64>(offset));
++        } else {
++            code.SUB(Xscratch1, Xpagetable, static_cast<u64>(-offset));
++        }
++        code.LDR(Xscratch0, Xscratch1, Xscratch0, LSL, 3);
++    } else {
++        code.LDR(Xscratch0, Xpagetable, Xscratch0, LSL, 3);
++    }
+ 
+     if (ctx.conf.page_table_pointer_mask_bits != 0) {
+         const u64 mask = u64(~u64(0)) << ctx.conf.page_table_pointer_mask_bits;
+@@ -414,13 +426,13 @@ void InlinePageTableEmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx
+         }
+     }();
+     const bool ordered = IsOrdered(args[2].GetImmediateAccType());
+-    ctx.fpsr.Spill();
++    ctx.fpsr.BeforeInlineMemoryAccess();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+     SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
+ 
+-    const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
++    const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback, true);
+     EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xbase, Xoffset, ordered);
+ 
+     ctx.deferred_emits.emplace_back([&code, &ctx, inst, Xaddr = *Xaddr, Rvalue = *Rvalue, ordered, fallback, end] {
+@@ -454,7 +466,7 @@ void InlinePageTableEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ct
+         }
+     }();
+     const bool ordered = IsOrdered(args[3].GetImmediateAccType());
+-    ctx.fpsr.Spill();
++    ctx.fpsr.BeforeInlineMemoryAccess();
+     ctx.reg_alloc.SpillFlags();
+     RegAlloc::Realize(Xaddr, Rvalue);
+ 
+@@ -638,8 +650,106 @@ void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* ins
+     }
+ }
+ 
++// (Azahar's Switch 2 port) LDREX and STREX of a word without leaving generated code. Upstream
++// calls out for every one: the monitor's lock, a callback, the embedder's page table walk. A
++// program that counts references atomically does a million a second (Pokemon Omega Ruby's
++// opening: the emulation thread busy 4.6 s of 5 with nothing else wrong).
++//
++// The monitor's data is used as the callbacks use it, so the two can mix (the other sizes, and
++// pages without a direct pointer, still call out): the read records its address and value;
++// the write needs this processor's address to match, drops every processor's reservation on
++// that address, then stores only if memory still holds the recorded value (a host
++// compare-and-swap, as the embedder's MemoryWriteExclusive32 does). The monitor's lock is not
++// taken: emulated processors run in turn on one thread here.
++void HenInlineExclusiveRead32(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    ctx.reg_alloc.PrepareForCall({}, args[1]);
++    const bool ordered = IsOrdered(args[2].GetImmediateAccType());
++
++    SharedLabel slow = GenSharedLabel();
++    oaknut::Label end;
++
++    code.MOV(Wscratch0, 1);
++    code.STRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.MOV(W1, W1);
++    const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<32>(code, ctx, X1, slow);
++    code.ADD(X4, Xbase, Xoffset);
++    code.LDR(W0, X4);
++    code.MOV(X3, ctx.conf.hen_exclusive_addresses + 8 * ctx.conf.hen_exclusive_processor_id);
++    code.STR(X1, X3);
++    code.MOV(X3, ctx.conf.hen_exclusive_value);
++    code.STR(W0, X3);
++    code.B(end);
++    code.l(*slow);
++    EmitRelocation(code, ctx, ExclusiveReadMemoryLinkTarget(32));
++    code.l(end);
++    if (ordered) {
++        code.DMB(oaknut::BarrierOp::ISH);
++    }
++    ctx.reg_alloc.DefineAsRegister(inst, X0);
++}
++
++void HenInlineExclusiveWrite32(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    ctx.reg_alloc.PrepareForCall({}, args[1], args[2]);
++    const bool ordered = IsOrdered(args[3].GetImmediateAccType());
++
++    SharedLabel slow = GenSharedLabel();
++    oaknut::Label end, fail, loop;
++
++    if (ordered) {
++        code.DMB(oaknut::BarrierOp::ISH);
++    }
++    code.MOV(W0, 1);
++    code.LDRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.CBZ(Wscratch0, end);
++    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.MOV(W1, W1);
++    const auto [Xbase, Xoffset] = InlinePageTableEmitVAddrLookup<32>(code, ctx, X1, slow);
++    code.ADD(X4, Xbase, Xoffset);
++    // This processor must hold the address (if not: fail, nothing dropped).
++    code.MOV(X3, ctx.conf.hen_exclusive_addresses + 8 * ctx.conf.hen_exclusive_processor_id);
++    code.LDR(X5, X3);
++    code.CMP(X5, X1);
++    code.B(NE, end);
++    // Every processor's reservation on it goes, this one's included.
++    code.MOV(X6, u64(0xDEAD'DEAD'DEAD'DEADull));
++    code.MOV(X3, ctx.conf.hen_exclusive_addresses);
++    for (size_t processor = 0; processor < ctx.conf.hen_exclusive_processors; processor++) {
++        code.LDR(X5, X3, processor * 8);
++        code.CMP(X5, X1);
++        code.CSEL(X5, X6, X5, EQ);
++        code.STR(X5, X3, processor * 8);
++    }
++    code.MOV(X3, ctx.conf.hen_exclusive_value);
++    code.LDR(W5, X3);
++    code.l(loop);
++    code.LDAXR(W6, X4);
++    code.CMP(W6, W5);
++    code.B(NE, fail);
++    code.STLXR(W7, W2, X4);
++    code.CBNZ(W7, loop);
++    code.MOV(W0, 0);
++    code.B(end);
++    code.l(fail);
++    code.CLREX();
++    code.MOV(W0, 1);
++    code.B(end);
++    code.l(*slow);
++    EmitRelocation(code, ctx, ExclusiveWriteMemoryLinkTarget(32));
++    code.l(end);
++    if (ordered) {
++        code.DMB(oaknut::BarrierOp::ISH);
++    }
++    ctx.reg_alloc.DefineAsRegister(inst, X0);
++}
++
+ template<size_t bitsize>
+ void EmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if (bitsize == 32 && ctx.conf.hen_exclusive_addresses != 0 && ctx.conf.page_table_pointer != 0) {
++        HenInlineExclusiveRead32(code, ctx, inst);
++        return;
++    }
+     CallbackOnlyEmitExclusiveReadMemory<bitsize>(code, ctx, inst);
+ }
+ 
+@@ -656,6 +766,10 @@ void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* in
+ 
+ template<size_t bitsize>
+ void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if (bitsize == 32 && ctx.conf.hen_exclusive_addresses != 0 && ctx.conf.page_table_pointer != 0) {
++        HenInlineExclusiveWrite32(code, ctx, inst);
++        return;
++    }
+     CallbackOnlyEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/fpsr_manager.cpp b/src/dynarmic/backend/arm64/fpsr_manager.cpp
+index 1c61474..4d3d997 100644
+--- a/src/dynarmic/backend/arm64/fpsr_manager.cpp
++++ b/src/dynarmic/backend/arm64/fpsr_manager.cpp
+@@ -16,7 +16,79 @@ using namespace oaknut::util;
+ FpsrManager::FpsrManager(oaknut::CodeGenerator& code, size_t state_fpsr_offset)
+         : code{code}, state_fpsr_offset{state_fpsr_offset} {}
+ 
++// (Azahar's Switch 2 port) Live mode, A32 only.
++//
++// Upstream zeroes the host's FPSR before the first floating-point operation of every block
++// (MSR) and reads it back into the state at the end of the block and before every memory
++// access (MRS). Those two instructions are slow on the console's cores: a block of four
++// single-precision operations took 70 cycles, and they were the hottest generated code in a
++// float loop.
++//
++// The cumulative exception bits are sticky in the guest's register and in the host's alike,
++// so the host register can simply stay in use from block to block. The rule while generated
++// code runs: the guest's cumulative bits are (state.fpsr | host FPSR). The entry code
++// (a32_address_space.cpp) zeroes the host register, the exit code folds it into the state.
++// Inside a block the register is read only where the guest reads its FPSCR, and anything
++// that may leave bits there that are not the guest's (a call into the emulator, a packed
++// saturating operation) folds first and marks the register dirty: it is zeroed again before
++// the next floating-point operation, or at the end of the block. The out-of-line memory
++// calls fold and zero inside their own trampolines, so an inline memory access costs nothing.
++#if defined(__SWITCH__)
++extern "C" int hen_live_fpsr;  // hen/jit/hen_jit.c; --no-live-fpsr
++#else
++static const int hen_live_fpsr = 0;
++#endif
++
++bool FpsrManager::Live() {
++    return hen_live_fpsr != 0;
++}
++
++void FpsrManager::Sync() {
++    if (!Live()) {
++        Spill();
++        return;
++    }
++    if (!dirty) {
++        code.LDR(Wscratch0, Xstate, state_fpsr_offset);
++        code.MRS(Xscratch1, oaknut::SystemReg::FPSR);
++        code.ORR(Wscratch0, Wscratch0, Wscratch1);
++        code.STR(Wscratch0, Xstate, state_fpsr_offset);
++    }
++}
++
++void FpsrManager::EndOfBlock() {
++    if (!Live()) {
++        Spill();
++        return;
++    }
++    if (dirty) {
++        code.MSR(oaknut::SystemReg::FPSR, XZR);
++        dirty = false;
++    }
++}
++
++void FpsrManager::BeforeInlineMemoryAccess() {
++    if (!Live()) {
++        Spill();
++    }
++}
++
++void FpsrManager::Overwrite() {
++    if (!Live()) {
++        fpsr_loaded = false;
++        return;
++    }
++    // (the guest wrote its register: the state is about to hold the new bits, nothing else counts)
++    code.MSR(oaknut::SystemReg::FPSR, XZR);
++    dirty = false;
++}
++
+ void FpsrManager::Spill() {
++    if (Live()) {
++        Sync();
++        dirty = true;
++        return;
++    }
+     if (!fpsr_loaded)
+         return;
+ 
+@@ -29,6 +101,13 @@ void FpsrManager::Spill() {
+ }
+ 
+ void FpsrManager::Load() {
++    if (Live()) {
++        if (dirty) {
++            code.MSR(oaknut::SystemReg::FPSR, XZR);
++            dirty = false;
++        }
++        return;
++    }
+     if (fpsr_loaded)
+         return;
+ 
+diff --git a/src/dynarmic/backend/arm64/fpsr_manager.h b/src/dynarmic/backend/arm64/fpsr_manager.h
+index 9e5d68b..dcc0237 100644
+--- a/src/dynarmic/backend/arm64/fpsr_manager.h
++++ b/src/dynarmic/backend/arm64/fpsr_manager.h
+@@ -20,7 +20,13 @@ public:
+ 
+     void Spill();
+     void Load();
+-    void Overwrite() { fpsr_loaded = false; }
++    void Overwrite();
++
++    // (Azahar's Switch 2 port; see fpsr_manager.cpp)
++    void Sync();
++    void EndOfBlock();
++    void BeforeInlineMemoryAccess();
++    static bool Live();
+ 
+     void GetFpsr(oaknut::WReg);
+ 
+@@ -28,6 +34,7 @@ private:
+     oaknut::CodeGenerator& code;
+     size_t state_fpsr_offset;
+     bool fpsr_loaded = false;
++    bool dirty = false;  // (live mode: the host register holds bits that are not the guest's)
+ };
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/common/spin_lock_arm64.cpp b/src/dynarmic/common/spin_lock_arm64.cpp
+index ccf807e..29597da 100644
+--- a/src/dynarmic/common/spin_lock_arm64.cpp
++++ b/src/dynarmic/common/spin_lock_arm64.cpp
+@@ -35,52 +35,22 @@ void EmitSpinLockUnlock(oaknut::CodeGenerator& code, oaknut::XReg ptr) {
+     code.STLR(WZR, ptr);
+ }
+ 
+-namespace {
+-
+-struct SpinLockImpl {
+-    SpinLockImpl();
+-
+-    void Initialize();
+-
+-    oaknut::CodeBlock mem;
+-    oaknut::CodeGenerator code;
+-
+-    void (*lock)(volatile int*);
+-    void (*unlock)(volatile int*);
+-};
+-
+-std::once_flag flag;
+-SpinLockImpl impl;
+-
+-SpinLockImpl::SpinLockImpl()
+-        : mem{4096}
+-        , code{mem.ptr(), mem.ptr()} {}
+-
+-void SpinLockImpl::Initialize() {
+-    mem.unprotect();
+-
+-    lock = code.xptr<void (*)(volatile int*)>();
+-    EmitSpinLockLock(code, X0);
+-    code.RET();
+-
+-    unlock = code.xptr<void (*)(volatile int*)>();
+-    EmitSpinLockUnlock(code, X0);
+-    code.RET();
+-
+-    mem.protect();
+-    mem.invalidate_all();
+-}
+-
+-}  // namespace
+-
++// (Azahar's Switch 2 port) Plain atomics instead of two generated routines behind a
++// std::call_once on every call: call_once goes through pthread_once, which takes a global
++// mutex here each time, and the exclusive monitor locks and unlocks for every LDREX and STREX
++// of the program. A third of the emulation thread's time in Pokemon Omega Ruby's opening (a
++// million exclusive pairs a second) was that mutex. It also needed a page of executable
++// memory of its own.
+ void SpinLock::Lock() {
+-    std::call_once(flag, &SpinLockImpl::Initialize, impl);
+-    impl.lock(&storage);
++    while (__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) != 0) {
++        while (__atomic_load_n(&storage, __ATOMIC_RELAXED) != 0) {
++            __asm__ volatile("yield");
++        }
++    }
+ }
+ 
+ void SpinLock::Unlock() {
+-    std::call_once(flag, &SpinLockImpl::Initialize, impl);
+-    impl.unlock(&storage);
++    __atomic_store_n(&storage, 0, __ATOMIC_RELEASE);
+ }
+ 
+ }  // namespace Dynarmic
+diff --git a/src/dynarmic/frontend/A32/translate/a32_translate.h b/src/dynarmic/frontend/A32/translate/a32_translate.h
+index 0f2c3a1..2854397 100644
+--- a/src/dynarmic/frontend/A32/translate/a32_translate.h
++++ b/src/dynarmic/frontend/A32/translate/a32_translate.h
+@@ -29,6 +29,11 @@ struct TranslationOptions {
+     /// If this is false, we treat the instruction as a NOP.
+     /// If this is true, we emit an ExceptionRaised instruction.
+     bool hook_hint_instructions = true;
++
++    /// (Azahar's Switch 2 port) ARM state: a conditional B that follows unconditional
++    /// instructions ends their block as Term::If, as the Thumb translator's does, instead
++    /// of becoming a block of its own (see TranslatorVisitor::arm_B).
++    bool fold_cond_branch = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp b/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
+index d87cfcf..be529ca 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_branch.cpp
+@@ -11,12 +11,29 @@ namespace Dynarmic::A32 {
+ 
+ // B <label>
+ bool TranslatorVisitor::arm_B(Cond cond, Imm<24> imm24) {
++    const u32 imm32 = mcl::bit::sign_extend<26, u32>(imm24.ZeroExtend() << 2) + 8;
++    const auto new_location = ir.current_location.AdvancePC(imm32);
++
++    // (Azahar's Switch 2 port, fold_cond_branch) A conditional branch after unconditional
++    // instructions ends their block with both ways out, as thumb16_B_t1 does, where upstream
++    // ends the block before it and makes the branch a block of its own (which is still what a
++    // jump to the branch's address gets: the block is empty then). Only where nothing else
++    // changes:
++    //   - no conditional instruction in the block so far (ConditionalState::None), so the
++    //     block has no entry condition and the flags the branch tests are in the state;
++    //   - the block has instructions, the case in which IsConditionPassed would end it here
++    //     (never when single-stepping: that block is the one instruction);
++    //   - the branch costs one tick, which is what the branch's own block charged when the
++    //     condition failed: both ways out then charge what the two blocks did.
++    if (options.fold_cond_branch && cond != Cond::AL && cond != Cond::NV && cond_state == ConditionalState::None && !ir.block.empty() && !ir.current_location.SingleStepping() && current_instruction_ticks == 1) {
++        ir.SetTerm(IR::Term::If{cond, IR::Term::LinkBlock{new_location}, IR::Term::LinkBlock{ir.current_location.AdvancePC(4)}});
++        return false;
++    }
++
+     if (!ArmConditionPassed(cond)) {
+         return true;
+     }
+ 
+-    const u32 imm32 = mcl::bit::sign_extend<26, u32>(imm24.ZeroExtend() << 2) + 8;
+-    const auto new_location = ir.current_location.AdvancePC(imm32);
+     ir.SetTerm(IR::Term::LinkBlock{new_location});
+     return false;
+ }
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index 44ac245..b4bd62d 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -31,6 +31,8 @@ struct TranslatorVisitor final {
+     TranslationOptions options;
+ 
+     size_t current_instruction_size;
++    /// (ARM state, set by TranslateArm) What GetTicksForCode says for the current instruction.
++    u64 current_instruction_ticks = 1;
+ 
+     bool ArmConditionPassed(Cond cond);
+     bool ThumbConditionPassed();
+diff --git a/src/dynarmic/frontend/A32/translate/translate_arm.cpp b/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+index 24b5797..c81e6cb 100644
+--- a/src/dynarmic/frontend/A32/translate/translate_arm.cpp
++++ b/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+@@ -40,6 +40,7 @@ IR::Block TranslateArm(LocationDescriptor descriptor, TranslateCallbacks* tcb, c
+ 
+             tcb->PreCodeTranslationHook(false, arm_pc, visitor.ir);
+             ticks_for_instruction = tcb->GetTicksForCode(false, arm_pc, *arm_instruction);
++            visitor.current_instruction_ticks = ticks_for_instruction;
+ 
+             if (const auto vfp_decoder = DecodeVFP<TranslatorVisitor>(*arm_instruction)) {
+                 should_continue = vfp_decoder->get().call(visitor, *arm_instruction);
+diff --git a/src/dynarmic/interface/A32/a32.h b/src/dynarmic/interface/A32/a32.h
+index e1c5b40..96b30d7 100644
+--- a/src/dynarmic/interface/A32/a32.h
++++ b/src/dynarmic/interface/A32/a32.h
+@@ -89,6 +89,23 @@ public:
+         return is_executing;
+     }
+ 
++    /// Azahar's Switch 2 port (see HenBlock in backend/arm64/address_space.h): names this JIT in
++    /// the list of compiled blocks, and compiles listed blocks ahead of use. Not while executing
++    /// on another thread.
++    void HenSetTag(std::uint16_t tag);
++    std::size_t HenCompileFrontier(std::uint64_t deadline_ns);
++    std::size_t HenUpgradeLinks(std::uint64_t deadline_ns, std::size_t max_sites);
++    std::size_t HenPrecompile(const void* blocks, std::uint8_t* state, std::size_t count, std::uint64_t deadline_ns, std::size_t* compiled);
++    /// Interpreter first (AddressSpace::HenGetOrDefer), for a caller that has just interpreted a
++    /// block and has written the new PC, CPSR and FPSCR here: true if Run() would only come
++    /// back with UserDefined2 for the block at this location (not compiled yet, to be
++    /// interpreted). The visit is then counted and the block queued exactly as Run() would
++    /// have, so Run() must not be called for it as well. False (nothing counted): call Run().
++    /// Always false with a halt or a cache invalidation pending. Not while executing.
++    bool HenPeekDefer();
++    /// The same list, for the compile worker instead (AddressSpace::HenSetList).
++    void HenSetList(const void* blocks, std::uint8_t* state, std::size_t count);
++
+     /// Debugging: Dump a disassembly all compiled code to the console.
+     void DumpDisassembly() const;
+ 
+diff --git a/src/dynarmic/interface/A32/config.h b/src/dynarmic/interface/A32/config.h
+index 360df06..8b99951 100644
+--- a/src/dynarmic/interface/A32/config.h
++++ b/src/dynarmic/interface/A32/config.h
+@@ -156,6 +156,12 @@ struct UserConfig {
+     static constexpr std::size_t PAGE_BITS = 12;
+     static constexpr std::size_t NUM_PAGE_TABLE_ENTRIES = 1 << (32 - PAGE_BITS);
+     std::array<std::uint8_t*, NUM_PAGE_TABLE_ENTRIES>* page_table = nullptr;
++    /// (Azahar's Switch 2 port) If set, a second table of the same form that reads look their
++    /// page up in; page_table then serves writes and exclusive accesses only. An entry here
++    /// may be non-null where page_table's is null (memory that may be read directly while
++    /// writes to it must reach the embedder). It must lie within 16 MiB of page_table, at a
++    /// multiple of 4096 bytes (arm64 backend: one instruction to get from one to the other).
++    std::array<std::uint8_t*, NUM_PAGE_TABLE_ENTRIES>* read_page_table = nullptr;
+     /// Determines if the pointer in the page_table shall be offseted locally or globally.
+     /// 'false' will access page_table[addr >> bits][addr & mask]
+     /// 'true'  will access page_table[addr >> bits][addr]
+diff --git a/src/dynarmic/ir/basic_block.cpp b/src/dynarmic/ir/basic_block.cpp
+index cc7eb48..9c99b89 100644
+--- a/src/dynarmic/ir/basic_block.cpp
++++ b/src/dynarmic/ir/basic_block.cpp
+@@ -22,7 +22,16 @@
+ namespace Dynarmic::IR {
+ 
+ Block::Block(const LocationDescriptor& location)
+-        : location{location}, end_location{location}, cond{Cond::AL}, instruction_alloc_pool{std::make_unique<Common::Pool>(sizeof(Inst), 4096)} {}
++        : location{location}, end_location{location}, cond{Cond::AL}, instruction_alloc_pool{std::make_unique<Common::Pool>(sizeof(Inst),
++#if defined(__SWITCH__)
++                                                                    // (Azahar's Switch 2 port) 256 at a time, not 4096: the pool grows
++                                                                    // by slabs when a block needs more, and a block held for later
++                                                                    // (the translation worker's) keeps its first slab.
++                                                                    256
++#else
++                                                                    4096
++#endif
++                                                                    )} {}
+ 
+ Block::~Block() = default;
+ 

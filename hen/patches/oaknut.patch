@@ -1,0 +1,140 @@
+diff --git a/include/oaknut/code_block.hpp b/include/oaknut/code_block.hpp
+index bfa87d9..8ed6a72 100644
+--- a/include/oaknut/code_block.hpp
++++ b/include/oaknut/code_block.hpp
+@@ -11,6 +11,22 @@
+ #if defined(_WIN32)
+ #    define NOMINMAX
+ #    include <windows.h>
++#elif defined(__SWITCH__)
++// Switch 2 homebrew (kaiHEN): code memory comes from hen_jit.c (no mmap). The buffer has a
++// write address (ordinary memory) and an execute address; protect() copies what invalidate()
++// reported as changed to the execute address.
++extern "C" {
++struct hen_jit;
++hen_jit* hen_jit_create(std::size_t size);
++void hen_jit_destroy(hen_jit* jit);
++std::uint32_t* hen_jit_wptr(hen_jit* jit);
++std::uint32_t* hen_jit_xptr(hen_jit* jit);
++void hen_jit_executable(hen_jit* jit);
++void hen_jit_writable(hen_jit* jit);
++void hen_jit_invalidate(hen_jit* jit, std::uint32_t* xmem, std::size_t size);
++std::size_t hen_jit_usable_size(hen_jit* jit);
++void hen_jit_rewind(hen_jit* jit, std::size_t offset);
++}
+ #elif defined(__APPLE__)
+ #    include <TargetConditionals.h>
+ #    include <libkern/OSCacheControl.h>
+@@ -30,6 +46,9 @@ public:
+     {
+ #if defined(_WIN32)
+         m_memory = (std::uint32_t*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
++#elif defined(__SWITCH__)
++        m_jit = hen_jit_create(size);
++        m_memory = m_jit ? hen_jit_wptr(m_jit) : nullptr;
+ #elif defined(__APPLE__)
+ #    if TARGET_OS_IPHONE
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+@@ -55,6 +74,8 @@ public:
+ 
+ #if defined(_WIN32)
+         VirtualFree((void*)m_memory, 0, MEM_RELEASE);
++#elif defined(__SWITCH__)
++        hen_jit_destroy(m_jit);
+ #else
+         munmap(m_memory, m_size);
+ #endif
+@@ -65,14 +86,53 @@ public:
+     CodeBlock(CodeBlock&&) = delete;
+     CodeBlock& operator=(CodeBlock&&) = delete;
+ 
++#if !defined(__SWITCH__)
+     std::uint32_t* ptr() const
+     {
+         return m_memory;
+     }
++#endif
++
++    /// Where the code is written.
++    std::uint32_t* wptr() const
++    {
++        return m_memory;
++    }
++
++    /// Where the code runs (the same address except on Switch).
++    std::uint32_t* xptr() const
++    {
++#if defined(__SWITCH__)
++        return hen_jit_xptr(m_jit);
++#else
++        return m_memory;
++#endif
++    }
++
++    /// How much of the block may be filled with code (all of it, except on Switch, where the
++    /// system limits how much code can be mapped at a time).
++    /// The owner starts writing again at offset (in bytes), having thrown its code away.
++    void rewind([[maybe_unused]] std::size_t offset)
++    {
++#if defined(__SWITCH__)
++        hen_jit_rewind(m_jit, offset);
++#endif
++    }
++
++    std::size_t usable_size() const
++    {
++#if defined(__SWITCH__)
++        return hen_jit_usable_size(m_jit);
++#else
++        return m_size;
++#endif
++    }
+ 
+     void protect()
+     {
+-#if defined(__APPLE__) && !TARGET_OS_IPHONE
++#if defined(__SWITCH__)
++        hen_jit_executable(m_jit);
++#elif defined(__APPLE__) && !TARGET_OS_IPHONE
+         pthread_jit_write_protect_np(1);
+ #elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+         mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);
+@@ -81,7 +141,9 @@ public:
+ 
+     void unprotect()
+     {
+-#if defined(__APPLE__) && !TARGET_OS_IPHONE
++#if defined(__SWITCH__)
++        hen_jit_writable(m_jit);
++#elif defined(__APPLE__) && !TARGET_OS_IPHONE
+         pthread_jit_write_protect_np(0);
+ #elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+         mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);
+@@ -90,7 +152,9 @@ public:
+ 
+     void invalidate(std::uint32_t* mem, std::size_t size)
+     {
+-#if defined(__APPLE__)
++#if defined(__SWITCH__)
++        hen_jit_invalidate(m_jit, mem, size);
++#elif defined(__APPLE__)
+         sys_icache_invalidate(mem, size);
+ #elif defined(_WIN32)
+         FlushInstructionCache(GetCurrentProcess(), mem, size);
+@@ -132,12 +196,15 @@ public:
+ 
+     void invalidate_all()
+     {
+-        invalidate(m_memory, m_size);
++        invalidate(xptr(), m_size);
+     }
+ 
+ protected:
+     std::uint32_t* m_memory;
+     std::size_t m_size = 0;
++#if defined(__SWITCH__)
++    hen_jit* m_jit = nullptr;
++#endif
+ };
+ 
+ }  // namespace oaknut

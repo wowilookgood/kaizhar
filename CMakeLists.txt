@@ -550,6 +550,10 @@ if (USE_SYSTEM_BOOST)
 endif()
 
 enable_testing()
+if (NINTENDO_SWITCH)
+    include(hen/cmake/Kaizhar.cmake)
+endif()
+
 add_subdirectory(externals)
 
 # Boost (bundled)
