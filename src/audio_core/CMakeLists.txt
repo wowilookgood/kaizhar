@@ -66,3 +66,7 @@ endif()
 if (CITRA_USE_PRECOMPILED_HEADERS)
     target_precompile_headers(audio_core PRIVATE precompiled_headers.h)
 endif()
+
+if (NINTENDO_SWITCH)
+    target_sources(audio_core PRIVATE switch_sink.cpp switch_sink.h)
+endif()

@@ -12,13 +12,20 @@ add_library(input_common STATIC EXCLUDE_FROM_ALL
     touch_from_button.h
     sdl/sdl.cpp
     sdl/sdl.h
-    udp/client.cpp
-    udp/client.h
-    udp/protocol.cpp
-    udp/protocol.h
-    udp/udp.cpp
-    udp/udp.h
 )
+
+# The cemuhook UDP motion/touch client uses Boost.Asio, which doesn't build for Switch 2 (libnx).
+if (NOT NINTENDO_SWITCH)
+    target_sources(input_common PRIVATE
+        udp/client.cpp
+        udp/client.h
+        udp/protocol.cpp
+        udp/protocol.h
+        udp/udp.cpp
+        udp/udp.h
+    )
+    target_compile_definitions(input_common PRIVATE HAVE_CEMUHOOK_UDP)
+endif()
 
 if(ENABLE_SDL2)
     target_sources(input_common PRIVATE

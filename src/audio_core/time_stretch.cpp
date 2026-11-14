@@ -35,6 +35,21 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
                                    std::size_t num_out) {
     const double time_delta = static_cast<double>(num_out) / native_sample_rate; // seconds
     double current_ratio = static_cast<double>(num_in) / static_cast<double>(num_out);
+#ifdef __SWITCH__
+    // Input arrives in bursts, one per emulated video frame: measure the rate over the last
+    // dozen calls rather than this one.
+    window_in[window_at] = static_cast<u32>(num_in);
+    window_out[window_at] = static_cast<u32>(num_out);
+    window_at = (window_at + 1) % window_in.size();
+    {
+        u64 sum_in = 0, sum_out = 0;
+        for (std::size_t i = 0; i < window_in.size(); i++) {
+            sum_in += window_in[i];
+            sum_out += window_out[i];
+        }
+        current_ratio = static_cast<double>(sum_in) / static_cast<double>(sum_out);
+    }
+#endif
 
     const double max_latency = 0.25; // seconds
     const double max_backlog = native_sample_rate * max_latency;
@@ -54,8 +69,24 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
     // This low-pass filter smoothes out variance in the calculated stretch ratio.
     // The time-scale determines how responsive this filter is.
     constexpr double lpf_time_scale = 0.712; // seconds
+#ifdef __SWITCH__
+    // After a slowdown, come back to normal speed quickly (the slow filter left the ratio low
+    // for a second or so, the backlog grew meanwhile and was then played back fast: an audible
+    // "catching up"), never play noticeably faster than normal, and when more than a quarter of
+    // a second is waiting, skip the excess instead.
+    const double lpf_gain =
+        1.0 - std::exp(-time_delta / (current_ratio > stretch_ratio ? 0.25 : lpf_time_scale));
+    stretch_ratio += lpf_gain * (current_ratio - stretch_ratio);
+    stretch_ratio = std::min(stretch_ratio, 1.03);
+    if (backlog_fullness > 1.0) {
+        sound_touch->receiveSamples(
+            static_cast<u32>(sound_touch->numSamples() - max_backlog * 0.5));
+        skips++;
+    }
+#else
     const double lpf_gain = 1.0 - std::exp(-time_delta / lpf_time_scale);
     stretch_ratio += lpf_gain * (current_ratio - stretch_ratio);
+#endif
 
     // Place a lower limit of 5% speed. When a game boots up, there will be
     // many silence samples. These do not need to be timestretched.
@@ -102,6 +133,21 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
                       std::is_same<soundtouch::SAMPLETYPE, s16>());
         UNREACHABLE_MSG("Invalid SAMPLETYPE {}", typeid(soundtouch::SAMPLETYPE).name());
         return 0;
+    }
+}
+
+std::size_t TimeStretcher::Drain(s16* out, std::size_t num_out) {
+    if constexpr (std::is_floating_point<soundtouch::SAMPLETYPE>()) {
+        std::vector<soundtouch::SAMPLETYPE> float_out(2 * num_out);
+        const std::size_t received =
+            sound_touch->receiveSamples(float_out.data(), static_cast<u32>(num_out));
+        for (std::size_t i = 0; i < 2 * received; i++) {
+            out[i] = static_cast<s16>(float_out[i] * std::numeric_limits<s16>::max());
+        }
+        return received;
+    } else {
+        return sound_touch->receiveSamples(reinterpret_cast<soundtouch::SAMPLETYPE*>(out),
+                                           static_cast<u32>(num_out));
     }
 }
 

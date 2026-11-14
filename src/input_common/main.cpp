@@ -17,7 +17,9 @@
 #include "input_common/sdl/sdl.h"
 #include "input_common/sdl/sdl_impl.h"
 #include "input_common/touch_from_button.h"
+#ifdef HAVE_CEMUHOOK_UDP
 #include "input_common/udp/udp.h"
+#endif
 
 namespace InputCommon {
 
@@ -28,7 +30,9 @@ std::shared_ptr<GCAdapter::Adapter> gcadapter;
 #endif
 static std::shared_ptr<Keyboard> keyboard;
 static std::shared_ptr<MotionEmu> motion_emu;
+#ifdef HAVE_CEMUHOOK_UDP
 static std::unique_ptr<CemuhookUDP::State> udp;
+#endif
 static std::unique_ptr<SDL::State> sdl;
 
 void Init() {
@@ -50,7 +54,9 @@ void Init() {
 
     sdl = SDL::Init();
 
+#ifdef HAVE_CEMUHOOK_UDP
     udp = CemuhookUDP::Init();
+#endif
 }
 
 void Shutdown() {
@@ -68,7 +74,9 @@ void Shutdown() {
     Input::UnregisterFactory<Input::TouchDevice>("emu_window");
     Input::UnregisterFactory<Input::TouchDevice>("touch_from_button");
     sdl.reset();
+#ifdef HAVE_CEMUHOOK_UDP
     udp.reset();
+#endif
 }
 
 std::string ButtonToText(const Common::ParamPackage& param) {
@@ -231,10 +239,12 @@ Common::ParamPackage GetControllerAnalogBinds(const Common::ParamPackage& params
 }
 
 void ReloadInputDevices() {
+#ifdef HAVE_CEMUHOOK_UDP
     if (!udp) {
         return;
     }
     udp->ReloadUDPClient();
+#endif
 }
 
 namespace Polling {
