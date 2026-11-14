@@ -1419,7 +1419,9 @@ unsigned InterpreterMainLoop(ARMul_State* cpu) {
 // GCC and Clang have a C++ extension to support a lookup table of labels. Otherwise, fallback
 // to a clunky switch statement.
 #if defined __GNUC__ || defined __clang__
-    void* InstLabel[] = {&&VMLA_INST,
+    // (Switch 2 port: static. As a local it was copied, 1640 bytes, at every call, and the
+    // interpreter tier calls once a block: about 30% of its time in Kid Icarus's cold start.)
+    static void* const InstLabel[] = {&&VMLA_INST,
                          &&VMLS_INST,
                          &&VNMLA_INST,
                          &&VNMLS_INST,
@@ -1631,6 +1633,14 @@ unsigned InterpreterMainLoop(ARMul_State* cpu) {
     unsigned int num_instrs = 0;
 
     std::size_t ptr;
+    unsigned hen_blocks = 0;
+// (see ARMul_State::hen_tier) Not this instruction: the JIT runs it.
+#define HEN_BAIL                                                                                   \
+    if (cpu->hen_tier) {                                                                           \
+        cpu->hen_bail = true;                                                                      \
+        num_instrs--;                                                                              \
+        goto END;                                                                                  \
+    }
 
     LOAD_NZCVT;
 DISPATCH: {
@@ -1644,6 +1654,12 @@ DISPATCH: {
         cpu->Reg[15] &= 0xfffffffe;
     else
         cpu->Reg[15] &= 0xfffffffc;
+
+    // One block a call. (A block the interpreter ended only because a page did isn't one the
+    // JIT would start a block after: it could be between the halves of a Thumb BL.)
+    if (cpu->hen_tier && hen_blocks++ != 0 && inst_base->br != TransExtData::END_OF_PAGE) {
+        goto END;
+    }
 
     // Find the cached instruction cream, otherwise translate it...
     auto itr = cpu->instruction_cache.find(cpu->Reg[15]);
@@ -1812,6 +1828,7 @@ BIC_INST: {
     GOTO_NEXT_INST;
 }
 BKPT_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         bkpt_inst* const inst_cream = (bkpt_inst*)inst_base->component;
         LOG_DEBUG(Core_ARM11, "Breakpoint instruction hit. Immediate: {:#010X}", inst_cream->imm);
@@ -1890,6 +1907,7 @@ CDP_INST: {
 }
 
 CLREX_INST: {
+    HEN_BAIL;
     cpu->UnsetExclusiveMemoryAddress();
     cpu->Reg[15] += cpu->GetInstructionSize();
     INC_PC(sizeof(clrex_inst));
@@ -2238,6 +2256,7 @@ LDRD_INST: {
 }
 
 LDREX_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int read_addr = RN;
@@ -2252,6 +2271,7 @@ LDREX_INST: {
     GOTO_NEXT_INST;
 }
 LDREXB_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int read_addr = RN;
@@ -2266,6 +2286,7 @@ LDREXB_INST: {
     GOTO_NEXT_INST;
 }
 LDREXH_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int read_addr = RN;
@@ -2280,6 +2301,7 @@ LDREXH_INST: {
     GOTO_NEXT_INST;
 }
 LDREXD_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int read_addr = RN;
@@ -3717,6 +3739,7 @@ STRD_INST: {
     GOTO_NEXT_INST;
 }
 STREX_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int write_addr = cpu->Reg[inst_cream->Rn];
@@ -3736,6 +3759,7 @@ STREX_INST: {
     GOTO_NEXT_INST;
 }
 STREXB_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int write_addr = cpu->Reg[inst_cream->Rn];
@@ -3755,6 +3779,7 @@ STREXB_INST: {
     GOTO_NEXT_INST;
 }
 STREXD_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int write_addr = cpu->Reg[inst_cream->Rn];
@@ -3784,6 +3809,7 @@ STREXD_INST: {
     GOTO_NEXT_INST;
 }
 STREXH_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         generic_arm_inst* inst_cream = (generic_arm_inst*)inst_base->component;
         unsigned int write_addr = cpu->Reg[inst_cream->Rn];
@@ -3869,6 +3895,7 @@ SUB_INST: {
     GOTO_NEXT_INST;
 }
 SWI_INST: {
+    HEN_BAIL;
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         swi_inst* const inst_cream = (swi_inst*)inst_base->component;
         cpu->system.GetRunningCore().GetTimer().AddTicks(num_instrs);

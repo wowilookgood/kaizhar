@@ -251,6 +251,12 @@ public:
     unsigned long long NumInstrs; // The number of instructions executed
     u64 NumInstrsToExecute;
 
+    // (Azahar's Switch 2 port) The interpreter as the JIT's first tier (ARM_Dynarmic::Run):
+    // stop at the end of each block, and stop before an instruction that needs the kernel or
+    // the exclusive monitor (hen_bail says so), which are the JIT's.
+    bool hen_tier = false;
+    bool hen_bail = false;
+
     unsigned NresetSig; // Reset the processor
     unsigned NfiqSig;
     unsigned NirqSig;

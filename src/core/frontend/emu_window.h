@@ -28,6 +28,7 @@ enum class WindowSystemType : u8 {
     X11,
     Wayland,
     LibRetro,
+    Switch, ///< Switch 2 homebrew: render_surface is the NWindow*
 };
 
 struct Frame;

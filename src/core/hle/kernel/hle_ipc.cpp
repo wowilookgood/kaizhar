@@ -25,6 +25,9 @@ SERIALIZE_EXPORT_IMPL(Kernel::SessionRequestHandler::SessionInfo)
 SERIALIZE_EXPORT_IMPL(Kernel::HLERequestContext)
 SERIALIZE_EXPORT_IMPL(Kernel::HLERequestContext::ThreadCallback)
 
+std::atomic<unsigned> hen_async_queued{0}, hen_async_started{0}, hen_async_finished{0},
+    hen_async_threw{0}, hen_async_negative{0};
+
 namespace Kernel {
 
 class HLERequestContext::ThreadCallback : public Kernel::WakeupCallback {

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <string>
 #include "core/hle/applets/applet.h"
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/result.h"
@@ -47,7 +48,12 @@ public:
     Result Finalize() override;
     void Update() override;
 
+    /// The text of the last error a program asked this applet to show, once (then empty).
+    static std::string TakeLastMessage();
+
 private:
+    static std::string last_message;
+
     /// This SharedMemory will be created when we receive the LibAppJustStarted message.
     /// It holds the framebuffer info retrieved by the application with
     /// GSPGPU::ImportDisplayCaptureInfo

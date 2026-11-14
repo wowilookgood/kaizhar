@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cstring>
+#include <string>
 #include <vector>
 #include "common/file_derived.h"
 #include "common/file_util.h"
@@ -97,8 +99,20 @@ static u32 TranslateAddr(u32 addr, const THREEloadinfo* loadinfo, u32* offsets) 
 
 using Kernel::CodeSet;
 
+/// The path the program has on the emulated SD card ("sdmc:/3ds/x/x.3dsx"), or nothing if the
+/// file isn't on it.
+static std::string SdmcPathOf(const std::string& host_path) {
+    const std::string root = FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir);
+    if (root.empty() || host_path.size() <= root.size() ||
+        host_path.compare(0, root.size(), root) != 0) {
+        return {};
+    }
+    return "sdmc:/" + host_path.substr(root.size());
+}
+
 static THREEDSX_Error Load3DSXFile(Core::System& system, FileUtil::IOFileBase* file, u32 base_addr,
-                                   std::shared_ptr<CodeSet>* out_codeset) {
+                                   std::shared_ptr<CodeSet>* out_codeset,
+                                   const std::string& sdmc_path = {}) {
     if (!file->IsOpen())
         return ERROR_FILE;
 
@@ -114,6 +128,12 @@ static THREEDSX_Error Load3DSXFile(Core::System& system, FileUtil::IOFileBase* f
     loadinfo.seg_sizes[0] = (hdr.code_seg_size + 0xFFF) & ~0xFFF;
     loadinfo.seg_sizes[1] = (hdr.rodata_seg_size + 0xFFF) & ~0xFFF;
     loadinfo.seg_sizes[2] = (hdr.data_seg_size + 0xFFF) & ~0xFFF;
+    // One more page of data, for the argument list (below).
+    const u32 arglist_offset = loadinfo.seg_sizes[2];
+    const bool with_arglist = !sdmc_path.empty() && sdmc_path.size() < 0x800;
+    if (with_arglist) {
+        loadinfo.seg_sizes[2] += 0x1000;
+    }
     // prevent integer overflow leading to heap-buffer-overflow
     if (loadinfo.seg_sizes[0] < hdr.code_seg_size || loadinfo.seg_sizes[1] < hdr.rodata_seg_size ||
         loadinfo.seg_sizes[2] < hdr.data_seg_size) {
@@ -224,6 +244,24 @@ static THREEDSX_Error Load3DSXFile(Core::System& system, FileUtil::IOFileBase* f
         }
     }
 
+    // The Homebrew Launcher tells a program where it was started from: argv[0], which the
+    // program's runtime also makes the current directory (programs find their data files
+    // through it). A program started directly gets the same, through the parameter block
+    // the runtime keeps at its start: "_prm", then the service pointer, application ID, heap
+    // sizes, and at +0x18 the pointer to the argument list (a count, then the strings).
+    if (with_arglist && loadinfo.seg_sizes[0] >= 0x20) {
+        u32 magic;
+        std::memcpy(&magic, loadinfo.seg_ptrs[0] + 4, sizeof(magic));
+        if (magic == 0x6D72705F) { // "_prm"
+            u8* const list = loadinfo.seg_ptrs[2] + arglist_offset;
+            const u32 count = 1;
+            std::memcpy(list, &count, sizeof(count));
+            std::memcpy(list + 4, sdmc_path.c_str(), sdmc_path.size() + 1);
+            const u32 list_addr = loadinfo.seg_addrs[2] + arglist_offset;
+            std::memcpy(loadinfo.seg_ptrs[0] + 0x18, &list_addr, sizeof(list_addr));
+        }
+    }
+
     // Create the CodeSet
     std::shared_ptr<CodeSet> code_set = system.Kernel().CreateCodeSet("", 0);
 
@@ -284,7 +322,8 @@ ResultStatus AppLoader_THREEDSX::Load(std::shared_ptr<Kernel::Process>& process)
         return ResultStatus::Error;
 
     std::shared_ptr<CodeSet> codeset;
-    if (Load3DSXFile(system, file.get(), Memory::PROCESS_IMAGE_VADDR, &codeset) != ERROR_NONE)
+    if (Load3DSXFile(system, file.get(), Memory::PROCESS_IMAGE_VADDR, &codeset,
+                     SdmcPathOf(filepath)) != ERROR_NONE)
         return ResultStatus::Error;
     codeset->name = filename;
 

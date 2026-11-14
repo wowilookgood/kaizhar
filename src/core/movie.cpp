@@ -226,6 +226,37 @@ u64 Movie::GetTotalInputCount() const {
     return static_cast<u64>(std::nearbyint(total_input / 234.0 * SCREEN_REFRESH_RATE));
 }
 
+// (Switch port) Playback reads each kind of input from its own position in the recording.
+// The file is one sequence of records in the order the emulated console polled them while
+// recording, and upstream reads it back strictly in that order: when two kinds are polled by
+// different timers (the buttons and the extra controller port a title such as Smash uses),
+// their order differs between runs, the record read is of the wrong kind, and it is dropped
+// ("Expected to read type 5, but found 0", thousands of times a minute). Each kind's Nth poll
+// now gets that kind's Nth record. current_byte stays the furthest position read, which is
+// what the end-of-movie check looks at.
+static bool HenNextOfType(const std::vector<u8>& input, ControllerStateType type, ControllerState& s,
+                          std::size_t& current_byte) {
+    static std::array<std::size_t, 8> cursor{};
+    if (current_byte == 0) {
+        cursor.fill(0);
+    }
+    const std::size_t kind = static_cast<std::size_t>(type) % cursor.size();
+    for (std::size_t at = cursor[kind]; at + sizeof(ControllerState) <= input.size();
+         at += sizeof(ControllerState)) {
+        std::memcpy(&s, &input[at], sizeof(ControllerState));
+        if (s.type == type) {
+            cursor[kind] = at + sizeof(ControllerState);
+            current_byte = std::max(current_byte, cursor[kind]);
+            return true;
+        }
+    }
+    cursor[kind] = input.size();
+    if (type == ControllerStateType::PadAndCircle) {
+        current_byte = input.size(); // (no button records left: the movie is over)
+    }
+    return false;
+}
+
 void Movie::CheckInputEnd() {
     if (current_byte + sizeof(ControllerState) > recorded_input.size()) {
         LOG_INFO(Movie, "Playback finished");
@@ -236,16 +267,10 @@ void Movie::CheckInputEnd() {
 
 void Movie::Play(Service::HID::PadState& pad_state, s16& circle_pad_x, s16& circle_pad_y) {
     ControllerState s{};
-    std::memcpy(&s, &recorded_input[current_byte], sizeof(ControllerState));
-    current_byte += sizeof(ControllerState);
-    current_input++;
-
-    if (s.type != ControllerStateType::PadAndCircle) {
-        LOG_ERROR(Movie,
-                  "Expected to read type {}, but found {}. Your playback will be out of sync",
-                  static_cast<int>(ControllerStateType::PadAndCircle), s.type);
+    if (!HenNextOfType(recorded_input, ControllerStateType::PadAndCircle, s, current_byte)) {
         return;
     }
+    current_input++;
 
     pad_state.a.Assign(s.pad_and_circle.a);
     pad_state.b.Assign(s.pad_and_circle.b);
@@ -268,13 +293,7 @@ void Movie::Play(Service::HID::PadState& pad_state, s16& circle_pad_x, s16& circ
 
 void Movie::Play(Service::HID::TouchDataEntry& touch_data) {
     ControllerState s{};
-    std::memcpy(&s, &recorded_input[current_byte], sizeof(ControllerState));
-    current_byte += sizeof(ControllerState);
-
-    if (s.type != ControllerStateType::Touch) {
-        LOG_ERROR(Movie,
-                  "Expected to read type {}, but found {}. Your playback will be out of sync",
-                  static_cast<int>(ControllerStateType::Touch), s.type);
+    if (!HenNextOfType(recorded_input, ControllerStateType::Touch, s, current_byte)) {
         return;
     }
 
@@ -285,13 +304,7 @@ void Movie::Play(Service::HID::TouchDataEntry& touch_data) {
 
 void Movie::Play(Service::HID::AccelerometerDataEntry& accelerometer_data) {
     ControllerState s{};
-    std::memcpy(&s, &recorded_input[current_byte], sizeof(ControllerState));
-    current_byte += sizeof(ControllerState);
-
-    if (s.type != ControllerStateType::Accelerometer) {
-        LOG_ERROR(Movie,
-                  "Expected to read type {}, but found {}. Your playback will be out of sync",
-                  static_cast<int>(ControllerStateType::Accelerometer), s.type);
+    if (!HenNextOfType(recorded_input, ControllerStateType::Accelerometer, s, current_byte)) {
         return;
     }
 
@@ -302,13 +315,7 @@ void Movie::Play(Service::HID::AccelerometerDataEntry& accelerometer_data) {
 
 void Movie::Play(Service::HID::GyroscopeDataEntry& gyroscope_data) {
     ControllerState s{};
-    std::memcpy(&s, &recorded_input[current_byte], sizeof(ControllerState));
-    current_byte += sizeof(ControllerState);
-
-    if (s.type != ControllerStateType::Gyroscope) {
-        LOG_ERROR(Movie,
-                  "Expected to read type {}, but found {}. Your playback will be out of sync",
-                  static_cast<int>(ControllerStateType::Gyroscope), s.type);
+    if (!HenNextOfType(recorded_input, ControllerStateType::Gyroscope, s, current_byte)) {
         return;
     }
 
@@ -319,13 +326,7 @@ void Movie::Play(Service::HID::GyroscopeDataEntry& gyroscope_data) {
 
 void Movie::Play(Service::IR::PadState& pad_state, s16& c_stick_x, s16& c_stick_y) {
     ControllerState s{};
-    std::memcpy(&s, &recorded_input[current_byte], sizeof(ControllerState));
-    current_byte += sizeof(ControllerState);
-
-    if (s.type != ControllerStateType::IrRst) {
-        LOG_ERROR(Movie,
-                  "Expected to read type {}, but found {}. Your playback will be out of sync",
-                  static_cast<int>(ControllerStateType::IrRst), s.type);
+    if (!HenNextOfType(recorded_input, ControllerStateType::IrRst, s, current_byte)) {
         return;
     }
 
@@ -337,13 +338,7 @@ void Movie::Play(Service::IR::PadState& pad_state, s16& c_stick_x, s16& c_stick_
 
 void Movie::Play(Service::IR::ExtraHIDResponse& extra_hid_response) {
     ControllerState s{};
-    std::memcpy(&s, &recorded_input[current_byte], sizeof(ControllerState));
-    current_byte += sizeof(ControllerState);
-
-    if (s.type != ControllerStateType::ExtraHidResponse) {
-        LOG_ERROR(Movie,
-                  "Expected to read type {}, but found {}. Your playback will be out of sync",
-                  static_cast<int>(ControllerStateType::ExtraHidResponse), s.type);
+    if (!HenNextOfType(recorded_input, ControllerStateType::ExtraHidResponse, s, current_byte)) {
         return;
     }
 

@@ -32,6 +32,9 @@
 SERIALIZE_EXPORT_IMPL(Kernel::Thread)
 SERIALIZE_EXPORT_IMPL(Kernel::WakeupCallback)
 
+#include <atomic>
+std::atomic<unsigned> hen_wake_fired{0}, hen_wake_not_waiting{0}; // (hang report)
+
 namespace Kernel {
 
 template <class Archive>
@@ -143,7 +146,13 @@ void Thread::Stop() {
 #endif
 }
 
+// (Switch 2 port) Counts every change that can alter which thread should run: a thread
+// becoming ready, a priority change, a context switch. svc.cpp compares it across a system
+// call to tell whether the reschedule the call asked for can do anything.
+unsigned long long hen_ready_changes = 0;
+
 void ThreadManager::SwitchContext(Thread* new_thread) {
+    hen_ready_changes++;
     Thread* previous_thread = GetCurrentThread();
     std::shared_ptr<Process> previous_process = nullptr;
 
@@ -282,6 +291,10 @@ void ThreadManager::ThreadWakeupCallback(u64 thread_id, s64 cycles_late) {
         return;
     }
 
+    ++hen_wake_fired;
+    if (thread->status == ThreadStatus::Running || thread->status == ThreadStatus::Ready) {
+        ++hen_wake_not_waiting;
+    }
     if (thread->status == ThreadStatus::WaitSynchAny ||
         thread->status == ThreadStatus::WaitSynchAll || thread->status == ThreadStatus::WaitArb ||
         thread->status == ThreadStatus::WaitHleEvent) {
@@ -346,6 +359,7 @@ void Thread::ResumeFromWait() {
 
     thread_manager.ready_queue.push_back(current_priority, this);
     status = ThreadStatus::Ready;
+    hen_ready_changes++;
     thread_manager.kernel.PrepareReschedule();
 }
 
@@ -431,6 +445,7 @@ ResultVal<std::shared_ptr<Thread>> KernelSystem::CreateThread(
         thread_managers[processor_id]->ready_queue.push_back(thread->current_priority,
                                                              thread.get());
         thread->status = ThreadStatus::Ready;
+        hen_ready_changes++;
     }
 
     return thread;
@@ -439,6 +454,9 @@ ResultVal<std::shared_ptr<Thread>> KernelSystem::CreateThread(
 void Thread::SetPriority(u32 priority) {
     ASSERT_MSG(priority <= ThreadPrioLowest && priority >= ThreadPrioHighest,
                "Invalid priority value.");
+    if (priority != current_priority) {
+        hen_ready_changes++;
+    }
     // If thread was ready, adjust queues
     if (status == ThreadStatus::Ready)
         thread_manager.ready_queue.move(this, current_priority, priority);
@@ -458,6 +476,9 @@ void Thread::UpdatePriority() {
 }
 
 void Thread::BoostPriority(u32 priority) {
+    if (priority != current_priority) {
+        hen_ready_changes++;
+    }
     // If thread was ready, adjust queues
     if (status == ThreadStatus::Ready)
         thread_manager.ready_queue.move(this, current_priority, priority);
@@ -509,6 +530,15 @@ bool ThreadManager::HaveReadyThreads() {
 void ThreadManager::Reschedule() {
     Thread* cur = GetCurrentThread();
     Thread* next = PopNextReadyThread();
+
+    // (Switch 2 port) The running thread stays: no switch. Upstream switched from the thread
+    // to itself here (context saved and loaded again, the timer queue searched, the ready
+    // queue pushed and popped) on every reschedule, which is every slice of every core and
+    // every system call that asks for one.
+    if (next != nullptr && next == cur && cur->status == ThreadStatus::Running) {
+        cur->last_running_ticks = cpu->GetTimer().GetTicks();
+        return;
+    }
 
     if (cur && next) {
         LOG_TRACE(Kernel, "context switch {} -> {}", cur->GetObjectId(), next->GetObjectId());

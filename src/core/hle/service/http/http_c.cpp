@@ -498,6 +498,16 @@ void Context::MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo
     FinishTransfer();
 }
 
+#ifdef __SWITCH__
+// The Switch 2 build has no TLS library: HTTPS requests fail.
+void Context::MakeRequestSSL(httplib::Request&, const Common::URLInfo& url_info,
+                             std::vector<Context::RequestHeader>&) {
+    LOG_ERROR(Service_HTTP, "HTTPS request to {} failed: no TLS support in this build",
+              url_info.host);
+    state = RequestState::Completed;
+    FinishTransfer();
+}
+#else
 void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& url_info,
                              std::vector<Context::RequestHeader>& pending_headers) {
     httplib::Error error{-1};
@@ -557,6 +567,7 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
 
     FinishTransfer();
 }
+#endif
 
 bool Context::ContentProvider(size_t offset, size_t length, httplib::DataSink& sink) {
     if (!post_data_raw.empty()) {

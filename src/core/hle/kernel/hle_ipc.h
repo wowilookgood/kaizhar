@@ -30,6 +30,12 @@ namespace Memory {
 class MemorySystem;
 }
 
+// (Switch port) Progress of service calls that run on a host thread, for the boot-hang report.
+#include <atomic>
+#include <cstdio>
+extern std::atomic<unsigned> hen_async_queued, hen_async_started, hen_async_finished,
+    hen_async_threw, hen_async_negative;
+
 namespace Kernel {
 
 class HandleTable;
@@ -350,12 +356,31 @@ public:
 
             // We use packaged_task so we can retrieve a std::future to pass to AsyncWakeUpCallback
             auto task = std::make_shared<std::packaged_task<void()>>([this, async_section] {
-                s64 sleep_for = async_section(*this);
+                // (Switch port) Counted for the boot-hang report, and an exception must not
+                // leave the calling thread asleep for good: the packaged_task would keep it
+                // to itself and the wake-up below would never be scheduled.
+                ++hen_async_started;
+                s64 sleep_for = 0;
+                try {
+                    sleep_for = async_section(*this);
+                } catch (const std::exception& e) {
+                    ++hen_async_threw;
+                    std::printf("hen: async: a service call's host-thread part threw: %s\n", e.what());
+                } catch (...) {
+                    ++hen_async_threw;
+                    std::printf("hen: async: a service call's host-thread part threw\n");
+                }
+                ++hen_async_finished;
+                if (sleep_for < 0) {
+                    ++hen_async_negative; // (WakeAfterDelay(-1) schedules nothing)
+                    sleep_for = 0;
+                }
                 this->thread->WakeAfterDelay(sleep_for, true);
             });
 
             auto future = task->get_future();
 
+            ++hen_async_queued;
             worker.QueueWork([task]() { (*task)(); });
 
             this->SleepClientThread("RunOnThread", std::chrono::nanoseconds(-1),

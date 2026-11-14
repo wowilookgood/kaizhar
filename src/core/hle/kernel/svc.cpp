@@ -1165,6 +1165,16 @@ void SVC::Break(u8 break_reason) {
     Core::LogException(system, Core::ExceptionType::Break);
 }
 
+#ifdef __SWITCH__
+extern "C" unsigned long long hen_jit_now_ns(void);
+extern "C" unsigned long long hen_jit_code_ticks_total(void);
+extern "C" long long hen_limiter_slept_total_us;
+extern "C" int hen_lazy_resched; // hen/jit/hen_jit.c; --no-lazy-resched
+extern "C" unsigned long long hen_resched_skipped;
+#endif
+extern unsigned long long hen_ready_changes; // thread.cpp (namespace Kernel, as here)
+extern "C" int hen_svc_lazy_state;           // core.cpp
+
 /// Used to output a message on a debug hardware unit, or for the GDB file I/O
 /// (HIO) protocol - does nothing on a retail unit.
 void SVC::OutputDebugString(VAddr address, s32 len) {
@@ -1187,6 +1197,15 @@ void SVC::OutputDebugString(VAddr address, s32 len) {
 
     std::string string(len, ' ');
     memory.ReadBlock(*kernel.GetCurrentProcess(), address, string.data(), len);
+#if defined(__SWITCH__) && HEN_DEV
+    // (Switch 2 port) Marks from the CPU benchmark (.3dsx): host time, time the limiter has
+    // slept and program-code ticks so far, so each test's instructions a host second can be
+    // worked out from the log.
+    if (string.rfind("henbench", 0) == 0) {
+        std::printf("hen: bench: %s t=%llu slept=%lld ticks=%llu\n", string.c_str(),
+                    hen_jit_now_ns(), hen_limiter_slept_total_us, hen_jit_code_ticks_total());
+    }
+#endif
     LOG_DEBUG(Debug_Emulated, "{}", string);
 }
 
@@ -2450,8 +2469,41 @@ void SVC::CallSVC(u32 immediate) {
     LOG_TRACE(Kernel_SVC, "calling {}", info->name);
     if (info) {
         if (info->func) {
-            system.GetRunningCore().GetTimer().AddTicks(info->cycles);
+            system.GetRunningCore().GetTimer().AddKernelTicks(info->cycles);
+#ifdef __SWITCH__
+            // (Switch 2 port) The calls on synchronisation objects ask for a reschedule every
+            // time, and leaving the generated code for one costs several microseconds (all
+            // cores' timers advanced and rescheduled). Programs make tens of thousands of
+            // these a second and nearly all change nothing: an uncontended mutex taken and
+            // released. So the request is held back during the call and dropped when the
+            // calling thread is still running and no thread became ready or changed priority.
+            // Not on core 1, whose scheduler also enforces the system core's time limit.
+            const bool lazy = hen_lazy_resched != 0 && system.GetRunningCore().GetID() != 1 &&
+                              (immediate == 0x14 || immediate == 0x16 || immediate == 0x18 ||
+                               immediate == 0x19 || immediate == 0x22 || immediate == 0x24 ||
+                               immediate == 0x25);
+            if (lazy) {
+                Thread* const before = kernel.GetCurrentThreadManager().GetCurrentThread();
+                const unsigned long long changes = hen_ready_changes;
+                hen_svc_lazy_state = 1;
+                (this->*(info->func))();
+                const bool asked = hen_svc_lazy_state == 2;
+                hen_svc_lazy_state = 0;
+                if (asked) {
+                    Thread* const now = kernel.GetCurrentThreadManager().GetCurrentThread();
+                    if (now != nullptr && now == before && now->status == ThreadStatus::Running &&
+                        changes == hen_ready_changes) {
+                        hen_resched_skipped++;
+                    } else {
+                        kernel.PrepareReschedule();
+                    }
+                }
+            } else {
+                (this->*(info->func))();
+            }
+#else
             (this->*(info->func))();
+#endif
         } else {
             LOG_ERROR(Kernel_SVC, "unimplemented SVC function {:02X} {}(..)", info->id, info->name);
         }

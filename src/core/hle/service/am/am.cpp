@@ -49,6 +49,13 @@
 SERIALIZE_EXPORT_IMPL(Service::AM::Module)
 SERVICE_CONSTRUCT_IMPL(Service::AM::Module)
 
+#ifdef __SWITCH__
+#include <chrono>
+// (Azahar's Switch 2 port, hen/jit/hen_jit.c) .cia install: piece size and timing.
+extern "C" unsigned hen_cia_chunk_bytes;
+extern "C" unsigned long long hen_cia_read_ns, hen_cia_write_ns, hen_cia_chunks;
+#endif
+
 namespace Service::AM {
 
 constexpr u16 PLATFORM_CTR = 0x0004;
@@ -1224,13 +1231,36 @@ InstallStatus InstallCIA(const std::string& path,
         }
 
         std::vector<u8> buffer;
+#ifdef __SWITCH__
+        // (Azahar's Switch 2 port) 16 MiB at a time: each flushed write is a round trip to the
+        // console's file system service that costs about 10 ms whatever its size. Measured on
+        // ~600 MiB titles: 64 KiB pieces 5.6 MiB/s, 4 MiB pieces 56 MiB/s, 16 MiB pieces 66.
+        buffer.resize(hen_cia_chunk_bytes ? hen_cia_chunk_bytes : 0x1000000);
+        hen_cia_read_ns = hen_cia_write_ns = hen_cia_chunks = 0;
+#else
         buffer.resize(0x10000);
+#endif
         auto file_size = in_file->GetSize();
         std::size_t total_bytes_read = 0;
         while (total_bytes_read != file_size) {
+#ifdef __SWITCH__
+            const auto hen_t0 = std::chrono::steady_clock::now();
+#endif
             std::size_t bytes_read = in_file->ReadBytes(buffer.data(), buffer.size());
+#ifdef __SWITCH__
+            const auto hen_t1 = std::chrono::steady_clock::now();
+#endif
             auto result = installFile.Write(static_cast<u64>(total_bytes_read), bytes_read, true,
                                             false, static_cast<u8*>(buffer.data()));
+#ifdef __SWITCH__
+            // (for the frontend's install report: reading the .cia against everything Write
+            // does with it, which is decrypting, hashing and writing the title's files)
+            hen_cia_read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hen_t1 - hen_t0).count();
+            hen_cia_write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - hen_t1)
+                                    .count();
+            hen_cia_chunks++;
+#endif
 
             if (update_callback) {
                 update_callback(total_bytes_read, file_size);

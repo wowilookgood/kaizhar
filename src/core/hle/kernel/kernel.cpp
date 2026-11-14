@@ -22,6 +22,10 @@
 
 SERIALIZE_EXPORT_IMPL(Kernel::New3dsHwCapabilities)
 
+namespace Core {
+void HenSetFastClock(Timing& timing, bool running_804mhz); // core_timing.cpp: --n3ds-clock
+}
+
 namespace Kernel {
 
 /// Initialize the kernel
@@ -184,6 +188,7 @@ void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
     if (Settings::values.is_new_3ds) {
         SetRunning804MHz(n3ds_hw_cap.enable_804MHz_cpu);
     }
+    Core::HenSetFastClock(timing, GetRunning804MHz());
 
     u32 tid_high = static_cast<u32>(title_id >> 32);
 

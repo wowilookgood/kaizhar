@@ -5,8 +5,10 @@
 #include <tuple>
 #include <utility>
 #include "common/archives.h"
+#include "core/core.h"
 #include "core/file_sys/archive_other_savedata.h"
 #include "core/file_sys/errors.h"
+#include "core/file_sys/ncch_container.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/fs/archive.h"
 
@@ -20,6 +22,20 @@ namespace FileSys {
 using Service::FS::MediaType;
 
 namespace {
+
+/// Whether the cartridge in the slot is this title. Its save data is kept with the SD card's
+/// (where the title itself reads and writes it when it runs), so another application may open
+/// it there. With no such cartridge, the archives answer as before: not inserted.
+bool CartridgeHolds(u64 program_id) {
+    const std::string& cartridge = Core::System::GetInstance().GetCartridge();
+    if (cartridge.empty()) {
+        return false;
+    }
+    u64 cartridge_id = 0;
+    NCCHContainer container(cartridge);
+    return container.ReadProgramId(cartridge_id) == Loader::ResultStatus::Success &&
+           cartridge_id == program_id;
+}
 
 template <typename T>
 ResultVal<std::tuple<MediaType, u64>> ParsePath(const Path& path, T program_id_reader) {
@@ -70,7 +86,7 @@ ResultVal<std::unique_ptr<ArchiveBackend>> ArchiveFactory_OtherSaveDataPermitted
     u64 program_id;
     CASCADE_RESULT(std::tie(media_type, program_id), ParsePathPermitted(path));
 
-    if (media_type == MediaType::GameCard) {
+    if (media_type == MediaType::GameCard && !CartridgeHolds(program_id)) {
         LOG_WARNING(Service_FS, "(stubbed) Unimplemented media type GameCard");
         return ResultGamecardNotInserted;
     }
@@ -93,7 +109,7 @@ ResultVal<ArchiveFormatInfo> ArchiveFactory_OtherSaveDataPermitted::GetFormatInf
     u64 program_id;
     CASCADE_RESULT(std::tie(media_type, program_id), ParsePathPermitted(path));
 
-    if (media_type == MediaType::GameCard) {
+    if (media_type == MediaType::GameCard && !CartridgeHolds(program_id)) {
         LOG_WARNING(Service_FS, "(stubbed) Unimplemented media type GameCard");
         return ResultGamecardNotInserted;
     }
@@ -112,7 +128,7 @@ ResultVal<std::unique_ptr<ArchiveBackend>> ArchiveFactory_OtherSaveDataGeneral::
     u64 program_id;
     CASCADE_RESULT(std::tie(media_type, program_id), ParsePathGeneral(path));
 
-    if (media_type == MediaType::GameCard) {
+    if (media_type == MediaType::GameCard && !CartridgeHolds(program_id)) {
         LOG_WARNING(Service_FS, "(stubbed) Unimplemented media type GameCard");
         return ResultGamecardNotInserted;
     }
@@ -129,7 +145,7 @@ Result ArchiveFactory_OtherSaveDataGeneral::Format(const Path& path,
     u64 program_id;
     CASCADE_RESULT(std::tie(media_type, program_id), ParsePathGeneral(path));
 
-    if (media_type == MediaType::GameCard) {
+    if (media_type == MediaType::GameCard && !CartridgeHolds(program_id)) {
         LOG_WARNING(Service_FS, "(stubbed) Unimplemented media type GameCard");
         return ResultGamecardNotInserted;
     }
@@ -145,7 +161,7 @@ ResultVal<ArchiveFormatInfo> ArchiveFactory_OtherSaveDataGeneral::GetFormatInfo(
     u64 program_id;
     CASCADE_RESULT(std::tie(media_type, program_id), ParsePathGeneral(path));
 
-    if (media_type == MediaType::GameCard) {
+    if (media_type == MediaType::GameCard && !CartridgeHolds(program_id)) {
         LOG_WARNING(Service_FS, "(stubbed) Unimplemented media type GameCard");
         return ResultGamecardNotInserted;
     }

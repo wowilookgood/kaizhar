@@ -12,6 +12,10 @@
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#ifdef __SWITCH__
+#include "core/arm/dynarmic/hen_block_list.h"
+#endif
+#include "video_core/hen_gpu_thread.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/hle/service/cam/cam.h"
@@ -90,6 +94,11 @@ System::~System() = default;
  * Executes the thread currently scheduled on the given core. Runs a full slice when tight_loop is
  * set, a single instruction otherwise, or a single instruction if a debugger asked to step it.
  */
+#ifdef __SWITCH__
+extern "C" unsigned long long hen_jit_now_ns(void);
+extern "C" unsigned long long hen_core_ns[4], hen_core_ticks[4], hen_core_runs[4]; // hen_jit.c
+#endif
+
 static void ExecuteCore(ARM_Interface& core, Kernel::Thread* thread, bool tight_loop) {
 #ifdef ENABLE_GDBSTUB
     if (thread->gdb_single_step) [[unlikely]] {
@@ -100,12 +109,29 @@ static void ExecuteCore(ARM_Interface& core, Kernel::Thread* thread, bool tight_
         return;
     }
 #endif
+#ifdef __SWITCH__
+    // (per emulated core: time on the host thread and emulated ticks, for the "hen: cores"
+    // line: which of the console's cores a title keeps busy)
+    const unsigned long long hen_start = hen_jit_now_ns();
+    const u64 hen_ticks = core.GetTimer().GetTicks();
+#endif
     if (tight_loop) {
         core.Run();
     } else {
         core.Step();
     }
+#ifdef __SWITCH__
+    const std::size_t hen_id = core.GetID() & 3;
+    hen_core_ns[hen_id] += hen_jit_now_ns() - hen_start;
+    hen_core_ticks[hen_id] += core.GetTimer().GetTicks() - hen_ticks;
+    hen_core_runs[hen_id]++;
+#endif
 }
+
+// (Switch 2 port, --gpu-thread) Whether no emulated thread ran in the last run loop pass:
+// then emulated time is jumping from event to event at no cost in host time, and a program
+// waiting for the GPU would see a whole frame of it pass before the GPU thread got anywhere.
+static bool hen_all_idle = false;
 
 System::ResultStatus System::RunLoop(bool tight_loop) {
     status = ResultStatus::Success;
@@ -113,6 +139,12 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     if (!IsPoweredOn()) {
         return ResultStatus::ErrorNotInitialized;
     }
+
+    // (Switch 2 port, --gpu-thread) The interrupts of what the GPU thread has finished are
+    // signalled here, before the cores' timers advance and their threads are rescheduled
+    // below, like an event that came due. Nothing without the thread.
+    VideoCore::HenGpu::Poll(hen_all_idle);
+    hen_all_idle = false;
 
 #ifdef ENABLE_GDBSTUB
     if (GDBStub::IsServerEnabled()) {
@@ -275,6 +307,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         // with a max slice that is the minimum of all max slices of all cores
         // TODO: Make special check for idle since we can easily revert the time of idle cores
         s64 max_slice = Timing::MAX_SLICE_LENGTH;
+        hen_all_idle = true;
         for (const auto& cpu_core : cpu_cores) {
             running_core = cpu_core.get();
             kernel->SetRunningCPU(running_core);
@@ -300,6 +333,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             } else {
                 // In the rare case the break flag is set (due to exception thrown)
                 // there is probably no need to adjust the timer accordingly.
+                hen_all_idle = false;
                 ExecuteCore(*cpu_core, thread, tight_loop);
             }
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
@@ -330,6 +364,10 @@ void System::ProcessPendingWork() {
 }
 
 void System::ProcessPendingWorkUntil(std::chrono::steady_clock::time_point deadline) {
+#ifdef __SWITCH__
+    // Use the wait to compile program code ahead of its use.
+    HenBlockList::Idle(deadline);
+#endif
     do {
         ProcessPendingWork();
     } while (pending_work_event.WaitUntil(deadline));
@@ -541,7 +579,17 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     return status;
 }
 
+// (Switch 2 port) See SVC::CallSVC: 1 while a system call that only touches synchronisation
+// objects runs, 2 once it has asked for a reschedule.
+extern "C" {
+int hen_svc_lazy_state = 0;
+}
+
 void System::PrepareReschedule() {
+    if (hen_svc_lazy_state != 0) {
+        hen_svc_lazy_state = 2;
+        return;
+    }
     running_core->PrepareReschedule();
     curr_core_reschedule_pending = true;
 }

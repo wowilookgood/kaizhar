@@ -14,6 +14,8 @@
 #include <sys/types.h>
 #include <sys/sysctl.h>
 // clang-format on
+#elif defined(__SWITCH__)
+// Horizon has no auxv or /proc; see Detect().
 #elif !defined(_WIN32)
 #ifndef __FreeBSD__
 #include <asm/hwcap.h>
@@ -36,7 +38,7 @@ static std::string GetCPUString() {
     }
     return buf;
 }
-#elif !defined(WIN32)
+#elif !defined(WIN32) && !defined(__SWITCH__)
 static std::string GetCPUString() {
     constexpr char procfile[] = "/proc/cpuinfo";
     constexpr char marker[] = "Hardware\t: ";
@@ -76,6 +78,16 @@ static CPUCaps Detect() {
     caps.sha1 = true;
     caps.sha2 = true;
     caps.cpu_string = GetCPUString();
+#elif defined(__SWITCH__)
+    // Horizon gives no way to query these; the Switch 2's CPU has all of them (the toolchain
+    // already compiles with +crc+crypto).
+    caps.fp = true;
+    caps.asimd = true;
+    caps.aes = true;
+    caps.crc32 = true;
+    caps.sha1 = true;
+    caps.sha2 = true;
+    caps.cpu_string = "Nintendo Switch 2";
 #elif defined(_WIN32)
     // Windows does not provide any mechanism for querying the system registers on ARMv8, unlike
     // Linux which traps the register reads and emulates them in the kernel. There are environment

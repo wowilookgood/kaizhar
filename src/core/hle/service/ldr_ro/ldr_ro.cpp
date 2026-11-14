@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdio>
+#include <optional>
+#include "common/hen_stats.h"
 #include "common/alignment.h"
 #include "common/archives.h"
 #include "common/common_types.h"
@@ -60,6 +63,7 @@ static bool VerifyBufferState(Kernel::Process& process, VAddr buffer_ptr, u32 si
 }
 
 void RO::Initialize(Kernel::HLERequestContext& ctx) {
+    const Core::System::InvalidationBatch invalidation_batch{system}; // (see core.h)
     IPC::RequestParser rp(ctx);
     VAddr crs_buffer_ptr = rp.Pop<u32>();
     u32 crs_size = rp.Pop<u32>();
@@ -167,6 +171,13 @@ void RO::UnloadCRR(Kernel::HLERequestContext& ctx) {
 }
 
 void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
+#if HEN_DEV
+    struct HenSay {
+        HenSay() { std::printf("hen: ldr: LoadCRO begins\n"); }
+        ~HenSay() { std::printf("hen: ldr: LoadCRO ends\n"); }
+    } hen_say; // (around the invalidations as well: declared first, so it ends last)
+#endif
+    const Core::System::InvalidationBatch invalidation_batch{system}; // (see core.h)
     IPC::RequestParser rp(ctx);
     VAddr cro_buffer_ptr = rp.Pop<u32>();
     VAddr cro_address = rp.Pop<u32>();
@@ -263,7 +274,9 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
 
     CROHelper cro(cro_address, *process, system);
 
+    std::optional<HenSlow> hen_slow_1{std::in_place, "CRO VerifyHash"};
     result = cro.VerifyHash(cro_size, crr_address);
+    hen_slow_1.reset();
     if (result.IsError()) {
         LOG_ERROR(Service_LDR, "Error verifying CRO in CRR {:08X}", result.raw);
         process->Unmap(cro_address, cro_buffer_ptr, cro_size, Kernel::VMAPermission::ReadWrite,
@@ -273,8 +286,10 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
         return;
     }
 
+    std::optional<HenSlow> hen_slow_2{std::in_place, "CRO Rebase"};
     result = cro.Rebase(slot->loaded_crs, cro_size, data_segment_address, data_segment_size,
                         bss_segment_address, bss_segment_size, false);
+    hen_slow_2.reset();
     if (result.IsError()) {
         LOG_ERROR(Service_LDR, "Error rebasing CRO {:08X}", result.raw);
         process->Unmap(cro_address, cro_buffer_ptr, cro_size, Kernel::VMAPermission::ReadWrite,
@@ -284,7 +299,9 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
         return;
     }
 
+    std::optional<HenSlow> hen_slow_3{std::in_place, "CRO Link"};
     result = cro.Link(slot->loaded_crs, link_on_load_bug_fix);
+    hen_slow_3.reset();
     if (result.IsError()) {
         LOG_ERROR(Service_LDR, "Error linking CRO {:08X}", result.raw);
         process->Unmap(cro_address, cro_buffer_ptr, cro_size, Kernel::VMAPermission::ReadWrite,
@@ -325,7 +342,9 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
         }
     }
 
+    std::optional<HenSlow> hen_slow_4{std::in_place, "CRO load InvalidateCacheRange"};
     system.InvalidateCacheRange(cro_address, cro_size);
+    hen_slow_4.reset();
 
     LOG_INFO(Service_LDR, "CRO \"{}\" loaded at 0x{:08X}, fixed_end=0x{:08X}", cro.ModuleName(),
              cro_address, cro_address + fix_size);
@@ -334,6 +353,13 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
 }
 
 void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
+#if HEN_DEV
+    struct HenSay {
+        HenSay() { std::printf("hen: ldr: UnloadCRO begins\n"); }
+        ~HenSay() { std::printf("hen: ldr: UnloadCRO ends\n"); }
+    } hen_say; // (around the invalidations as well: declared first, so it ends last)
+#endif
+    const Core::System::InvalidationBatch invalidation_batch{system}; // (see core.h)
     IPC::RequestParser rp(ctx);
     VAddr cro_address = rp.Pop<u32>();
     u32 zero = rp.Pop<u32>();
@@ -372,7 +398,9 @@ void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
 
     cro.Unregister(slot->loaded_crs);
 
+    std::optional<HenSlow> hen_slow_5{std::in_place, "CRO Unlink"};
     Result result = cro.Unlink(slot->loaded_crs);
+    hen_slow_5.reset();
     if (result.IsError()) {
         LOG_ERROR(Service_LDR, "Error unlinking CRO {:08X}", result.raw);
         rb.Push(result);
@@ -382,7 +410,9 @@ void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
     // If the module is not fixed, clears all external/internal relocations
     // to restore the state before loading, so that it can be loaded again(?)
     if (!cro.IsFixed()) {
+        std::optional<HenSlow> hen_slow_6{std::in_place, "CRO ClearRelocations"};
         result = cro.ClearRelocations();
+        hen_slow_6.reset();
         if (result.IsError()) {
             LOG_ERROR(Service_LDR, "Error clearing relocations {:08X}", result.raw);
             rb.Push(result);
@@ -390,7 +420,9 @@ void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
         }
     }
 
+    std::optional<HenSlow> hen_slow_7{std::in_place, "CRO Unrebase"};
     cro.Unrebase(false);
+    hen_slow_7.reset();
 
     result = process->Unmap(cro_address, cro_buffer_ptr, fixed_size,
                             Kernel::VMAPermission::ReadWrite, true);
@@ -398,12 +430,21 @@ void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
         LOG_ERROR(Service_LDR, "Error unmapping CRO {:08X}", result.raw);
     }
 
+    std::optional<HenSlow> hen_slow_8{std::in_place, "CRO unload InvalidateCacheRange"};
     system.InvalidateCacheRange(cro_address, fixed_size);
+    hen_slow_8.reset();
 
     rb.Push(result);
 }
 
 void RO::LinkCRO(Kernel::HLERequestContext& ctx) {
+#if HEN_DEV
+    struct HenSay {
+        HenSay() { std::printf("hen: ldr: LinkCRO begins\n"); }
+        ~HenSay() { std::printf("hen: ldr: LinkCRO ends\n"); }
+    } hen_say; // (around the invalidations as well: declared first, so it ends last)
+#endif
+    const Core::System::InvalidationBatch invalidation_batch{system}; // (see core.h)
     IPC::RequestParser rp(ctx);
     VAddr cro_address = rp.Pop<u32>();
     auto process = rp.PopObject<Kernel::Process>();
@@ -444,6 +485,13 @@ void RO::LinkCRO(Kernel::HLERequestContext& ctx) {
 }
 
 void RO::UnlinkCRO(Kernel::HLERequestContext& ctx) {
+#if HEN_DEV
+    struct HenSay {
+        HenSay() { std::printf("hen: ldr: UnlinkCRO begins\n"); }
+        ~HenSay() { std::printf("hen: ldr: UnlinkCRO ends\n"); }
+    } hen_say; // (around the invalidations as well: declared first, so it ends last)
+#endif
+    const Core::System::InvalidationBatch invalidation_batch{system}; // (see core.h)
     IPC::RequestParser rp(ctx);
     VAddr cro_address = rp.Pop<u32>();
     auto process = rp.PopObject<Kernel::Process>();
@@ -475,7 +523,9 @@ void RO::UnlinkCRO(Kernel::HLERequestContext& ctx) {
 
     LOG_INFO(Service_LDR, "Unlinking CRO \"{}\"", cro.ModuleName());
 
+    std::optional<HenSlow> hen_slow_9{std::in_place, "CRO Unlink"};
     Result result = cro.Unlink(slot->loaded_crs);
+    hen_slow_9.reset();
     if (result.IsError()) {
         LOG_ERROR(Service_LDR, "Error unlinking CRO {:08X}", result.raw);
     }
@@ -484,6 +534,7 @@ void RO::UnlinkCRO(Kernel::HLERequestContext& ctx) {
 }
 
 void RO::Shutdown(Kernel::HLERequestContext& ctx) {
+    const Core::System::InvalidationBatch invalidation_batch{system}; // (see core.h)
     IPC::RequestParser rp(ctx);
     VAddr crs_buffer_ptr = rp.Pop<u32>();
     auto process = rp.PopObject<Kernel::Process>();

@@ -200,6 +200,7 @@ public:
         u64 GetIdleTicks() const;
 
         void AddTicks(u64 ticks);
+        void AddKernelTicks(u64 ticks); // (Switch 2 port: a system call's charge)
 
         s64 GetDowncount() const;
 

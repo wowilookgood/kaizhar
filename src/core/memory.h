@@ -73,6 +73,7 @@ struct PageTable {
 
             Entry& operator=(MemoryRef value) {
                 pointers.raw[idx] = value.GetPtr();
+                pointers.read[idx] = value.GetPtr();
                 pointers.refs[idx] = std::move(value);
                 return *this;
             }
@@ -94,8 +95,26 @@ struct PageTable {
             return refs[idx];
         }
 
+        // (Switch 2 port, hen_read_table) `read` is the table generated code looks reads up
+        // in. It is `raw`, except for a page the renderer has cached: `raw` is null there (a
+        // write must reach the renderer), and `read` keeps the page's memory for as long as
+        // a read needs nothing from the renderer, which is while nothing drawn is waiting to
+        // be written back to the page or to the one after it (an access may straddle the
+        // two). That is the test a read makes when it does leave generated code
+        // (VideoCore::HenGpu::ReadIsClean), and MemorySystem::HenReadTableUpdate keeps the
+        // entry to it. The GPU thread stores entries while generated code loads them: a
+        // pointer is stored with release, after the bytes it makes readable.
+        u8* Read(std::size_t idx) const {
+            return read[idx];
+        }
+        void SetRead(std::size_t idx, u8* pointer) {
+            __atomic_store_n(&read[idx], pointer, __ATOMIC_RELEASE);
+        }
+
     private:
         std::array<u8*, PAGE_TABLE_NUM_ENTRIES> raw;
+        // (right after `raw`: generated code reaches one from the other with an offset)
+        std::array<u8*, PAGE_TABLE_NUM_ENTRIES> read;
         std::array<MemoryRef, PAGE_TABLE_NUM_ENTRIES> refs;
         friend struct PageTable;
     };
@@ -110,6 +129,9 @@ struct PageTable {
 
     std::array<u8*, PAGE_TABLE_NUM_ENTRIES>& GetPointerArray() {
         return pointers.raw;
+    }
+    std::array<u8*, PAGE_TABLE_NUM_ENTRIES>& GetReadPointerArray() {
+        return pointers.read;
     }
 
     struct WatchpointPageInfo {
@@ -138,6 +160,7 @@ private:
         ar & watchpoint_pages_map;
         for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
             pointers.raw[i] = pointers.refs[i].GetPtr();
+            pointers.read[i] = pointers.raw[i]; // (cached pages: until next drawn to and written back)
         }
     }
     friend class boost::serialization::access;
@@ -662,6 +685,12 @@ public:
 
     /// For a rasterizer-accessible PAddr, gets a list of all possible VAddr
     std::vector<VAddr> PhysicalToVirtualAddressForRasterizer(PAddr addr);
+
+    /// (Switch 2 port, hen_read_table; see PageTable::Pointers) The renderer's surface cache
+    /// says that this page (its physical address) now has, or no longer has, something drawn
+    /// waiting to be written back to it. Called on the thread that owns the cache, after the
+    /// cache's page bitmap has the new state.
+    void HenReadTableUpdate(PAddr page);
 
     /// Gets a pointer to the memory region beginning at the specified physical address.
     u8* GetPhysicalPointer(PAddr address);

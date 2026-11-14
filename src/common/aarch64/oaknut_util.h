@@ -44,7 +44,12 @@ inline void CallFarFunction(oaknut::VectorCodeGenerator& code, const T f) {
     // X16(IP0) and X17(IP1) is the standard veneer register
     // LR is also available as an intermediate register
     // https://developer.arm.com/documentation/102374/0101/Procedure-Call-Standard
-    code.MOVP2R(oaknut::util::X16, reinterpret_cast<const void*>(f));
+    // (Switch 2 port) The absolute address, not MOVP2R: that picks ADR/ADRP when the target is
+    // within 4 GiB of where the code is being assembled, which here is a vector that is copied
+    // to its executable address afterwards. On Switch 2 the heap is that close to the program,
+    // and the PICA shader JIT's first call to a host function (a geometry shader's EMIT) jumped
+    // to a wrong address.
+    code.MOV(oaknut::util::X16, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(f)));
     code.BLR(oaknut::util::X16);
 }
 

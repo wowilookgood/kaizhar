@@ -58,6 +58,11 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
+#elif defined(__SWITCH__)
+
+// libnx's pthreads have no scheduling parameters; threads keep the priority they start with.
+void SetCurrentThreadPriority(ThreadPriority) {}
+
 #else
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
@@ -92,7 +97,9 @@ void SetCurrentThreadName(const char* name) {
 // MinGW with the POSIX threading model does not support pthread_setname_np
 #if !defined(_WIN32) || defined(_MSC_VER)
 void SetCurrentThreadName(const char* name) {
-#ifdef __APPLE__
+#ifdef __SWITCH__
+    (void)name; // no thread names in libnx's pthreads
+#elif defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
     pthread_set_name_np(pthread_self(), name);

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <boost/serialization/unique_ptr.hpp>
+#include <chrono>
+#include "common/hen_stats.h"
 #include "common/archives.h"
 #include "common/logging/log.h"
 #include "core/core.h"
@@ -86,7 +88,12 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         auto& buffer = rp.PopMappedBuffer();
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
         std::unique_ptr<u8[]> data = std::make_unique_for_overwrite<u8[]>(length);
+        const auto hen_read_start = std::chrono::steady_clock::now();
         const auto read = backend->Read(offset, length, data.get());
+        hen_gfx_note(HEN_GFX_FILE_SYNC, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - hen_read_start)
+                                            .count());
+        hen_gfx_note(HEN_GFX_FILE_BYTES, length);
         if (read.Failed()) {
             rb.Push(read.Code());
             rb.Push<u32>(0);
@@ -132,8 +139,14 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     ctx.RunAsync(
         [this, async_data](Kernel::HLERequestContext& ctx) {
             async_data->data = std::make_unique_for_overwrite<u8[]>(async_data->length);
+            const auto hen_read_start = std::chrono::steady_clock::now();
             const auto read =
                 backend->Read(async_data->offset, async_data->length, async_data->data.get());
+            hen_gfx_note(async_data->cache_ready ? HEN_GFX_FILE_SYNC : HEN_GFX_FILE_ASYNC,
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - hen_read_start)
+                             .count());
+            hen_gfx_note(HEN_GFX_FILE_BYTES, async_data->length);
             if (read.Failed()) {
                 async_data->ret = read.Code();
                 async_data->read_size = 0;

@@ -2263,6 +2263,39 @@ std::optional<SOC_U::InterfaceInfo> SOC_U::GetDefaultInterfaceInfo() {
         return InterfaceInfo(this->interface_info);
     }
 
+#ifdef __SWITCH__
+    // The TCP connect below blocks until it times out when the console has no route to the
+    // internet (over a minute, with the emulator stopped). Connecting a UDP socket sends
+    // nothing and returns at once with the local address chosen. There is no interface list
+    // here, so the netmask is assumed to be /24.
+    {
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            return std::nullopt;
+        }
+        struct sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(53);
+        to.sin_addr.s_addr = inet_addr("8.8.8.8");
+        struct sockaddr_in local = {};
+        socklen_t length = sizeof(local);
+        const bool ok = ::connect(fd, reinterpret_cast<struct sockaddr*>(&to), sizeof(to)) == 0 &&
+                        ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&local), &length) ==
+                            0 &&
+                        local.sin_addr.s_addr != 0;
+        closesocket(fd);
+        if (!ok) {
+            return std::nullopt;
+        }
+        InterfaceInfo info;
+        info.address = local.sin_addr.s_addr;
+        info.netmask = inet_addr("255.255.255.0");
+        info.broadcast = info.address | ~info.netmask;
+        this->interface_info = info;
+        this->interface_info_cached = true;
+        return info;
+    }
+#endif
     InterfaceInfo ret;
 
     SocketHolder::SOCKET sock_fd = -1;

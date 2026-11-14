@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include "common/file_util.h"
 #include "common/settings.h"
+#include "core/core.h"
 #include "core/core_timing.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
@@ -26,6 +27,27 @@ constexpr double FRAME_LENGTH = 1.0 / SCREEN_REFRESH_RATE;
 // Purposefully ignore the first five frames, as there's a significant amount of overhead in
 // booting that we shouldn't account for
 constexpr std::size_t IgnoreFrames = 5;
+
+#ifdef __SWITCH__
+extern "C" long long hen_cpu_shade_debt_ns; // hen/jit/hen_jit.c
+extern "C" int hen_max_lag_ms;
+extern "C" long long hen_limiter_given_up_us, hen_limiter_slept_us; // (for the report)
+namespace Core::HenBlockList {
+void UpgradeLinks(); // arm/dynarmic/hen_block_list.cpp
+}
+extern "C" void hen_boost_note_frame(void); // hen/jit/hen_jit.c: the loading boost
+extern "C" void hen_boost_tick(long long limiter_slept_total_us);
+extern "C" long long hen_limiter_slept_total_us;
+namespace Core {
+void HenClockControl(Timing& timing, s64 work_us, s64 budget_us); // core_timing.cpp
+}
+static long long hen_spare_ring[10] = {};
+static long long hen_spare_slot = 0;
+extern "C" {
+long long hen_recent_spare_ns = 0; // (sleep in the last half second; vk_rasterizer.cpp)
+long long hen_limiter_slept_total_us = 0; // (never reset: read by the benchmark marks in svc.cpp)
+}
+#endif
 
 namespace Core {
 
@@ -112,6 +134,9 @@ void PerfStats::EndGameFrame() {
 
     game_frames += 1;
     PerfStats::game_frames_updated = true;
+#ifdef __SWITCH__
+    hen_boost_note_frame();
+#endif
 }
 
 double PerfStats::GetMeanFrametime() const {
@@ -231,6 +256,10 @@ void FrameLimiter::WaitOnce() {
 }
 
 void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
+#ifdef __SWITCH__
+    Core::HenBlockList::UpgradeLinks();
+    hen_boost_tick(hen_limiter_slept_total_us);
+#endif
     if (frame_advancing_enabled) {
         // Frame advancing is enabled: wait on event instead of doing framelimiting
         WaitForFrameAdvance();
@@ -248,11 +277,34 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
     // speed percent or it will clamp too much and prevent this from properly limiting to that
     // percent. High values means it'll take longer after a slow frame to recover and start limiting
     const microseconds max_lag_time_us = duration_cast<microseconds>(
+#ifdef __SWITCH__
+        // (Switch 2 port) hen_max_lag_ms, 60 by default: time lost to a slow frame beyond this
+        // is given up for good. Upstream's 25 ms gave up part of every frame while vertex
+        // shaders ran on the CPU for pipelines still compiling: a GPU command list then takes
+        // about 24 ms of wall time and none of the emulated clock's, and with the rest of the
+        // frame's work the lag passed 25 ms. The emulation thread slept half the time and
+        // still ran at 85% (Pokemon Omega Ruby's title scene, first launch).
+        std::chrono::duration<double, std::chrono::microseconds::period>(
+            std::chrono::milliseconds(hen_max_lag_ms) / sleep_scale));
+#else
         std::chrono::duration<double, std::chrono::microseconds::period>(25ms / sleep_scale));
+#endif
     frame_limiting_delta_err += duration_cast<microseconds>(
         std::chrono::duration<double, std::chrono::microseconds::period>(
             (current_system_time_us - previous_system_time_us) / sleep_scale));
     frame_limiting_delta_err -= duration_cast<microseconds>(now - previous_walltime);
+#ifdef __SWITCH__
+    // (the automatic emulated clock of New 3DS titles: what this blank's work took of its time)
+    Core::HenClockControl(
+        Core::System::GetInstance().CoreTiming(),
+        duration_cast<microseconds>(now - previous_walltime).count(),
+        static_cast<s64>((current_system_time_us - previous_system_time_us).count() / sleep_scale));
+    // (not counted: more than 5 s behind, which is time in the title list or the app suspended)
+    if (frame_limiting_delta_err < -max_lag_time_us &&
+        frame_limiting_delta_err > -microseconds(5'000'000)) {
+        hen_limiter_given_up_us += (-max_lag_time_us - frame_limiting_delta_err).count();
+    }
+#endif
     frame_limiting_delta_err =
         std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);
 
@@ -264,6 +316,35 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         }
         auto now_after_sleep = Clock::now();
         frame_limiting_delta_err -= duration_cast<microseconds>(now_after_sleep - now);
+#ifdef __SWITCH__
+        hen_limiter_slept_us += duration_cast<microseconds>(now_after_sleep - now).count();
+        hen_limiter_slept_total_us += duration_cast<microseconds>(now_after_sleep - now).count();
+        // (the sleeps of the last half second, by 50 ms slot: what the emulation has had to
+        // spare lately. The rasterizer's allowance for draws shaded on the CPU goes by it.)
+        {
+            const long long slot_now =
+                duration_cast<std::chrono::milliseconds>(now_after_sleep.time_since_epoch()).count() / 50;
+            if (slot_now != hen_spare_slot) {
+                const long long step = std::min<long long>(slot_now - hen_spare_slot, 10);
+                for (long long i = 1; i <= step; i++) {
+                    hen_spare_ring[(hen_spare_slot + i) % 10] = 0;
+                }
+                hen_spare_slot = slot_now;
+            }
+            hen_spare_ring[slot_now % 10] +=
+                duration_cast<std::chrono::nanoseconds>(now_after_sleep - now).count();
+            long long sum = 0;
+            for (const long long v : hen_spare_ring) {
+                sum += v;
+            }
+            hen_recent_spare_ns = sum;
+        }
+        // (time to spare pays off what vertex shaders run on the CPU have cost: vk_rasterizer.cpp)
+        hen_cpu_shade_debt_ns = std::max(
+            0ll, hen_cpu_shade_debt_ns -
+                     static_cast<long long>(
+                         duration_cast<std::chrono::nanoseconds>(now_after_sleep - now).count()));
+#endif
         now = now_after_sleep;
     }
 

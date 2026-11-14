@@ -8,6 +8,7 @@
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/binary_object.hpp>
 #include "audio_core/dsp_interface.h"
+#include "common/hen_stats.h"
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/atomic_ops.h"
@@ -27,6 +28,7 @@
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/hen_gpu_thread.h"
 #include "video_core/renderer_base.h"
 
 SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::FCRAM>)
@@ -42,10 +44,32 @@ constexpr u32 SIGTRAP = 5;
 constexpr u32 SIGSEGV = 11;
 #endif
 
+#ifdef __SWITCH__
+extern "C" int hen_read_table; // hen/jit/hen_jit.c: --no-read-table
+#else
+static constexpr int hen_read_table = 0;
+#endif
+
 namespace Memory {
+
+// (Switch 2 port, --gpu-thread; see video_core/hen_gpu_thread.cpp) With the GPU thread
+// running, the surface cache marks pages cached and uncached (RasterizerMarkRegionCached)
+// from that thread while this one runs the program. A page's type and its pointer are two
+// stores, so a slow path here can find a page of the regions the cache covers typed as plain
+// memory with no pointer yet (or no longer). Such a page is then treated as cached: the same
+// bytes, reached through GetPointerForRasterizerCache. Never true without the thread.
+static bool HenPageInTransition(VAddr vaddr) {
+    if (!VideoCore::HenGpu::Active()) [[likely]] {
+        return false;
+    }
+    return (vaddr >= VRAM_VADDR && vaddr < VRAM_VADDR_END) ||
+           (vaddr >= LINEAR_HEAP_VADDR && vaddr < LINEAR_HEAP_VADDR_END) ||
+           (vaddr >= NEW_LINEAR_HEAP_VADDR && vaddr < NEW_LINEAR_HEAP_VADDR_END);
+}
 
 void PageTable::Clear() {
     pointers.raw.fill(nullptr);
+    pointers.read.fill(nullptr);
     pointers.refs.fill(MemoryRef());
     attributes.fill(PageType::Unmapped);
 }
@@ -195,9 +219,15 @@ public:
                 break;
             }
             case PageType::Memory: {
-                DEBUG_ASSERT(page_table.pointers[page_index]);
+                const u8* page_ptr = page_table.pointers[page_index];
+                if (page_ptr == nullptr && HenPageInTransition(current_vaddr)) [[unlikely]] {
+                    std::memcpy(dest_buffer, GetPointerForRasterizerCache(current_vaddr),
+                                copy_amount);
+                    break;
+                }
+                DEBUG_ASSERT(page_ptr);
 
-                const u8* src_ptr = page_table.pointers[page_index] + page_offset;
+                const u8* src_ptr = page_ptr + page_offset;
                 std::memcpy(dest_buffer, src_ptr, copy_amount);
                 break;
             }
@@ -253,9 +283,19 @@ public:
                 break;
             }
             case PageType::Memory: {
-                DEBUG_ASSERT(page_table.pointers[page_index]);
+                u8* page_ptr = page_table.pointers[page_index];
+                if (page_ptr == nullptr && HenPageInTransition(current_vaddr)) [[unlikely]] {
+                    if constexpr (!UNSAFE) {
+                        RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                                     FlushMode::Invalidate);
+                    }
+                    std::memcpy(GetPointerForRasterizerCache(current_vaddr), src_buffer,
+                                copy_amount);
+                    break;
+                }
+                DEBUG_ASSERT(page_ptr);
 
-                u8* dest_ptr = page_table.pointers[page_index] + page_offset;
+                u8* dest_ptr = page_ptr + page_offset;
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
                 break;
             }
@@ -306,7 +346,52 @@ public:
         return MemoryRef{};
     }
 
+    /// (Switch 2 port, hen_read_table) The physical address of a page in the regions the
+    /// renderer caches; 0 for any other.
+    PAddr HenRasterizerPAddr(VAddr addr) const {
+        if (addr >= LINEAR_HEAP_VADDR && addr < LINEAR_HEAP_VADDR_END) {
+            return addr - LINEAR_HEAP_VADDR + FCRAM_PADDR;
+        }
+        if (addr >= NEW_LINEAR_HEAP_VADDR && addr < NEW_LINEAR_HEAP_VADDR_END) {
+            return addr - NEW_LINEAR_HEAP_VADDR + FCRAM_PADDR;
+        }
+        if (addr >= VRAM_VADDR && addr < VRAM_VADDR_END) {
+            return addr - VRAM_VADDR + VRAM_PADDR;
+        }
+        if (addr >= PLUGIN_3GX_FB_VADDR && addr < PLUGIN_3GX_FB_VADDR_END && plugin_fb_address) {
+            return addr - PLUGIN_3GX_FB_VADDR + plugin_fb_address;
+        }
+        return 0;
+    }
+
+    /// (Switch 2 port, hen_read_table; see PageTable::Pointers) Sets the read entry of a page
+    /// the renderer has cached: the page's memory if a read of it needs nothing from the
+    /// renderer, by the test such a read makes in RasterizerFlushVirtualRegion below (on the
+    /// page and the one after it: an access of up to 8 bytes may straddle the two), else
+    /// null. Returns 1 if the entry got its pointer back, -1 if it lost it, 0 otherwise.
+    /// On the thread that owns the surface cache, which reads its own bitmap here.
+    int HenUpdateReadPointer(PageTable& page_table, VAddr page) {
+        const std::size_t index = page >> CITRA_PAGE_BITS;
+        if (page_table.attributes[index] != PageType::RasterizerCachedMemory) {
+            return 0; // (plain memory has its pointer in both tables, anything else in neither)
+        }
+        const PAddr paddr = HenRasterizerPAddr(page);
+        u8* const pointer =
+            hen_read_table && paddr != 0 &&
+                    VideoCore::HenGpu::ReadIsClean(paddr, CITRA_PAGE_SIZE + 1)
+                ? GetPointerForRasterizerCache(page).GetPtr()
+                : nullptr;
+        u8* const before = page_table.pointers.Read(index);
+        if (before == pointer) {
+            return 0;
+        }
+        page_table.pointers.SetRead(index, pointer);
+        return pointer ? 1 : -1;
+    }
+
     void RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode) {
+        // (counted, not timed: two clock readings a call were a third of what a read here cost)
+        hen_gfx_note(mode == FlushMode::Flush ? HEN_GFX_MEM_FLUSH : HEN_GFX_MEM_INVALIDATE, 0);
         const VAddr end = start + size;
 
         auto CheckRegion = [&](VAddr region_start, VAddr region_end, PAddr paddr_region_start) {
@@ -315,11 +400,31 @@ public:
                 return;
             }
 
-            auto& renderer = system.GPU().Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
+
+            // (Switch 2 port, --gpu-thread) The renderer may be the GPU thread's right now.
+            // A read needs it only when something drawn is waiting to be written back to
+            // these pages, and a write's invalidation can follow the queued work; anything
+            // else waits for the GPU thread (system.GPU().Renderer() below does).
+            if (VideoCore::HenGpu::Active()) [[unlikely]] {
+                if (mode == FlushMode::Flush &&
+                    VideoCore::HenGpu::ReadIsClean(physical_start, overlap_size)) {
+                    return;
+                }
+                if (mode == FlushMode::Invalidate &&
+                    VideoCore::HenGpu::DeferWrite(physical_start, overlap_size)) {
+                    return;
+                }
+                VideoCore::HenGpu::Drain(mode == FlushMode::Flush
+                                             ? VideoCore::HenGpu::WaitRead
+                                             : mode == FlushMode::Invalidate
+                                                   ? VideoCore::HenGpu::WaitWrite
+                                                   : VideoCore::HenGpu::WaitMap);
+            }
+            auto& renderer = system.GPU().Renderer();
 
             auto* rasterizer = renderer.Rasterizer();
             switch (mode) {
@@ -453,6 +558,7 @@ void MemorySystem::RegisterWatchpoint(const Kernel::Process& process, VAddr addr
             case PageType::RasterizerCachedMemory:
                 mem = GetPointerForRasterizerCache(page_base);
                 type = PageType::RasterizerCachedMemoryWatchpoint;
+                page_table.pointers.SetRead(page_index, nullptr); // (hen_read_table)
                 break;
             default:
                 LOG_ERROR(HW_Memory, "Cannot get pointer to register watchpoint for page 0x{:08X}",
@@ -513,6 +619,10 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
     LOG_DEBUG(HW_Memory, "Mapping {} onto {:08X}-{:08X}", (void*)memory.GetPtr(),
               base * CITRA_PAGE_SIZE, (base + size) * CITRA_PAGE_SIZE);
 
+    // (Switch 2 port, --gpu-thread) The GPU thread changes page tables too
+    // (RasterizerMarkRegionCached): not while this one does.
+    VideoCore::HenGpu::Drain(VideoCore::HenGpu::WaitMap);
+
     if (impl->system.IsPoweredOn()) {
         RasterizerFlushVirtualRegion(base << CITRA_PAGE_BITS, size * CITRA_PAGE_SIZE,
                                      FlushMode::FlushAndInvalidate);
@@ -529,6 +639,7 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
         if (type == PageType::Memory && impl->cache_marker.IsCached(base * CITRA_PAGE_SIZE)) {
             page_table.attributes[base] = PageType::RasterizerCachedMemory;
             page_table.pointers[base] = nullptr;
+            impl->HenUpdateReadPointer(page_table, base * CITRA_PAGE_SIZE);
         }
 
         base += 1;
@@ -555,10 +666,12 @@ MemoryRef MemorySystem::GetPointerForRasterizerCache(VAddr addr) const {
 }
 
 void MemorySystem::RegisterPageTable(std::shared_ptr<PageTable> page_table) {
+    VideoCore::HenGpu::Drain(VideoCore::HenGpu::WaitMap); // (it walks this list)
     impl->page_table_list.push_back(page_table);
 }
 
 void MemorySystem::UnregisterPageTable(std::shared_ptr<PageTable> page_table) {
+    VideoCore::HenGpu::Drain(VideoCore::HenGpu::WaitMap);
     auto it = std::find(impl->page_table_list.begin(), impl->page_table_list.end(), page_table);
     if (it != impl->page_table_list.end()) {
         impl->page_table_list.erase(it);
@@ -620,6 +733,9 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
     }
 
     PageType type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
+    if (type == PageType::Memory && HenPageInTransition(vaddr)) [[unlikely]] {
+        type = PageType::RasterizerCachedMemory;
+    }
     switch (type) {
     case PageType::Unmapped: {
 
@@ -716,6 +832,9 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
     }
 
     PageType type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
+    if (type == PageType::Memory && HenPageInTransition(vaddr)) [[unlikely]] {
+        type = PageType::RasterizerCachedMemory;
+    }
     switch (type) {
     case PageType::Unmapped:
         (void)UnmappedAccess<T>(vaddr, data, false);
@@ -771,6 +890,9 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
     }
 
     PageType type = impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS];
+    if (type == PageType::Memory && HenPageInTransition(vaddr)) [[unlikely]] {
+        type = PageType::RasterizerCachedMemory;
+    }
     switch (type) {
     case PageType::Unmapped:
         (void)UnmappedAccess<T>(vaddr, data, false);
@@ -849,7 +971,9 @@ u8* MemorySystem::GetPointer(const VAddr vaddr) {
     if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
             PageType::RasterizerCachedMemory ||
         impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
-            PageType::RasterizerCachedMemoryWatchpoint) {
+            PageType::RasterizerCachedMemoryWatchpoint ||
+        (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] == PageType::Memory &&
+         HenPageInTransition(vaddr))) {
         return GetPointerForRasterizerCache(vaddr);
     }
 
@@ -866,7 +990,9 @@ const u8* MemorySystem::GetPointer(const VAddr vaddr) const {
     if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
             PageType::RasterizerCachedMemory ||
         impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
-            PageType::RasterizerCachedMemoryWatchpoint) {
+            PageType::RasterizerCachedMemoryWatchpoint ||
+        (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] == PageType::Memory &&
+         HenPageInTransition(vaddr))) {
         return GetPointerForRasterizerCache(vaddr);
     }
 
@@ -892,10 +1018,13 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 }
 
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
-    if (address >= phys_mem_region_info_cache.region_start &&
-        address < phys_mem_region_info_cache.region_end) {
-        return phys_mem_region_info_cache;
-    }
+    // (Switch 2 port) No cache of the last region in a member: upstream keeps one, read and
+    // written here without a lock, which is fine on one thread. With the GPU thread the
+    // emulation thread and the GPU thread both come through here, and a reader could take one
+    // region's memory with another's start address: an offset far outside the memory, and the
+    // MemoryRef assertion (memory_ref.h:85) that ended a Mario Kart 7 run on 2026-11-12, or,
+    // unnoticed, a read from the wrong place. Four regions: looking them up costs nothing.
+    PhysMemRegionInfo info{};
 
     constexpr std::array memory_areas = {
         std::make_pair(VRAM_PADDR, VRAM_SIZE),
@@ -913,28 +1042,27 @@ MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address
     if (area == memory_areas.end()) [[unlikely]] {
         LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
                   impl->GetPC());
-        phys_mem_region_info_cache = PhysMemRegionInfo();
-        return phys_mem_region_info_cache;
+        return info;
     }
 
     switch (area->first) {
     case VRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->vram_mem, area->first, area->second};
+        info = {&impl->vram_mem, area->first, area->second};
         break;
     case DSP_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->dsp_mem, area->first, area->second};
+        info = {&impl->dsp_mem, area->first, area->second};
         break;
     case FCRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->fcram_mem, area->first, area->second};
+        info = {&impl->fcram_mem, area->first, area->second};
         break;
     case N3DS_EXTRA_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->n3ds_extra_ram_mem, area->first, area->second};
+        info = {&impl->n3ds_extra_ram_mem, area->first, area->second};
         break;
     default:
         UNREACHABLE();
     }
 
-    return phys_mem_region_info_cache;
+    return info;
 }
 
 u8* MemorySystem::GetPhysicalPointer(PAddr address) {
@@ -1011,6 +1139,10 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                                         ? PageType::RasterizerCachedMemory
                                         : PageType::RasterizerCachedMemoryWatchpoint;
                         page_table->pointers[vaddr >> CITRA_PAGE_BITS] = nullptr;
+                        // (hen_read_table: reads of it stay in generated code if they may)
+                        if (impl->HenUpdateReadPointer(*page_table, vaddr & ~CITRA_PAGE_MASK) > 0) {
+                            hen_gfx_note(HEN_GFX_READ_TABLE_KEPT, 0);
+                        }
                         break;
                     default:
                         UNREACHABLE();
@@ -1037,6 +1169,28 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                     default:
                         UNREACHABLE();
                     }
+                }
+            }
+        }
+    }
+}
+
+void MemorySystem::HenReadTableUpdate(PAddr page) {
+    if (!hen_read_table) {
+        return;
+    }
+    // (the page before as well: its entry answers for an access that ends in this one)
+    for (const PAddr paddr : {static_cast<PAddr>(page - CITRA_PAGE_SIZE), page}) {
+        if (!(paddr >= VRAM_PADDR && paddr < VRAM_PADDR_END) &&
+            !(paddr >= FCRAM_PADDR && paddr < FCRAM_N3DS_PADDR_END)) {
+            continue;
+        }
+        for (const VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
+            for (auto& page_table : impl->page_table_list) {
+                const int change = impl->HenUpdateReadPointer(*page_table, vaddr);
+                if (change != 0) {
+                    hen_gfx_note(
+                        change > 0 ? HEN_GFX_READ_TABLE_RESTORED : HEN_GFX_READ_TABLE_CLEARED, 0);
                 }
             }
         }
@@ -1173,9 +1327,16 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
             break;
         }
         case PageType::Memory: {
-            DEBUG_ASSERT(page_table.pointers[page_index]);
+            u8* page_ptr = page_table.pointers[page_index];
+            if (page_ptr == nullptr && HenPageInTransition(current_vaddr)) [[unlikely]] {
+                RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                             FlushMode::Invalidate);
+                std::memset(GetPointerForRasterizerCache(current_vaddr), 0, copy_amount);
+                break;
+            }
+            DEBUG_ASSERT(page_ptr);
 
-            u8* dest_ptr = page_table.pointers[page_index] + page_offset;
+            u8* dest_ptr = page_ptr + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
             break;
         }
@@ -1233,8 +1394,14 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
             break;
         }
         case PageType::Memory: {
-            DEBUG_ASSERT(page_table.pointers[page_index]);
-            const u8* src_ptr = page_table.pointers[page_index] + page_offset;
+            const u8* page_ptr = page_table.pointers[page_index];
+            if (page_ptr == nullptr && HenPageInTransition(current_vaddr)) [[unlikely]] {
+                WriteBlock(dest_process, dest_addr, GetPointerForRasterizerCache(current_vaddr),
+                           copy_amount);
+                break;
+            }
+            DEBUG_ASSERT(page_ptr);
+            const u8* src_ptr = page_ptr + page_offset;
             WriteBlock(dest_process, dest_addr, src_ptr, copy_amount);
             break;
         }

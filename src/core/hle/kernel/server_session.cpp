@@ -16,6 +16,12 @@
 
 SERIALIZE_EXPORT_IMPL(Kernel::ServerSession)
 
+#if defined(__SWITCH__) && HEN_DEV
+#include <cstdio>
+extern "C" unsigned long long hen_jit_now_ns(void);
+extern "C" void hen_blackbox_dump(unsigned ms);
+#endif
+
 namespace Kernel {
 
 template <class Archive>
@@ -94,7 +100,20 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
             std::make_shared<Kernel::HLERequestContext>(kernel, SharedFrom(this), thread);
         context->PopulateFromIncomingCommandBuffer(cmd_buf.data(), current_process);
 
+#if defined(__SWITCH__) && HEN_DEV
+        const unsigned long long hen_t0 = hen_jit_now_ns();
         hle_handler->HandleSyncRequest(*context);
+        if (const unsigned long long took = hen_jit_now_ns() - hen_t0; took > 20'000'000ull) {
+            // (the emulation thread was in this call: nothing else of the program ran)
+            std::printf("hen: slow: %.0f ms in a service call, session %s, command %08x\n", took / 1e6,
+                        GetName().c_str(), static_cast<unsigned>(cmd_buf[0]));
+            if (took > 80'000'000ull) {
+                hen_blackbox_dump(static_cast<unsigned>(took / 1'000'000));
+            }
+        }
+#else
+        hle_handler->HandleSyncRequest(*context);
+#endif
 
         ASSERT(thread->status == Kernel::ThreadStatus::Running ||
                thread->status == Kernel::ThreadStatus::WaitHleEvent);

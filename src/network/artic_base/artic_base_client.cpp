@@ -19,7 +19,9 @@
 #include <cerrno>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#ifndef __SWITCH__ // libnx has no ifaddrs.h (nothing from it is used here)
 #include <ifaddrs.h>
+#endif
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>

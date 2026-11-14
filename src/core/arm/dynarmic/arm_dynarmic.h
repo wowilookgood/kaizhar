@@ -11,6 +11,8 @@
 #include "core/arm/arm_interface.h"
 #include "core/arm/dynarmic/arm_dynarmic_cp15.h"
 
+struct ARMul_State;
+
 namespace Memory {
 struct PageTable;
 class MemorySystem;
@@ -73,6 +75,14 @@ private:
     std::unique_ptr<Dynarmic::A32::Jit> MakeJit();
 
     u32 fpexc = 0;
+#ifdef __SWITCH__
+    // The interpreter as first tier (see Run).
+    void HenInterpretBlock();
+    void HenClearInterpreter();
+    std::unique_ptr<ARMul_State> hen_interp;
+    bool hen_interpreting = false;
+    bool hen_reschedule = false;
+#endif
     CP15State cp15_state;
     Core::DynarmicExclusiveMonitor& exclusive_monitor;
 

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <boost/icl/interval_set.hpp>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -243,10 +244,45 @@ public:
     }
 
     void InvalidateCacheRange(u32 start_address, std::size_t length) {
+        if (invalidation_batch_depth != 0 && length != 0) {
+            const u32 first = start_address >> 12;
+            const u32 last = static_cast<u32>((static_cast<u64>(start_address) + length - 1) >> 12);
+            invalidation_batch_pages += boost::icl::interval<u32>::closed(first, last);
+            return;
+        }
         for (const auto& cpu : cpu_cores) {
             cpu->InvalidateCacheRange(start_address, length);
         }
     }
+
+    /// (Switch 2 port) While one of these exists, InvalidateCacheRange only notes the pages
+    /// and the last one to go invalidates them, whole. The CRO loader (ldr:ro) invalidated four
+    /// bytes on every core for each relocation it applied, then the whole module at the end:
+    /// 80 to 500 ms on the emulation thread for a module load in Super Smash Bros.
+    class InvalidationBatch {
+    public:
+        explicit InvalidationBatch(System& system_) : system{system_} {
+            system.invalidation_batch_depth++;
+        }
+        ~InvalidationBatch() {
+            if (--system.invalidation_batch_depth != 0) {
+                return;
+            }
+            const auto pages = std::move(system.invalidation_batch_pages);
+            system.invalidation_batch_pages.clear();
+            for (const auto& interval : pages) {
+                const u32 first = boost::icl::first(interval);
+                const u32 last = boost::icl::last(interval);
+                system.InvalidateCacheRange(first << 12,
+                                            (static_cast<std::size_t>(last - first) + 1) << 12);
+            }
+        }
+        InvalidationBatch(const InvalidationBatch&) = delete;
+        InvalidationBatch& operator=(const InvalidationBatch&) = delete;
+
+    private:
+        System& system;
+    };
 
     /**
      * Gets a reference to the emulated DSP.
@@ -529,6 +565,10 @@ private:
     std::unique_ptr<Timing> timing;
 
     std::unique_ptr<Core::ExclusiveMonitor> exclusive_monitor;
+
+private:
+    int invalidation_batch_depth = 0;
+    boost::icl::interval_set<u32> invalidation_batch_pages;
 
 private:
     static System s_instance;

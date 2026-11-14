@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <array>
+#include <vector>
 #include "core/arm/dyncom/arm_dyncom_dec.h"
 #include "core/arm/skyeye_common/armsupp.h"
 
@@ -440,30 +442,40 @@ const InstructionSetEncodingItem arm_exclusion_code[] = {
 };
 // clang-format on
 
-ARMDecodeStatus DecodeARMInstruction(u32 instr, int* idx) {
-    int n = 0;
+// One table entry against an instruction: the entry's conditions, then its exclusions.
+static bool EntryMatches(int i, u32 instr) {
+    int n = arm_instruction[i].attribute_value;
     int base = 0;
-    int instr_slots = sizeof(arm_instruction) / sizeof(InstructionSetEncodingItem);
-    ARMDecodeStatus ret = ARMDecodeStatus::FAILURE;
 
-    for (int i = 0; i < instr_slots; i++) {
-        n = arm_instruction[i].attribute_value;
+    // 3DS has no VFP3 support
+    if (arm_instruction[i].version == ARMVFP3)
+        return false;
+
+    while (n) {
+        if (arm_instruction[i].content[base + 1] == 31 && arm_instruction[i].content[base] == 0) {
+            // clrex
+            if (instr != arm_instruction[i].content[base + 2]) {
+                break;
+            }
+        } else if (BITS(instr, arm_instruction[i].content[base],
+                        arm_instruction[i].content[base + 1]) !=
+                   arm_instruction[i].content[base + 2]) {
+            break;
+        }
+        base += 3;
+        n--;
+    }
+    if (n != 0)
+        return false;
+
+    // All conditions are satisfied.
+    n = arm_exclusion_code[i].attribute_value;
+    if (n != 0) {
         base = 0;
-
-        // 3DS has no VFP3 support
-        if (arm_instruction[i].version == ARMVFP3)
-            continue;
-
         while (n) {
-            if (arm_instruction[i].content[base + 1] == 31 &&
-                arm_instruction[i].content[base] == 0) {
-                // clrex
-                if (instr != arm_instruction[i].content[base + 2]) {
-                    break;
-                }
-            } else if (BITS(instr, arm_instruction[i].content[base],
-                            arm_instruction[i].content[base + 1]) !=
-                       arm_instruction[i].content[base + 2]) {
+            if (BITS(instr, arm_exclusion_code[i].content[base],
+                     arm_exclusion_code[i].content[base + 1]) !=
+                arm_exclusion_code[i].content[base + 2]) {
                 break;
             }
             base += 3;
@@ -472,32 +484,72 @@ ARMDecodeStatus DecodeARMInstruction(u32 instr, int* idx) {
 
         // All conditions are satisfied.
         if (n == 0)
-            ret = ARMDecodeStatus::SUCCESS;
+            return false;
+    }
+    return true;
+}
 
-        if (ret == ARMDecodeStatus::SUCCESS) {
-            n = arm_exclusion_code[i].attribute_value;
-            if (n != 0) {
-                base = 0;
-                while (n) {
-                    if (BITS(instr, arm_exclusion_code[i].content[base],
-                             arm_exclusion_code[i].content[base + 1]) !=
-                        arm_exclusion_code[i].content[base + 2]) {
-                        break;
-                    }
-                    base += 3;
-                    n--;
+#ifdef __SWITCH__
+// (Switch 2 port) The entries that can match at all, by bits 27..20 and 7..4 of the instruction,
+// in table order. The scan below then tries a handful of entries where the plain one tries
+// about a hundred: on a first launch the interpreter runs every block before it is compiled,
+// and decoding was the largest single part of the emulation thread's time in the pauses
+// between frames (160 ms of 770 over five cold starts). Each candidate still gets the whole
+// check, so the answer is the same as the linear scan's (compared on the Mac over 32 million
+// instructions, every bucket included: no difference). Kid Icarus, cold, first 25 s of the
+// recorded route: 975 -> 516 ms in the interpreter, 818 -> 603 ms of lag given up, first
+// interval 79 -> 84%.
+namespace {
+struct DecodeBuckets {
+    std::array<std::vector<u16>, 4096> by_key;
+    DecodeBuckets() {
+        const int instr_slots = sizeof(arm_instruction) / sizeof(InstructionSetEncodingItem);
+        for (u32 key = 0; key < 4096; key++) {
+            const u32 bits = ((key >> 4) << 20) | ((key & 15) << 4);
+            const u32 covered = 0x0FF000F0;
+            for (int i = 0; i < instr_slots; i++) {
+                if (arm_instruction[i].version == ARMVFP3) {
+                    continue;
                 }
-
-                // All conditions are satisfied.
-                if (n == 0)
-                    ret = ARMDecodeStatus::FAILURE;
+                bool possible = true;
+                int base = 0;
+                for (int n = arm_instruction[i].attribute_value; n != 0 && possible; n--, base += 3) {
+                    const u32 lo = arm_instruction[i].content[base];
+                    const u32 hi = arm_instruction[i].content[base + 1];
+                    const u32 value = arm_instruction[i].content[base + 2];
+                    // (the field's bits of the instruction that the key fixes)
+                    const u32 field = (hi == 31 ? 0xFFFFFFFFu : ((1u << (hi + 1)) - 1)) & ~((1u << lo) - 1);
+                    const u32 want = hi == 31 && lo == 0 ? value : (value << lo);
+                    possible = ((bits ^ want) & field & covered) == 0;
+                }
+                if (possible) {
+                    by_key[key].push_back(static_cast<u16>(i));
+                }
             }
         }
+    }
+};
+} // namespace
+#endif
 
-        if (ret == ARMDecodeStatus::SUCCESS) {
+ARMDecodeStatus DecodeARMInstruction(u32 instr, int* idx) {
+#ifdef __SWITCH__
+    static const DecodeBuckets buckets;
+    for (const u16 i : buckets.by_key[((instr >> 16) & 0xFF0) | ((instr >> 4) & 15)]) {
+        if (EntryMatches(i, instr)) {
             *idx = i;
-            return ret;
+            return ARMDecodeStatus::SUCCESS;
         }
     }
-    return ret;
+    return ARMDecodeStatus::FAILURE;
+#else
+    const int instr_slots = sizeof(arm_instruction) / sizeof(InstructionSetEncodingItem);
+    for (int i = 0; i < instr_slots; i++) {
+        if (EntryMatches(i, instr)) {
+            *idx = i;
+            return ARMDecodeStatus::SUCCESS;
+        }
+    }
+    return ARMDecodeStatus::FAILURE;
+#endif
 }

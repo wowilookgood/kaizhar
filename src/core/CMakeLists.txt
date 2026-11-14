@@ -543,6 +543,8 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
     target_sources(citra_core PRIVATE
         arm/dynarmic/arm_dynarmic.cpp
         arm/dynarmic/arm_dynarmic.h
+        $<$<BOOL:${NINTENDO_SWITCH}>:arm/dynarmic/hen_block_list.cpp>
+        $<$<BOOL:${NINTENDO_SWITCH}>:arm/dynarmic/hen_block_list.h>
         arm/dynarmic/arm_dynarmic_cp15.cpp
         arm/dynarmic/arm_dynarmic_cp15.h
         arm/dynarmic/arm_exclusive_monitor.cpp
