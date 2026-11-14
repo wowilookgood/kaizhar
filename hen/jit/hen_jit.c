@@ -527,6 +527,13 @@ int hen_n3ds_mode = 0;          // core_timing.cpp: the title runs in the New 3D
 // same, GPU at its lowest rate), also what 1 falls back to if the clock is refused. 0: nothing
 // held in handheld, as before. --n3ds-handheld N. Heat and battery in handheld are unmeasured.
 int hen_n3ds_handheld = 1;
+// Handheld, any title: the system's boost mode held for as long as the title runs. Until
+// 2026-11-14 that was what happened without being meant: the mode was ended with
+// appletSetCpuBoostMode(Normal), which keeps the request, so after the first loading burst the
+// CPU stayed at the boost rate. With the request really cancelled the handheld clock was too
+// slow: Ocarina, warm, 60 s hands-off, 61 to 79% speed with 12186 ms of lag, against 100% and
+// 54 ms held (one run each). 0: --no-handheld-hold, only while loading.
+int hen_handheld_hold = 1;
 static void boost_set(bool on, u64 now) {
 	if (on == s_boostOn) {
 		return;
@@ -629,6 +636,7 @@ void hen_boost_tick(long long limiter_slept_total_us) {
 		// CPU all the time, not while something compiles.
 		const bool lenient = hen_boost_lenient && s_boostDocked && hen_load_boost != 3;
 		const bool n3ds = hen_n3ds_mode && (s_boostDocked || hen_n3ds_handheld != 0) && hen_load_boost != 3;
+		const bool handheld = !s_boostDocked && hen_handheld_hold && hen_load_boost != 3;
 		// By the clock there are two more reasons (2026-11-12: with the bursts alone the clock
 		// did no better than the system's mode, 143 against 147 ms of lag in Pokemon OR; what
 		// the held clock won came from being raised already when a hitch arrives):
@@ -638,7 +646,7 @@ void hen_boost_tick(long long limiter_slept_total_us) {
 		// the line is 41%: it stays up for as long as the normal clock would be short.
 		const bool new_code = lenient && (s_boostRing[at].demand - s_boostRing[old].demand) / seconds > 5e6;
 		const bool busy = lenient && slept < (s_boostOn && s_boostByClock ? 0.41 : 0.10);
-		if (loading || compiling || pipelines || (lenient && any_pipeline) || n3ds || new_code || busy) {
+		if (loading || compiling || pipelines || (lenient && any_pipeline) || n3ds || handheld || new_code || busy) {
 			atomic_store_explicit(&s_boostLastWanted, now, memory_order_relaxed);
 			s_boostWhy[loading ? 0 : compiling || new_code ? 1 : pipelines || (lenient && any_pipeline) ? 2 : busy ? 3 : 4]++;
 		}

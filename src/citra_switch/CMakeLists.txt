@@ -7,6 +7,7 @@ add_executable(kaizhar
     main.cpp
     switch_audio.c
     switch_menu.c
+    switch_mic.c
     switch_menu.h
     title_menu.cpp
     title_menu.h
@@ -66,7 +67,7 @@ target_link_options(kaizhar PRIVATE -Wl,--wrap=__syscall_thread_create -Wl,--wra
     -Wl,--wrap=__syscall_cond_signal -Wl,--wrap=__syscall_cond_wait)
 
 # The name, author and version the homebrew menu shows (the version field holds 15 characters).
-nx_generate_nacp(kaizhar.nacp NAME "Kaizhar" AUTHOR "wowilookgood" VERSION "2126.2-kaizhar1")
+nx_generate_nacp(kaizhar.nacp NAME "Kaizhar" AUTHOR "wowilookgood" VERSION "2126.2-kaizhar2")
 # The icon: one variable, so that another picture can be given at configure time.
 set(KAIZHAR_ICON "${PROJECT_SOURCE_DIR}/hen/icon/icon.jpg" CACHE FILEPATH "Icon of the .nro (JPEG, 256x256)")
 # HEN_ROMFS_DIR: a folder of test programs (.3dsx) that a development build carries as romfs:/.

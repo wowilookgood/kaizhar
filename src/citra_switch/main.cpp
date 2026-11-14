@@ -24,13 +24,13 @@
 //   Renderer:  --gpu-thread  --no-gpu-thread  --gpu-thread-sync-writes  --sync-depth-reads
 //              --no-depth-scale-blit  --max-lag-ms N
 //   Host:      --load-boost  --no-load-boost  --load-boost-system  --boost-strict
-//              --boost-linger MS  --no-boost-cancel  --cpu-boost N  --no-file-defer
+//              --boost-linger MS  --no-boost-cancel  --no-handheld-hold  --cpu-boost N  --no-file-defer
 //              --no-fs-canon  --no-pointer  --no-wake-all  --cia-chunk-kib N
 //
 // Options of development builds only (HEN_DEV):
 //   Test runs: --hen-exit-after SECONDS  --repeat N  --director PORT  --movie-record NAME
 //              --movie-play NAME  --screenshot-at S[,S...]  --screenshot-frame N[,N...]
-//              --cold-driver  --keyboard-test  --crash-test
+//              --cold-driver  --keyboard-test  --crash-test  --mic N  --mic-probe
 //   Logging:   --profile  --profile-pipelines  --no-blackbox  --clock-info  --jit-trace
 //              --exit-counts
 //              --pipe-log  --dump-spirv  --dump-spirv-all  --crumbs  --vk-trace
@@ -52,6 +52,7 @@
 
 #include <fmt/format.h>
 
+#include "audio_core/input_details.h"
 #include "audio_core/sink_details.h"
 #include "common/hen_stats.h"
 #include "common/file_util.h"
@@ -145,7 +146,7 @@ extern "C" int hen_jit_alias;
 extern "C" int hen_worker_depth_limit;
 extern "C" int hen_emu_ahead;
 extern "C" int hen_tier;
-extern "C" int hen_boost_lenient, hen_boost_linger_ms, hen_boost_cancel;
+extern "C" int hen_boost_lenient, hen_boost_linger_ms, hen_boost_cancel, hen_handheld_hold;
 extern "C" int hen_fs_canon, hen_generic_fs, hen_pointer, hen_generic_seed;
 static bool hen_sw_shaders = false;
 extern "C" int hen_generic_first, hen_stale_profile;
@@ -317,7 +318,7 @@ void ReportGfx() {
         hen_boost_stats(boost);
         if (boost[0] != 0 || boost[1] != 0) {
             std::printf("hen: boost: on %llu ms, %llu switches; asked for by: loading %llu, new code %llu, "
-                        "pipelines %llu, busy %llu, New 3DS mode %llu (vertical blanks); %s, longest switch %llu us\n",
+                        "pipelines %llu, busy %llu, held (New 3DS mode or handheld) %llu (vertical blanks); %s, longest switch %llu us\n",
                         boost[0], boost[1], boost[2], boost[3], boost[4], boost[7], boost[8],
                         boost[6] ? "by the CPU clock" : "by the system's boost mode", boost[5]);
         }
@@ -757,6 +758,8 @@ int EmulatorMain(int argc, char** argv) {
     // from the movie's time. A replay needs the save data the recording started from.
     std::string movie_record, movie_play;
     bool clock_info = false;   // --clock-info: CPU/GPU clock rates and temperature in the log
+    int mic = 1;             // --mic N: 0 none, 1 the system's microphone, 2 the emulator's static noise
+    bool mic_probe = false;  // --mic-probe: what the audio input service answers and records
     int repeat_left = 0;     // --repeat N
     bool shot_by_frame = false;
     std::vector<int> shot_times; // --screenshot-at S[,S...]: pictures sent over the log
@@ -853,6 +856,8 @@ int EmulatorMain(int argc, char** argv) {
             hen_sw_shaders = true;
         } else if (std::strcmp(argv[i], "--boost-strict") == 0) {
             hen_boost_lenient = 0;
+        } else if (std::strcmp(argv[i], "--no-handheld-hold") == 0) {
+            hen_handheld_hold = 0; // (handheld: the system's boost mode only while loading)
         } else if (std::strcmp(argv[i], "--no-boost-cancel") == 0) {
             hen_boost_cancel = 0; // (end the system's boost with appletSetCpuBoostMode(Normal))
         } else if (std::strcmp(argv[i], "--boost-linger") == 0 && i + 1 < argc) {
@@ -1001,6 +1006,10 @@ int EmulatorMain(int argc, char** argv) {
             repeat_left = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--clock-info") == 0) {
             clock_info = true;
+        } else if (std::strcmp(argv[i], "--mic") == 0 && i + 1 < argc) {
+            mic = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--mic-probe") == 0) {
+            mic_probe = true;
         } else if (std::strcmp(argv[i], "--keyboard-test") == 0) {
             char text[64];
             const int result = sw_keyboard("Keyboard test", "", 16, text, sizeof(text));
@@ -1066,6 +1075,19 @@ int EmulatorMain(int argc, char** argv) {
     Settings::values.graphics_api =
         software_renderer ? Settings::GraphicsAPI::Software : Settings::GraphicsAPI::Vulkan;
     Settings::values.output_type = no_audio ? AudioCore::SinkType::Null : AudioCore::SinkType::Auto;
+    // The microphone: Auto is the system's (audio_core/switch_input.cpp), opened when a title
+    // starts sampling.
+    Settings::values.input_type = AudioCore::InputType::Auto;
+#if HEN_DEV
+    if (mic != 1) {
+        Settings::values.input_type = mic == 2 ? AudioCore::InputType::Static : AudioCore::InputType::Null;
+    }
+    std::printf("hen: mic: --mic %d (%s)\n", mic,
+                std::string(AudioCore::GetInputDetails(Settings::values.input_type.GetValue()).name).c_str());
+    if (mic_probe) {
+        sw_mic_probe();
+    }
+#endif
     Settings::values.resolution_factor = static_cast<u32>(std::clamp(resolution, 0, 10)); // 0: what the layout shows
     Settings::values.use_cpu_jit = !interpreter;
     // (glslang's SPIR-V optimizer before the driver was tried: no gain)
@@ -1443,6 +1465,7 @@ int EmulatorMain(int argc, char** argv) {
 #endif
     SwitchInput::Shutdown();
     InputCommon::Shutdown();
+    sw_mic_shutdown();
     Common::Log::Stop();
     hen_file_defer_finish();
     hen_boost_off();

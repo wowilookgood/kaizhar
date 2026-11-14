@@ -98,6 +98,15 @@ void sw_clock_report(const char* when);
 int sw_cpu_clock_quiet(unsigned hz);
 void sw_cpu_clock_end(void);
 
+/// The microphone (switch_mic.c, for audio_core/switch_input.cpp). At exit: its thread ended
+/// and the device closed. --mic-probe (development builds): lists the input devices, records
+/// a second from the default one and half a second from each listed one, and prints what the
+/// service answered and the levels.
+void sw_mic_shutdown(void);
+#if HEN_DEV
+void sw_mic_probe(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
