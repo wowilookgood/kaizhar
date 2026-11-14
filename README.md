@@ -21,15 +21,16 @@ The table gives lag, the time the frame limiter gave up.
 | Mario Kart 7 | 39–57 ms | 0 ms |
 | Super Smash Bros. | 1–28 ms | 71 ms |
 
-The table is from a development build on a pre-release HEN. The release build lost 214 ms over the five first launches together. Nothing was measured in handheld.
+The table is from a development build on a pre-release HEN. The release build lost 214 ms over the five first launches together. In handheld (a development build of 2126.2-kaizhar2, one first launch each with recorded input): Pokémon Omega Ruby, Ocarina of Time 3D and Kid Icarus: Uprising hold 98 to 100% speed after their first five seconds.
 
 A first launch compiles code and shaders as it goes: expect short hitches and breaks in the sound. New 3DS titles get an emulated CPU clock that follows what the console keeps up with: a 130 s Xenoblade route held 29.8 to 30.0 fps.
 
 Known issues:
 
 - Kid Icarus: Uprising stutters in its first five seconds on a first launch.
-- The CPU clock is raised while a title loads (docked) and while a New 3DS title runs (handheld too). Heat and battery cost are unmeasured.
-- No settings screen, microphone, camera or HTTPS.
+- The CPU clock is raised while a title loads (docked) and while a New 3DS title runs (handheld too). In handheld the system's CPU boost mode is held for as long as any title runs. Heat and battery cost are unmeasured.
+- No settings screen, camera or HTTPS.
+- Microphone input works in a test program (record and play back); no commercial title was tried.
 - Untested: touch in the right-side-up portrait layout, motion in portrait, quitting during a shader cache rebuild.
 
 ## Install
