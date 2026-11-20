@@ -409,7 +409,7 @@ index bbdf925..d02df47 100644
  }
  
 diff --git a/src/dynarmic/backend/arm64/a32_address_space.h b/src/dynarmic/backend/arm64/a32_address_space.h
-index 3b9e9fb..c7f0322 100644
+index 3b9e9fb..51eaba6 100644
 --- a/src/dynarmic/backend/arm64/a32_address_space.h
 +++ b/src/dynarmic/backend/arm64/a32_address_space.h
 @@ -5,6 +5,7 @@
@@ -420,7 +420,7 @@ index 3b9e9fb..c7f0322 100644
  #include "dynarmic/backend/arm64/address_space.h"
  #include "dynarmic/backend/block_range_information.h"
  #include "dynarmic/interface/A32/config.h"
-@@ -26,6 +27,24 @@ protected:
+@@ -26,6 +27,25 @@ protected:
  
      void EmitPrelude();
      EmitConfig GetEmitConfig() override;
@@ -439,6 +439,7 @@ index 3b9e9fb..c7f0322 100644
 +        return conf.callbacks->MemoryReadCode(vaddr);
 +    }
 +    IR::Block HenGenerateIRQuiet(IR::LocationDescriptor descriptor) const override;
++    bool HenReadsOwnCode() const override { return conf.page_table != nullptr && !conf.absolute_offset_page_table; }
 +public:
 +    ~A32AddressSpace() override { HenStopWorker(); }
 +protected:
@@ -601,7 +602,7 @@ index 6b38c41..fa5d246 100644
      impl->DumpDisassembly();
  }
 diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
-index 2c7ae77..90fb84c 100644
+index 2c7ae77..021fceb 100644
 --- a/src/dynarmic/backend/arm64/address_space.cpp
 +++ b/src/dynarmic/backend/arm64/address_space.cpp
 @@ -3,10 +3,20 @@
@@ -1151,7 +1152,7 @@ index 2c7ae77..90fb84c 100644
  
  CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
      if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
-@@ -60,17 +573,414 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
+@@ -60,17 +573,421 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
      return nullptr;
  }
  
@@ -1408,7 +1409,14 @@ index 2c7ae77..90fb84c 100644
 +            // (timed apart: the CompileTimer in GetOrEmit can't see inside this call, and
 +            // counted all of it as translation)
 +            const auto t0 = HenStatClock();
-+            IR::Block ir_block = hen_on_worker ? HenGenerateIRQuiet(descriptor) : GenerateIR(descriptor);
++            // From this address space's own page table wherever it has one, on the emulation
++            // thread too: in its idle time that thread compiles ahead for every JIT (the block
++            // lists and the frontier, when no worker has them), and the embedder's callbacks
++            // read the process that is current then, which need not be this JIT's. A block
++            // listed for one process was so translated from another's bytes at the same address
++            // (every process is loaded at the same one), after its hash had been checked
++            // against the right ones.
++            IR::Block ir_block = (hen_on_worker || HenReadsOwnCode()) ? HenGenerateIRQuiet(descriptor) : GenerateIR(descriptor);
 +            const auto t1 = HenStatClock();
 +            end = ir_block.EndLocation();
 +            *out = Emit(std::move(ir_block));
@@ -1570,7 +1578,7 @@ index 2c7ae77..90fb84c 100644
      UnprotectCodeMemory();
  
      for (const auto& descriptor : descriptors) {
-@@ -82,193 +992,788 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+@@ -82,193 +999,788 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
          // Unlink before removal because InvalidateBasicBlocks can be called within a fastmem callback,
          // and the currently executing block may have references to itself which need to be unlinked.
          RelinkForDescriptor(descriptor, nullptr);
@@ -2406,7 +2414,7 @@ index 2c7ae77..90fb84c 100644
  }
  
  void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
-@@ -276,7 +1781,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+@@ -276,7 +1788,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
      using namespace oaknut::util;
  
      for (auto [ptr_offset, type] : block_relocations_list) {
@@ -2415,7 +2423,7 @@ index 2c7ae77..90fb84c 100644
          c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
  
          switch (type) {
-@@ -301,6 +1806,26 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+@@ -301,6 +1813,26 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
  }
  
  void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
@@ -2442,7 +2450,7 @@ index 2c7ae77..90fb84c 100644
      for (auto code_ptr : block_references[target_descriptor]) {
          if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
              const EmittedBlockInfo& block_info = block_iter->second;
-@@ -314,6 +1839,1159 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
+@@ -314,6 +1846,1159 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
      }
  }
  
@@ -3603,7 +3611,7 @@ index 2c7ae77..90fb84c 100644
      {
          const auto host_ptr = mcl::bit_cast<CodePtr>(host_pc);
 diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
-index 835566b..b4f6a65 100644
+index 835566b..0c2acca 100644
 --- a/src/dynarmic/backend/arm64/address_space.h
 +++ b/src/dynarmic/backend/arm64/address_space.h
 @@ -5,7 +5,16 @@
@@ -3662,7 +3670,7 @@ index 835566b..b4f6a65 100644
  namespace Dynarmic::Backend::Arm64 {
  
  class AddressSpace {
-@@ -28,6 +69,10 @@ public:
+@@ -28,6 +69,13 @@ public:
      virtual ~AddressSpace();
  
      virtual IR::Block GenerateIR(IR::LocationDescriptor) const = 0;
@@ -3670,10 +3678,13 @@ index 835566b..b4f6a65 100644
 +    /// program's code without going through the embedder's callbacks, which aren't made for a
 +    /// second thread. Default: no such reading, so no worker translations.
 +    virtual IR::Block HenGenerateIRQuiet(IR::LocationDescriptor) const { throw 1; }
++    /// True when HenGenerateIRQuiet reads the program's code from this address space's own
++    /// page table, whichever process the embedder's callbacks follow at that moment.
++    virtual bool HenReadsOwnCode() const { return false; }
  
      CodePtr Get(IR::LocationDescriptor descriptor);
  
-@@ -37,20 +82,288 @@ public:
+@@ -37,20 +85,288 @@ public:
      // Returns "most likely" entry_point associated with the emitted code at that location
      CodePtr ReverseGetEntryPoint(CodePtr host_pc);
  
@@ -3963,7 +3974,7 @@ index 835566b..b4f6a65 100644
          mem.protect();
  #endif
      }
-@@ -64,13 +377,47 @@ protected:
+@@ -64,13 +380,47 @@ protected:
      size_t GetRemainingSize();
      EmittedBlockInfo Emit(IR::Block ir_block);
      void Link(EmittedBlockInfo& block);
@@ -4013,7 +4024,7 @@ index 835566b..b4f6a65 100644
      oaknut::CodeGenerator code;
  
      // A IR::LocationDescriptor will have one current CodePtr.
-@@ -79,18 +426,31 @@ protected:
+@@ -79,18 +429,31 @@ protected:
      std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
      tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
      tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
@@ -4045,7 +4056,7 @@ index 835566b..b4f6a65 100644
  
          void* read_memory_8;
          void* read_memory_16;
-@@ -132,7 +492,8 @@ protected:
+@@ -132,7 +495,8 @@ protected:
          void* get_cntpct;
          void* add_ticks;
          void* get_ticks_remaining;
