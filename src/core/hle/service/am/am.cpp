@@ -2,8 +2,14 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <future>
+#include <map>
+#include <mutex>
 #include <cstring>
 #include <optional>
 #include <cryptopp/aes.h>
@@ -51,12 +57,199 @@ SERVICE_CONSTRUCT_IMPL(Service::AM::Module)
 
 #ifdef __SWITCH__
 #include <chrono>
+#include <dirent.h>
 // (Azahar's Switch 2 port, hen/jit/hen_jit.c) .cia install: piece size and timing.
 extern "C" unsigned hen_cia_chunk_bytes;
 extern "C" unsigned long long hen_cia_read_ns, hen_cia_write_ns, hen_cia_chunks;
 #endif
 
 namespace Service::AM {
+
+// (Kaizhar) A request's lock on one of the title manager's lists (am.h: the tickets and the
+// installed titles have a lock each). Development builds of the Switch 2 port say when a
+// request waited for the start-up scan, and how long the scan took.
+#ifdef __SWITCH__
+extern "C" {
+// A test switch of the Switch 2 port (--am-scan-eager): everything is scanned as the service
+// starts, as upstream does it, to compare with the port's way (Module::StartupScan).
+int hen_am_scan_eager = 0;
+// The saved list of installed titles (below: SavedTitleListPath). 0: --no-am-title-list, the
+// title manager without one, to compare.
+int hen_am_title_list = 1;
+}
+#if HEN_DEV
+extern "C" unsigned int svcGetCurrentProcessorNumber(void);
+#endif
+#else
+static constexpr int hen_am_scan_eager = 1; // (other platforms: as upstream)
+static constexpr int hen_am_title_list = 0;
+#endif
+
+// (Kaizhar) The saved list of installed titles. Scanning the installed titles opens every
+// title's content (about 15 to 20 file-service operations a title: 1.4 to 3 s for the 191 titles
+// of a linked console), and the request that needs the list (GetNumPrograms, GetProgramList)
+// waits for it on the emulation thread. So every complete scan leaves its result in a file
+// beside the nand folder: per medium (nand, SD card) the title folder's path, the names of the
+// folders in it two levels deep (title ID high / title ID low) in the order the scan read them,
+// and the title IDs the scan accepted, in the list's order. The next start reads the file,
+// lists the same folders again (names only: one listing per title-ID-high folder, no title is
+// opened) and, if path and names are the same, takes the list from the file.
+// What makes the file wrong, and what is done about each:
+//  - a title folder added or removed by any means: the names differ, the titles are scanned;
+//  - an install or a removal through this program (title manager requests, the title list's
+//    .cia install, the system title set-up): the file is deleted as it begins
+//    (InvalidateSavedTitleList), and the scan that follows a title manager request writes it again;
+//  - files changed by hand inside a title's folder with its name unchanged (content deleted
+//    or repaired): NOT noticed; delete nand/kaizhar_title_list.txt, or start once with
+//    --no-am-title-list or --am-scan-eager (the latter writes a fresh file).
+// The cartridge slot's entry is never saved: it is read from the title being started.
+static std::string SavedTitleListPath() {
+    return FileUtil::GetUserPath(FileUtil::UserPath::NANDDir) + "kaizhar_title_list.txt";
+}
+
+// (Kaizhar, hen_launch_cache) Where a title's content is, remembered for the run.
+// GetTitleContentPath lists the title's content folder for .tmd files and reads the title
+// metadata each time it is asked: 7 to 16 ms on the card for the keyboard applet at every
+// open ("finding its file" in the "hen: launch:" line), and again for the update title
+// that each launch looks for on the SD card. GetTitleContentPathForLaunch (the two callers
+// that start a title: apt/ns.cpp and loader/ncch.cpp) keeps the answer by medium and title.
+//  - Forgotten, all of it, when an install begins and when one ends (CIAFile, constructor and
+//    destructor), and in UninstallProgram: the places that drop the saved title list. While
+//    any install is in progress nothing is kept or answered from memory, so a path worked out
+//    from half-written title metadata is never remembered.
+//  - An answer for a title that is not installed (the update title, usually) is a path that
+//    does not exist; it is kept like any other and the open that follows fails all the same.
+//  - NOT noticed: content changed by other means during the run (FTP).
+// Memory: one path string per title started in the run.
+#ifdef __SWITCH__
+extern "C" int hen_launch_cache; // hen/jit/hen_jit.c: --no-launch-cache
+namespace {
+std::mutex hen_content_path_mutex;
+std::map<std::pair<u32, u64>, std::string> hen_content_paths;
+int hen_installs_in_progress = 0; // (under the mutex)
+} // namespace
+#endif
+
+static void HenForgetContentPaths([[maybe_unused]] int installs_delta) {
+#ifdef __SWITCH__
+    {
+        std::scoped_lock lock{hen_content_path_mutex};
+        hen_content_paths.clear();
+        hen_installs_in_progress = std::max(0, hen_installs_in_progress + installs_delta);
+    }
+    FileUtil::HenAbsentClear();
+    Loader::HenLaunchCacheForget();
+#endif
+}
+
+std::string GetTitleContentPathForLaunch(Service::FS::MediaType media_type, u64 tid) {
+#ifdef __SWITCH__
+    if (hen_launch_cache && (media_type == Service::FS::MediaType::NAND ||
+                             media_type == Service::FS::MediaType::SDMC)) {
+        const std::pair<u32, u64> key{static_cast<u32>(media_type), tid};
+        {
+            std::scoped_lock lock{hen_content_path_mutex};
+            if (hen_installs_in_progress == 0) {
+                if (const auto found = hen_content_paths.find(key);
+                    found != hen_content_paths.end()) {
+                    return found->second;
+                }
+            }
+        }
+        std::string path = GetTitleContentPath(media_type, tid);
+        std::scoped_lock lock{hen_content_path_mutex};
+        if (hen_installs_in_progress == 0 && !path.empty()) {
+            hen_content_paths.insert_or_assign(key, path);
+        }
+        return path;
+    }
+#endif
+    return GetTitleContentPath(media_type, tid);
+}
+
+static std::atomic<unsigned> hen_title_changes{0};
+unsigned HenTitleChanges() {
+    return hen_title_changes.load();
+}
+
+static void InvalidateSavedTitleList() {
+    HenForgetContentPaths(0);
+    hen_title_changes++;
+#ifdef __SWITCH__
+    // (whatever hen_am_title_list says: a later start may use the file)
+    const std::string path = SavedTitleListPath();
+    if (FileUtil::Exists(path)) {
+        FileUtil::Delete(path);
+    }
+#endif
+}
+
+/// The names in a title folder as ScanForTitlesImpl records them: "high/" for each entry of the
+/// folder, then "high/low" for each entry inside it, in the order the folder gives them.
+/// Names only: nothing is opened but the folders themselves. A folder that does not open has
+/// no entries (as in the scan).
+static void ListTitleFolderNames([[maybe_unused]] const std::string& title_path,
+                                 std::vector<std::string>& names) {
+    names.clear();
+#ifdef __SWITCH__
+    std::vector<std::string> highs;
+    if (DIR* top = opendir(title_path.c_str())) {
+        while (const dirent* entry = readdir(top)) {
+            if (std::strcmp(entry->d_name, ".") != 0 && std::strcmp(entry->d_name, "..") != 0) {
+                highs.emplace_back(entry->d_name);
+            }
+        }
+        closedir(top);
+    }
+    for (const std::string& high : highs) {
+        names.push_back(high + "/");
+        if (DIR* dir = opendir((title_path + DIR_SEP + high).c_str())) {
+            while (const dirent* entry = readdir(dir)) {
+                if (std::strcmp(entry->d_name, ".") != 0 && std::strcmp(entry->d_name, "..") != 0) {
+                    names.push_back(high + "/" + entry->d_name);
+                }
+            }
+            closedir(dir);
+        }
+    }
+#endif
+}
+
+class AmListLock {
+public:
+    AmListLock(Module& am, std::mutex& mutex, [[maybe_unused]] const char* list,
+               [[maybe_unused]] const char* request) {
+        am.NeedLists(request, &mutex == &am.am_lists_mutex);
+#if defined(__SWITCH__) && HEN_DEV
+        const auto start = std::chrono::steady_clock::now();
+        lock = std::unique_lock(mutex);
+        const double waited =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (waited > 5.0) {
+            std::printf("hen: am: %s waited %.0f ms for the list of %s\n", request, waited, list);
+        }
+#else
+        lock = std::unique_lock(mutex);
+#endif
+    }
+
+private:
+    std::unique_lock<std::mutex> lock;
+};
+
+static void AmScanReport([[maybe_unused]] double tickets_ms, [[maybe_unused]] double whole_ms,
+                         [[maybe_unused]] std::size_t tickets, [[maybe_unused]] std::size_t nand,
+                         [[maybe_unused]] std::size_t sd, [[maybe_unused]] std::size_t card,
+                         [[maybe_unused]] bool stopped, [[maybe_unused]] unsigned core_at_start) {
+#if defined(__SWITCH__) && HEN_DEV
+    std::printf("hen: am: start-up scan: %zu ticket(s) in %.0f ms; installed titles: %zu in nand, %zu on the "
+                "SD card, %zu in the cartridge slot; %.0f ms in all%s; its thread began on core %u and ended on "
+                "core %u\n",
+                tickets, tickets_ms, nand, sd, card, whole_ms, stopped ? " (stopped early: the title ended)" : "",
+                core_at_start, svcGetCurrentProcessorNumber());
+#endif
+}
+
 
 constexpr u16 PLATFORM_CTR = 0x0004;
 constexpr u16 CATEGORY_SYSTEM = 0x0010;
@@ -462,6 +655,9 @@ void CIAFile::AuthorizeDecryptionFromHLE() {
 CIAFile::CIAFile(Core::System& system_, Service::FS::MediaType media_type, bool from_cdn_)
     : system(system_), from_cdn(from_cdn_), decryption_authorized(false), media_type(media_type),
       decryption_state(std::make_unique<DecryptionState>()) {
+    // (Kaizhar) An install is beginning: the saved list of installed titles no longer holds.
+    InvalidateSavedTitleList();
+    HenForgetContentPaths(+1); // (and nothing is remembered about titles until it has ended)
     // If data is being installing from CDN, provide a fake header to the container so that
     // it's not uninitialized.
     if (from_cdn) {
@@ -481,6 +677,7 @@ CIAFile::CIAFile(Core::System& system_, Service::FS::MediaType media_type, bool 
 
 CIAFile::~CIAFile() {
     Close();
+    HenForgetContentPaths(-1); // (Kaizhar: what the install wrote is looked up afresh)
 }
 
 ResultVal<std::size_t> CIAFile::Read(u64 offset, std::size_t length, u8* buffer) const {
@@ -1540,7 +1737,7 @@ void Module::ScanForTickets() {
         ScanForTicketsImpl();
     } else {
         scan_tickets_future = std::async([this]() {
-            std::scoped_lock lock(am_lists_mutex);
+            std::scoped_lock lock(am_tickets_mutex);
             ScanForTicketsImpl();
         });
     }
@@ -1583,6 +1780,7 @@ void Module::ScanForTitles(Service::FS::MediaType media_type) {
         scan_titles_future = std::async([this, media_type]() {
             std::scoped_lock lock(am_lists_mutex);
             ScanForTitlesImpl(media_type);
+            SaveTitleList(); // (Kaizhar: if the other medium's folders are known too)
         });
     }
 }
@@ -1612,6 +1810,16 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
 
         FileUtil::FSTEntry entries;
         FileUtil::ScanDirectoryTree(title_path, entries, 1, &stop_scan_flag);
+        // (Kaizhar) The folder names this scan goes by, for the saved list (SaveTitleList).
+        auto& folder_names = title_folder_names[static_cast<u32>(media_type)];
+        folder_names.clear();
+        title_folder_names_known[static_cast<u32>(media_type)] = false;
+        for (const FileUtil::FSTEntry& tid_high : entries.children) {
+            folder_names.push_back(tid_high.virtualName + "/");
+            for (const FileUtil::FSTEntry& tid_low : tid_high.children) {
+                folder_names.push_back(tid_high.virtualName + "/" + tid_low.virtualName);
+            }
+        }
         for (const FileUtil::FSTEntry& tid_high : entries.children) {
             if (stop_scan_flag) {
                 break;
@@ -1641,9 +1849,351 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
                 }
             }
         }
+        // (a scan the title's end cut short is not one to save)
+        title_folder_names_known[static_cast<u32>(media_type)] = !stop_scan_flag;
     }
 
     LOG_DEBUG(Service_AM, "Finished title scan for media_type={}", static_cast<int>(media_type));
+}
+
+/// The saved list, read and checked against the folder names that are there now (now: those
+/// names, per medium). False: it cannot be used, and why.
+static bool ReadSavedTitleList(std::array<std::vector<u64_le>, 2>& titles,
+                               std::array<std::vector<std::string>, 2>& now, const char*& why_not,
+                               std::size_t& names_checked) {
+    std::string text;
+    const std::string saved_path = SavedTitleListPath();
+    if (!FileUtil::Exists(saved_path) || FileUtil::ReadFileToString(false, saved_path, text) == 0) {
+        why_not = "there is none";
+        return false;
+    }
+    // "kaizhar-title-list 1", then per medium "M <medium> <path>", "T <title ID>" lines and
+    // "N <name>" lines, and "E" as the last line (SaveTitleList).
+    std::array<std::string, 2> paths;
+    std::array<std::vector<std::string>, 2> names;
+    std::array<bool, 2> seen{};
+    bool header = false, complete = false;
+    int medium = -1;
+    std::size_t at = 0;
+    while (at < text.size() && !complete) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        if (!header) {
+            if (line != "kaizhar-title-list 1") {
+                break;
+            }
+            header = true;
+        } else if (line == "E") {
+            complete = true;
+        } else if (line.size() >= 4 && line[0] == 'M' && (line[2] == '0' || line[2] == '1') && line[3] == ' ') {
+            medium = line[2] - '0';
+            seen[medium] = true;
+            paths[medium] = line.substr(4);
+        } else if (medium >= 0 && line.size() == 2 + TITLE_ID_VALID_LENGTH && line[0] == 'T') {
+            char* stop = nullptr;
+            const u64 tid = std::strtoull(line.c_str() + 2, &stop, 16);
+            if (stop == nullptr || *stop != 0) {
+                break;
+            }
+            titles[medium].push_back(tid);
+        } else if (medium >= 0 && line.size() > 2 && line[0] == 'N') {
+            names[medium].push_back(line.substr(2));
+        } else {
+            break;
+        }
+    }
+    if (!complete || !seen[0] || !seen[1]) {
+        why_not = "the file is not whole";
+        return false;
+    }
+    for (u32 m = 0; m < 2; m++) {
+        const std::string title_path = GetMediaTitlePath(static_cast<FS::MediaType>(m));
+        if (title_path != paths[m]) {
+            why_not = m == 0 ? "the nand title folder is another one" : "the SD card's title folder is another one";
+            return false;
+        }
+        ListTitleFolderNames(title_path, now[m]);
+        names_checked += now[m].size();
+        if (now[m] != names[m]) {
+            why_not = m == 0 ? "the folders in the nand title folder have changed"
+                             : "the folders in the SD card's title folder have changed";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Module::LoadSavedTitleList(const char*& why_not, std::size_t& names_checked) {
+    std::array<std::vector<u64_le>, 2> titles;
+    std::array<std::vector<std::string>, 2> now;
+    if (!ReadSavedTitleList(titles, now, why_not, names_checked)) {
+        return false;
+    }
+    for (u32 m = 0; m < 2; m++) {
+        am_title_list[m] = std::move(titles[m]);
+        title_folder_names[m] = std::move(now[m]);
+        title_folder_names_known[m] = true;
+    }
+    return true;
+}
+
+bool HenNandTitles::HasMetadata(u64 tid) {
+    if (valid) {
+        if (listed.contains(tid)) {
+            return true;
+        }
+        if (!folders.contains(tid)) {
+            return false;
+        }
+    }
+    asked_card++;
+    return FileUtil::Exists(GetTitleMetadataPath(FS::MediaType::NAND, tid, false));
+}
+
+HenNandTitles HenReadNandTitles() {
+    HenNandTitles result;
+#ifdef __SWITCH__
+    std::array<std::vector<u64_le>, 2> titles;
+    std::array<std::vector<std::string>, 2> now;
+    std::size_t names_checked = 0;
+    if (hen_am_title_list && ReadSavedTitleList(titles, now, result.why_no_list, names_checked)) {
+        result.from_saved_list = true;
+        result.listed.insert(titles[0].begin(), titles[0].end());
+    } else {
+        if (!hen_am_title_list) {
+            result.why_no_list = "it is switched off";
+        }
+        // (the check may have stopped before it listed the nand folder, or at it)
+        ListTitleFolderNames(GetMediaTitlePath(FS::MediaType::NAND), now[0]);
+    }
+    // "high/" and "high/low" (ListTitleFolderNames): a title is two names of eight hex digits.
+    for (const std::string& name : now[0]) {
+        if (name.size() != 17 || name[8] != '/') {
+            continue;
+        }
+        const std::string digits = name.substr(0, 8) + name.substr(9);
+        if (digits.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+            continue;
+        }
+        result.folders.insert(std::stoull(digits, nullptr, 16));
+    }
+    result.valid = true;
+#endif
+    return result;
+}
+
+void Module::SaveTitleList() {
+    if (!hen_am_title_list || stop_scan_flag || !title_folder_names_known[0] || !title_folder_names_known[1]) {
+        return;
+    }
+    [[maybe_unused]] const auto start = std::chrono::steady_clock::now();
+    std::string text = "kaizhar-title-list 1\n";
+    std::size_t names = 0;
+    for (u32 m = 0; m < 2; m++) {
+        text += fmt::format("M {} {}\n", m, GetMediaTitlePath(static_cast<FS::MediaType>(m)));
+        for (const u64 tid : am_title_list[m]) {
+            text += fmt::format("T {:016x}\n", tid);
+        }
+        for (const std::string& name : title_folder_names[m]) {
+            if (name.find('\n') != std::string::npos) {
+                return; // (not a name this file can hold: no saved list)
+            }
+            text += "N " + name + "\n";
+        }
+        names += title_folder_names[m].size();
+    }
+    text += "E\n";
+    // (written beside, then moved: a file cut short is never under the real name; and the
+    // loader wants the last line anyway)
+    const std::string path = SavedTitleListPath();
+    const std::string beside = path + ".new";
+    bool ok = FileUtil::WriteStringToFile(false, beside, text) == text.size();
+    if (ok && FileUtil::Exists(path)) {
+        ok = FileUtil::Delete(path);
+    }
+    ok = ok && FileUtil::Rename(beside, path);
+#if defined(__SWITCH__) && HEN_DEV
+    std::printf("hen: am: the list of installed titles %s (%zu in nand, %zu on the SD card, %zu folder names) in %.0f ms\n",
+                ok ? "was saved" : "could NOT be saved", am_title_list[0].size(), am_title_list[1].size(), names,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+#endif
+}
+
+void Module::ScanTitlesHoldingLock() {
+    [[maybe_unused]] const auto start = std::chrono::steady_clock::now();
+    if (hen_am_title_list) {
+        const char* why_not = "";
+        std::size_t names_checked = 0;
+        if (LoadSavedTitleList(why_not, names_checked)) {
+            // (the cartridge slot: the title being started, read now as in a scan)
+            ScanForTitlesImpl(Service::FS::MediaType::GameCard);
+#if defined(__SWITCH__) && HEN_DEV
+            std::printf("hen: am: installed titles from the saved list: %zu in nand, %zu on the SD card, %zu in the "
+                        "cartridge slot; %.0f ms (%zu folder names checked, no title opened)\n",
+                        am_title_list[0].size(), am_title_list[1].size(), am_title_list[2].size(),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                        names_checked);
+#endif
+            return;
+        }
+#if defined(__SWITCH__) && HEN_DEV
+        std::printf("hen: am: the saved list of installed titles is not used (%s; %zu folder names checked, %.0f ms): "
+                    "scanning the titles\n",
+                    why_not, names_checked,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+#endif
+    }
+    if (!stop_scan_flag) {
+        ScanForTitlesImpl(Service::FS::MediaType::NAND);
+    }
+    if (!stop_scan_flag) {
+        ScanForTitlesImpl(Service::FS::MediaType::SDMC);
+    }
+    if (!stop_scan_flag) {
+        ScanForTitlesImpl(Service::FS::MediaType::GameCard);
+    }
+#if defined(__SWITCH__) && HEN_DEV
+    std::printf("hen: am: installed titles: %zu in nand, %zu on the SD card, %zu in the cartridge slot; %.0f ms%s\n",
+                am_title_list[0].size(), am_title_list[1].size(), am_title_list[2].size(),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                stop_scan_flag ? " (stopped early: the title ended)" : "");
+#endif
+    SaveTitleList();
+}
+
+void Module::StartTitleScan([[maybe_unused]] const char* request, [[maybe_unused]] const char* at_start) {
+    // A thread of its own reads or scans the installed titles, and this returns once that thread
+    // holds the list's lock, where a request then waits as a request waits for the start-up
+    // scan. Requests for tickets never wait here.
+    // (the promise is shared: the caller may be gone while set_value is still returning)
+    const auto holds_lock = std::make_shared<std::promise<void>>();
+    std::future<void> held = holds_lock->get_future();
+    scan_titles_future = std::async([this, holds_lock, request, at_start]() {
+        std::scoped_lock lock(am_lists_mutex);
+        holds_lock->set_value();
+#if defined(__SWITCH__) && HEN_DEV
+        if (at_start != nullptr) {
+            std::printf("hen: am: the installed titles are read as the service starts (%s)\n", at_start);
+        } else {
+            std::printf("hen: am: %s needs the list of installed titles: %s\n", request,
+                        hen_am_title_list ? "reading them now" : "scanning them now");
+        }
+#endif
+        ScanTitlesHoldingLock();
+    });
+    held.wait();
+    titles_pending = false;
+}
+
+void Module::ScanAllHoldingLocks(std::unique_lock<std::mutex>& tickets_lock) {
+    titles_pending = false; // (this scan covers them; a plain flag: a second scan would only repeat)
+    const auto scan_start = std::chrono::steady_clock::now();
+#if defined(__SWITCH__) && HEN_DEV
+    const unsigned core_at_start = svcGetCurrentProcessorNumber();
+#else
+    const unsigned core_at_start = 0;
+#endif
+    ScanForTicketsImpl();
+    const std::size_t tickets_found = am_ticket_list.size();
+    tickets_lock.unlock();
+    const auto tickets_done = std::chrono::steady_clock::now();
+    struct Report {
+        Module& am;
+        std::chrono::steady_clock::time_point start, tickets;
+        std::size_t tickets_found;
+        unsigned core_at_start;
+        ~Report() {
+            AmScanReport(std::chrono::duration<double, std::milli>(tickets - start).count(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                             .count(),
+                         tickets_found, am.am_title_list[0].size(), am.am_title_list[1].size(),
+                         am.am_title_list[2].size(), am.stop_scan_flag, core_at_start);
+        }
+    } report{*this, scan_start, tickets_done, tickets_found, core_at_start};
+    if (!stop_scan_flag) {
+        ScanForTitlesImpl(Service::FS::MediaType::NAND);
+    }
+    if (!stop_scan_flag) {
+        ScanForTitlesImpl(Service::FS::MediaType::SDMC);
+    }
+    if (!stop_scan_flag) {
+        ScanForTitlesImpl(Service::FS::MediaType::GameCard);
+    }
+    SaveTitleList(); // (Kaizhar: a complete scan, at start or after an install or a removal)
+}
+
+void Module::StartupScan() {
+    // A system title (the HOME Menu, System Settings: the system bit of the title ID's
+    // category) lists the installed titles as it starts: for those everything at once.
+    u64 starting = 0;
+    system.GetAppLoader().ReadProgramId(starting);
+    const bool system_title = (static_cast<u32>(starting >> 32) & CATEGORY_SYSTEM) != 0;
+    if (Settings::values.deterministic_async_operations || hen_am_scan_eager ||
+        (system_title && !hen_am_title_list)) {
+#if defined(__SWITCH__) && HEN_DEV
+        std::printf("hen: am: everything is scanned as the service starts (%s)\n",
+                    hen_am_scan_eager ? "--am-scan-eager" : "a system title is starting");
+#endif
+        ScanForAllTitles();
+        return;
+    }
+    // With the online modules running as the console's own code one of them asks for the number
+    // of installed titles as it starts (am:net GetNumPrograms: with a scan there, the
+    // emulation thread waits 1.4 to 2.4 s in that request), and a system title lists them too.
+    // For both the installed titles are read as the service starts, beside the tickets, on a
+    // thread of their own: from the saved list if it still fits the folders (a file and a dozen
+    // folder listings), else by the scan, which then runs while the title loads and slows its
+    // first seconds, once, and leaves the list saved.
+    // Any other title: on first need (file work in a title's first seconds slows the
+    // requests that hand new JIT code to the system), from the saved list if it fits.
+    const bool online_modules =
+        hen_am_title_list && Common::Hacks::hack_manager.OverrideBooleanSetting(
+                                 Common::Hacks::HackType::ONLINE_LLE_REQUIRED, starting,
+                                 Settings::values.enable_required_online_lle_modules.GetValue());
+    const bool titles_at_start = system_title || online_modules;
+    // Otherwise the tickets now (one folder's listing), and the installed titles when a request
+    // first needs their list (NeedLists). Scanning them opens every installed title's content:
+    // seconds of file-service work on a console with a system's worth of titles in nand/, and
+    // for those seconds every title started slower (measured: the requests that hand new JIT
+    // code to the system took four times as long while the scan ran). Games do not ask for
+    // that list.
+    {
+        std::scoped_lock lock(startup_mutex);
+        titles_pending = true;
+    }
+    scan_tickets_future = std::async([this, titles_at_start]() {
+        std::scoped_lock lock(am_tickets_mutex);
+        [[maybe_unused]] const auto start = std::chrono::steady_clock::now();
+        ScanForTicketsImpl();
+#if defined(__SWITCH__) && HEN_DEV
+        std::printf("hen: am: start-up scan: %zu ticket(s) in %.0f ms; the installed titles %s\n",
+                    am_ticket_list.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                    titles_at_start ? "are read beside this, on their own thread"
+                                    : "are scanned when a request needs their list");
+#endif
+    });
+    if (titles_at_start) {
+        std::unique_lock startup(startup_mutex);
+        StartTitleScan(nullptr, system_title ? "a system title is starting"
+                                             : "the online modules run as the console's own code");
+    }
+}
+
+void Module::NeedLists([[maybe_unused]] const char* request, bool titles) {
+    if (!titles || !titles_pending) {
+        return;
+    }
+    std::unique_lock startup(startup_mutex);
+    if (!titles_pending) {
+        return;
+    }
+    // The installed titles, on first need (StartTitleScan: from the saved list if it fits).
+    StartTitleScan(request, nullptr);
 }
 
 void Module::ScanForAllTitles() {
@@ -1654,17 +2204,15 @@ void Module::ScanForAllTitles() {
         ScanForTitlesImpl(Service::FS::MediaType::GameCard);
     } else {
         scan_all_future = std::async([this]() {
+            // (Kaizhar) Two locks, taken together as upstream takes its one: nothing reads a
+            // list before its scan. The tickets' is let go as soon as the tickets are scanned
+            // (one folder's listing), so a request for tickets no longer waits for the scan
+            // of every installed title, which opens each title's content: seconds on a
+            // console with a system's worth of titles in nand/, and the emulated console
+            // stood still for them (Smash asks for its add-on content's tickets as it starts).
+            std::unique_lock tickets_lock(am_tickets_mutex);
             std::scoped_lock lock(am_lists_mutex);
-            ScanForTicketsImpl();
-            if (!stop_scan_flag) {
-                ScanForTitlesImpl(Service::FS::MediaType::NAND);
-            }
-            if (!stop_scan_flag) {
-                ScanForTitlesImpl(Service::FS::MediaType::SDMC);
-            }
-            if (!stop_scan_flag) {
-                ScanForTitlesImpl(Service::FS::MediaType::GameCard);
-            }
+            ScanAllHoldingLocks(tickets_lock);
         });
     }
 }
@@ -1734,7 +2282,7 @@ void Module::Interface::GetNumPrograms(Kernel::HLERequestContext& ctx) {
             return;
         }
 
-        std::scoped_lock lock(am->am_lists_mutex);
+        AmListLock lock(*am, am->am_lists_mutex, "installed titles", __func__);
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
         rb.Push(ResultSuccess);
         rb.Push<u32>(static_cast<u32>(am->am_title_list[media_type].size()));
@@ -1849,7 +2397,7 @@ void Module::Interface::FindDLCContentInfos(Kernel::HLERequestContext& ctx) {
                 // we give rights anyway if the ticket is not installed.
                 bool has_ticket = false;
                 FileSys::Ticket ticket;
-                std::scoped_lock lock(am->am_lists_mutex);
+                AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
                 auto entries = am->am_ticket_list.find(async_data->title_id);
                 if (entries != am->am_ticket_list.end() &&
                     ticket.Load(async_data->title_id, (*entries).second) ==
@@ -2017,7 +2565,7 @@ void Module::Interface::ListDLCContentInfos(Kernel::HLERequestContext& ctx) {
                 // we give rights anyway if the ticket is not installed.
                 bool has_ticket = false;
                 FileSys::Ticket ticket;
-                std::scoped_lock lock(am->am_lists_mutex);
+                AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
                 auto entries = am->am_ticket_list.find(async_data->title_id);
                 if (entries != am->am_ticket_list.end() &&
                     ticket.Load(async_data->title_id, (*entries).second) ==
@@ -2160,7 +2708,7 @@ void Module::Interface::GetProgramList(Kernel::HLERequestContext& ctx) {
             return;
         }
 
-        std::scoped_lock lock(am->am_lists_mutex);
+        AmListLock lock(*am, am->am_lists_mutex, "installed titles", __func__);
         u32 media_count = static_cast<u32>(am->am_title_list[media_type].size());
         u32 copied = std::min(media_count, count);
 
@@ -2810,7 +3358,7 @@ void Module::Interface::ListDataTitleTicketInfos(Kernel::HLERequestContext& ctx)
 
         auto& out_buffer = rp.PopMappedBuffer();
 
-        std::scoped_lock lock(am->am_lists_mutex);
+        AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
         auto range = am->am_ticket_list.equal_range(title_id);
         auto it = range.first;
         std::advance(it, std::min(static_cast<size_t>(start_index),
@@ -2928,7 +3476,7 @@ void Module::Interface::DeleteTicket(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_AM, "title_id={:016X}", title_id);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto range = am->am_ticket_list.equal_range(title_id);
     if (range.first == range.second) {
         rb.Push(Result(ErrorDescription::AlreadyDone, ErrorModule::AM, ErrorSummary::Success,
@@ -2951,7 +3499,7 @@ void Module::Interface::GetNumTickets(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_AM, "");
 
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     u32 ticket_count = static_cast<u32>(am->am_ticket_list.size());
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
@@ -2968,7 +3516,7 @@ void Module::Interface::GetTicketList(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_AM, "ticket_list_count={}, ticket_index={}", ticket_list_count, ticket_index);
 
     u32 tickets_written = 0;
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto it = am->am_ticket_list.begin();
     std::advance(it, std::min(static_cast<size_t>(ticket_index), am->am_ticket_list.size()));
 
@@ -3325,7 +3873,7 @@ void Module::Interface::GetPersonalizedTicketInfoList(Kernel::HLERequestContext&
     ctx.RunAsync(
         [this, async_data](Kernel::HLERequestContext& ctx) {
             u32 written = 0;
-            std::scoped_lock lock(am->am_lists_mutex);
+            AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
             for (auto it = am->am_ticket_list.begin();
                  it != am->am_ticket_list.end() && written < async_data->ticket_count; it++) {
                 u64 title_id = it->first;
@@ -3397,7 +3945,7 @@ void Module::Interface::CheckContentRights(Kernel::HLERequestContext& ctx) {
 
     bool has_ticket = false;
     FileSys::Ticket ticket;
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto entries = am->am_ticket_list.find(tid);
     if (entries != am->am_ticket_list.end() &&
         ticket.Load(tid, (*entries).second) == Loader::ResultStatus::Success) {
@@ -3420,7 +3968,7 @@ void Module::Interface::CheckContentRightsIgnorePlatform(Kernel::HLERequestConte
 
     bool has_ticket = false;
     FileSys::Ticket ticket;
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto entries = am->am_ticket_list.find(tid);
     if (entries != am->am_ticket_list.end() &&
         ticket.Load(tid, (*entries).second) == Loader::ResultStatus::Success) {
@@ -3944,6 +4492,9 @@ Result UninstallProgram(const FS::MediaType media_type, const u64 title_id) {
         return ResultInvalidMediaType;
     }
     // Use the content folder so we don't delete the user's save data.
+    // (Kaizhar: the title's folder stays, so the saved list of installed titles would not see
+    // this by the folders' names)
+    InvalidateSavedTitleList();
     const auto path = GetTitlePath(media_type, title_id) + "content/";
     if (!FileUtil::Exists(path)) {
         return {ErrorDescription::NotFound, ErrorModule::AM, ErrorSummary::InvalidState,
@@ -4092,7 +4643,7 @@ void Module::Interface::EndImportTicket(Kernel::HLERequestContext& ctx) {
                 }
                 const auto [title_id, ticket_id] = commit_result.Unwrap();
 
-                std::scoped_lock lock(am->am_lists_mutex);
+                AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
                 am->am_ticket_list.insert(std::make_pair(title_id, ticket_id));
 
                 LOG_DEBUG(Service_AM, "EndImportTicket: title_id={:016X} ticket_id={:016X}",
@@ -4128,7 +4679,7 @@ void Module::Interface::BeginImportTitle(Kernel::HLERequestContext& ctx) {
     am->importing_title =
         std::make_shared<CurrentImportingTitle>(Core::System::GetInstance(), title_id, media_type);
 
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto entries = am->am_ticket_list.find(title_id);
     if (entries == am->am_ticket_list.end()) {
         // Ticket is not installed
@@ -4764,6 +5315,8 @@ void Module::Interface::Sign(Kernel::HLERequestContext& ctx) {
 
 template <class Archive>
 void Module::serialize(Archive& ar, const unsigned int) {
+    // (Kaizhar: both lists, in the scan's order)
+    std::scoped_lock tickets_lock(am_tickets_mutex);
     std::scoped_lock lock(am_lists_mutex);
     DEBUG_SERIALIZATION_POINT;
     ar & cia_installing;
@@ -4809,7 +5362,7 @@ void Module::Interface::DeleteTicketId(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_AM, "title_id={:016X} ticket_id={}", title_id, ticket_id);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto range = am->am_ticket_list.equal_range(title_id);
     auto it = range.first;
     for (; it != range.second; it++) {
@@ -4837,7 +5390,7 @@ void Module::Interface::GetNumTicketIds(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_AM, "title_id={:016X}", title_id);
 
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto range = am->am_ticket_list.equal_range(title_id);
     u32 count = static_cast<u32>(std::distance(range.first, range.second));
 
@@ -4857,7 +5410,7 @@ void Module::Interface::GetTicketIdList(Kernel::HLERequestContext& ctx) {
     auto out_buf = rp.PopMappedBuffer();
 
     u32 index = 0;
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     for (auto [it, rangeEnd] = am->am_ticket_list.equal_range(title_id);
          it != rangeEnd && index < list_count; index++, it++) {
         u64 ticket_id = it->second;
@@ -4875,7 +5428,7 @@ void Module::Interface::GetNumTicketsOfProgram(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_AM, "title_id={:016X}", title_id);
 
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto range = am->am_ticket_list.equal_range(title_id);
     u32 count = static_cast<u32>(std::distance(range.first, range.second));
 
@@ -4893,7 +5446,7 @@ void Module::Interface::ListTicketInfos(Kernel::HLERequestContext& ctx) {
 
     LOG_DEBUG(Service_AM, "(STUBBED) called, ticket_count={}", ticket_count);
 
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto range = am->am_ticket_list.equal_range(title_id);
     auto it = range.first;
     std::advance(it, std::min(static_cast<size_t>(skip),
@@ -5175,7 +5728,7 @@ void Module::Interface::ExportTicketWrapped(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    std::scoped_lock lock(am->am_lists_mutex);
+    AmListLock lock(*am, am->am_tickets_mutex, "tickets", __func__);
     auto range = am->am_ticket_list.equal_range(title_id);
     auto it = range.first;
     for (; it != range.second; it++)
@@ -5273,7 +5826,7 @@ bool Module::IsTitleImportPending(u64 title_id) const {
 
 Module::Module(Core::System& _system) : system(_system) {
     FileUtil::CreateFullPath(GetTicketDirectory());
-    ScanForAllTitles();
+    StartupScan();
     system_updater_mutex = system.Kernel().CreateMutex(false, "AM::SystemUpdaterMutex");
 }
 

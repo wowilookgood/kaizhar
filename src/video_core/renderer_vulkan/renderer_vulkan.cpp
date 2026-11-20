@@ -2,7 +2,15 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <fmt/format.h>
 #include "common/assert.h"
+#include "common/hen_frame_work.h"
+#include "common/hen_gap.h"
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
 #include "common/microprofile.h"
@@ -36,6 +44,8 @@ MICROPROFILE_DEFINE(Vulkan_RenderFrame, "Vulkan", "Render Frame", MP_RGB(128, 12
 
 #ifdef __SWITCH__
 extern "C" unsigned long long hen_present_gaps[6]; // hen/jit/hen_jit.c
+extern "C" unsigned long long hen_render_latency_gap_max_ns; // vk_present_window.cpp
+extern "C" long long hen_limiter_slept_total_us;   // core/perf_stats.cpp
 #if HEN_DEV
 extern "C" void hen_blackbox_dump(unsigned ms);
 #endif
@@ -43,6 +53,9 @@ extern "C" void hen_boost_note_present(unsigned long long ns); // hen/jit/hen_ji
 /// The console is held the other way up (a flipped portrait layout): the finished picture is
 /// turned half a turn. citra_switch/switch_platform.c
 extern "C" bool sw_flipped(void);
+/// The Settings page's pointer size (a factor) and style (DrawCursor). citra_switch/switch_platform.c
+extern "C" float sw_pointer_size(void);
+extern "C" int sw_pointer_style(void);
 #endif
 
 namespace Vulkan {
@@ -168,6 +181,7 @@ RendererVulkan::~RendererVulkan() {
     }
 
     device.destroyPipeline(cursor_pipeline);
+    device.destroyPipeline(cursor_solid_pipeline);
     device.destroyShaderModule(cursor_vertex_shader);
     device.destroyShaderModule(cursor_fragment_shader);
 }
@@ -245,6 +259,10 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
     });
 }
 
+#ifdef __SWITCH__
+extern "C" unsigned long long hen_swap_ns[8]; // hen/jit/hen_jit.c
+#endif
+
 void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                                     bool flipped) {
     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
@@ -262,9 +280,27 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         clear_color.float32[2] = Settings::values.bg_blue.GetValue();
         clear_color.float32[3] = 1.0f;
 
+#if defined(__SWITCH__) && HEN_DEV
+        const auto hen_draw_start = std::chrono::steady_clock::now();
+#endif
         DrawScreens(frame, layout, flipped);
+#ifdef __SWITCH__
+        // (vk_present_window.cpp: the time the GPU takes to finish this frame's drawing,
+        // timed by a thread of its own; this call only queues two numbers)
+        window.HenWatchFrame(scheduler.CurrentTick(),
+                             static_cast<unsigned long long>(
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count()));
+#endif
         scheduler.Flush(frame->render_ready);
         window.Present(frame);
+#if defined(__SWITCH__) && HEN_DEV
+        hen_swap_ns[7] += static_cast<unsigned long long>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 hen_draw_start)
+                .count());
+#endif
         if ((secondaryWindowEnabled && isSecondaryWindow) || (!secondaryWindowEnabled)) {
             Core::PerfStats::game_frames_updated = false;
             screenRendered = true;
@@ -500,14 +536,15 @@ void RendererVulkan::BuildPipelines() {
     {
         const vk::VertexInputBindingDescription cursor_binding = {
             .binding = 0,
-            .stride = sizeof(float) * 2,
+            .stride = sizeof(float) * 3,
             .inputRate = vk::VertexInputRate::eVertex,
         };
 
+        // (x, y, and a shade from black 0 to white 1)
         const vk::VertexInputAttributeDescription cursor_attribute = {
             .location = 0,
             .binding = 0,
-            .format = vk::Format::eR32G32Sfloat,
+            .format = vk::Format::eR32G32B32Sfloat,
             .offset = 0,
         };
 
@@ -614,6 +651,18 @@ void RendererVulkan::BuildPipelines() {
             instance.GetDevice().createGraphicsPipeline({}, cursor_pipeline_info);
         ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build cursor pipeline");
         cursor_pipeline = pipeline;
+
+        // (Kaizhar) The same without blending, for the pointer styles drawn in plain black and
+        // white: the pipeline above can only invert what is under it.
+        vk::PipelineColorBlendAttachmentState solid_attachment = cursor_blend_attachment;
+        solid_attachment.blendEnable = false;
+        vk::PipelineColorBlendStateCreateInfo solid_blending = cursor_color_blending;
+        solid_blending.pAttachments = &solid_attachment;
+        vk::GraphicsPipelineCreateInfo solid_info = cursor_pipeline_info;
+        solid_info.pColorBlendState = &solid_blending;
+        const auto [solid_result, solid_pipeline] = instance.GetDevice().createGraphicsPipeline({}, solid_info);
+        ASSERT_MSG(solid_result == vk::Result::eSuccess, "Unable to build cursor pipeline");
+        cursor_solid_pipeline = solid_pipeline;
     }
 }
 
@@ -1096,7 +1145,14 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
     const float abs_y = layout.bottom_screen.top + cursor.projected_y;
     const float cx = (abs_x / buf_w) * 2.0f - 1.0f;
     const float cy = (abs_y / buf_h) * 2.0f - 1.0f;
-    const float ratio = static_cast<float>(layout.bottom_screen.GetHeight()) / 30.0f;
+#ifdef __SWITCH__
+    const float scale = sw_pointer_size();
+    const int style = sw_pointer_style();
+#else
+    const float scale = 1.0f;
+    const int style = 0;
+#endif
+    const float ratio = static_cast<float>(layout.bottom_screen.GetHeight()) / 30.0f * scale;
     const float rw = ratio / buf_w;
     const float rh = ratio / buf_h;
 
@@ -1106,46 +1162,101 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
     const float br = (layout.bottom_screen.right / buf_w) * 2.0f - 1.0f;
     const float bb = (layout.bottom_screen.bottom / buf_h) * 2.0f - 1.0f;
 
-    // Crosshair geometry clamped to bottom screen bounds
-    const float vl = std::fmax(cx - rw / 5.0f, bl);
-    const float vr = std::fmin(cx + rw / 5.0f, br);
-    const float vt = std::fmax(cy - rh, bt);
-    const float vb = std::fmin(cy + rh, bb);
-
-    const float hl = std::fmax(cx - rw, bl);
-    const float hr = std::fmin(cx + rw, br);
-    const float ht = std::fmax(cy - rh / 5.0f, bt);
-    const float hb = std::fmin(cy + rh / 5.0f, bb);
-
-    // 12 vertices = 4 triangles (2 for vertical bar, 2 for horizontal bar)
-    // clang-format off
-    float vertices[] = {
-        // Vertical bar
-        vl, vt,  vr, vt,  vr, vb,
-        vl, vt,  vr, vb,  vl, vb,
-        // Horizontal bar
-        hl, ht,  hr, ht,  hr, hb,
-        hl, ht,  hr, hb,  hl, hb,
+    // (Kaizhar) The pointer is a few triangles: x, y and a shade (0 black, 1 white) a vertex, in
+    // units of an arm of the cross, as the player sees them (x to the right, y down; an upright
+    // arrangement shows the 3DS's picture a quarter turn round), kept inside the bottom screen.
+    // Style 0 is the cross every build had, through the pipeline that inverts the picture under
+    // it; the others are drawn in plain black and white, dark edge first.
+    std::array<float, 3 * 6 * 48> vertices;
+    std::size_t count = 0;
+    const auto point = [&](float x, float y, float shade) {
+        const float dx = layout.is_rotated ? x : y, dy = layout.is_rotated ? y : -x;
+        vertices[count++] = std::clamp(cx + dx * rw, bl, br);
+        vertices[count++] = std::clamp(cy + dy * rh, bt, bb);
+        vertices[count++] = shade;
     };
-    // clang-format on
+    const auto quad = [&](float l, float t, float r, float b, float shade) {
+        point(l, t, shade), point(r, t, shade), point(r, b, shade);
+        point(l, t, shade), point(r, b, shade), point(l, b, shade);
+    };
+    const auto cross = [&](float arm, float half, float shade) {
+        quad(-half, -arm, half, arm, shade);
+        quad(-arm, -half, arm, half, shade);
+    };
+    const auto ring = [&](float outer, float inner, float shade) {
+        constexpr int steps = 20;
+        for (int i = 0; i < steps; i++) {
+            const float a = 6.2831853f * i / steps, b = 6.2831853f * (i + 1) / steps;
+            const float ax = std::cos(a), ay = std::sin(a), bx = std::cos(b), by = std::sin(b);
+            point(ax * outer, ay * outer, shade), point(bx * outer, by * outer, shade), point(bx * inner, by * inner, shade);
+            point(ax * outer, ay * outer, shade), point(bx * inner, by * inner, shade), point(ax * inner, ay * inner, shade);
+        }
+    };
+    constexpr float edge = 0.12f;
+    switch (style) {
+    case 1: // white cross with a dark edge
+        cross(1.0f + edge, 0.2f + edge, 0.0f);
+        cross(1.0f, 0.2f, 1.0f);
+        break;
+    case 2: // ring with a dot
+        ring(1.0f + edge, 0.7f - edge, 0.0f);
+        ring(1.0f, 0.7f, 1.0f);
+        quad(-0.14f - edge, -0.14f - edge, 0.14f + edge, 0.14f + edge, 0.0f);
+        quad(-0.14f, -0.14f, 0.14f, 0.14f, 1.0f);
+        break;
+    case 3: { // arrow, its tip where the pointer is
+        const auto arrow = [&](float grow, float shade) {
+            // (tip, lower left, notch, right; grown about a point inside for the edge)
+            const float px[] = {0.0f, 0.0f, 0.5f, 1.25f}, py[] = {0.0f, 1.75f, 1.3f, 1.25f};
+            float x[4], y[4];
+            for (int i = 0; i < 4; i++) {
+                x[i] = 0.4f + (px[i] - 0.4f) * grow;
+                y[i] = 1.0f + (py[i] - 1.0f) * grow;
+            }
+            point(x[0], y[0], shade), point(x[1], y[1], shade), point(x[2], y[2], shade);
+            point(x[0], y[0], shade), point(x[2], y[2], shade), point(x[3], y[3], shade);
+        };
+        arrow(1.3f, 0.0f);
+        arrow(1.0f, 1.0f);
+        break;
+    }
+    case 4: // crosshair open in the middle, each arm white near the middle and black further out
+        for (int turn = 0; turn < 4; turn++) {
+            const float sx = turn == 0 ? 1.0f : turn == 1 ? -1.0f : 0.0f, sy = turn == 2 ? 1.0f : turn == 3 ? -1.0f : 0.0f;
+            const auto arm = [&](float from, float to, float shade) {
+                const float half = 0.16f;
+                quad(std::min(sx * from, sx * to) - (sx == 0.0f ? half : 0.0f), std::min(sy * from, sy * to) - (sy == 0.0f ? half : 0.0f),
+                     std::max(sx * from, sx * to) + (sx == 0.0f ? half : 0.0f), std::max(sy * from, sy * to) + (sy == 0.0f ? half : 0.0f),
+                     shade);
+            };
+            arm(0.3f, 0.8f, 1.0f);
+            arm(0.8f, 1.3f, 0.0f);
+        }
+        quad(-0.1f, -0.1f, 0.1f, 0.1f, 1.0f);
+        break;
+    default: // the cross that inverts the picture
+        cross(1.0f, 0.2f, 1.0f);
+        break;
+    }
 #ifdef __SWITCH__
     if (sw_flipped()) { // half a turn, as the screens in DrawScreens
-        for (float& v : vertices) {
-            v = -v;
+        for (std::size_t i = 0; i < count; i += 3) {
+            vertices[i] = -vertices[i];
+            vertices[i + 1] = -vertices[i + 1];
         }
     }
 #endif
 
-    const u64 size = sizeof(vertices);
+    const u64 size = count * sizeof(float);
     auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
-    std::memcpy(data, vertices, size);
+    std::memcpy(data, vertices.data(), size);
     vertex_buffer.Commit(size);
 
-    scheduler.Record([this, offset = offset, pipeline = cursor_pipeline](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, offset = offset, vertex_count = static_cast<u32>(count / 3),
+                      pipeline = style >= 1 && style <= 4 ? cursor_solid_pipeline : cursor_pipeline](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-        cmdbuf.bindVertexBuffers(0, vertex_buffer.Handle(), {0});
-        const u32 first_vertex = static_cast<u32>(offset) / (sizeof(float) * 2);
-        cmdbuf.draw(12, 1, first_vertex, 0);
+        cmdbuf.bindVertexBuffers(0, vertex_buffer.Handle(), {offset});
+        cmdbuf.draw(vertex_count, 1, 0, 0);
     });
 }
 
@@ -1194,6 +1305,96 @@ void RendererVulkan::SwapBuffers() {
                     hen_present_gaps[5] += gap_us;
                 }
 #if HEN_DEV
+                // What went on in a gap over 40 ms (common/hen_gap.h): the totals now against
+                // those at the frame before. Workers' time is summed over the workers, so it
+                // can be more than the gap; items under a millisecond are left out.
+                {
+                    static unsigned long long before[HEN_GAP_KINDS];
+                    static long long slept_before;
+                    static unsigned long long cpu_before[2];
+                    unsigned long long cpu[2];
+                    hen_gap_thread_cpu(cpu);
+                    unsigned long long totals[HEN_GAP_KINDS], longest[HEN_GAP_LONGEST_KINDS];
+                    char what[HEN_GAP_LONGEST_KINDS][64];
+                    hen_gap_read(totals, longest, what);
+                    const long long slept = hen_limiter_slept_total_us;
+                    if (gap_us > 40'000) {
+                        static const char* const names[HEN_GAP_KINDS] = {
+                            // (the workers' figures are sums over threads and
+                            // include waiting in the driver for another thread's compile of the
+                            // same shader; a build on the GPU thread itself is in the next one;
+                            // the texture figure includes the decode)
+                            "jit compile", "jit lock", "interpreter", "pipelines built (workers, summed)",
+                            "shaders built (workers, summed)", "pipelines built on or waited for by the GPU thread",
+                            "cpu draws", "texture decodes and uploads",
+                            "downloads", "driver wait", "cache flush", "waited for the GPU thread",
+                            "title file reads", "file calls (any thread)", "service calls", "jit publishes", ""};
+                        // The time the two threads had a core comes first: a gap in which
+                        // the emulation thread ran little and nothing below accounts for the
+                        // rest was spent waiting for a core or for another process.
+                        std::string line = fmt::format("emulation thread on a core {}, jit worker on a core {}",
+                                                       (cpu[0] - cpu_before[0]) / 1'000'000,
+                                                       (cpu[1] - cpu_before[1]) / 1'000'000);
+                        for (int k = 0; k < HEN_GAP_PUBLISH_COUNT; k++) {
+                            const unsigned long long ms = (totals[k] - before[k]) / 1'000'000;
+                            if (ms == 0) {
+                                continue;
+                            }
+                            line += fmt::format("{}{} {}", line.empty() ? "" : ", ", names[k], ms);
+                            if (k == HEN_GAP_PUBLISH) {
+                                line += fmt::format(" (in {} requests)",
+                                                    totals[HEN_GAP_PUBLISH_COUNT] - before[HEN_GAP_PUBLISH_COUNT]);
+                            }
+                            if (k == HEN_GAP_FILE_CALLS && longest[HEN_GAP_LONGEST_FILE] >= 1'000'000) {
+                                line += fmt::format(" (longest {} {})", longest[HEN_GAP_LONGEST_FILE] / 1'000'000,
+                                                    what[HEN_GAP_LONGEST_FILE]);
+                            } else if (k == HEN_GAP_SERVICE_CALLS && longest[HEN_GAP_LONGEST_SERVICE] >= 1'000'000) {
+                                line += fmt::format(" (longest {} {})", longest[HEN_GAP_LONGEST_SERVICE] / 1'000'000,
+                                                    what[HEN_GAP_LONGEST_SERVICE]);
+                            }
+                        }
+                        if (slept - slept_before >= 1000) {
+                            line += fmt::format("{}slept {}", line.empty() ? "" : ", ", (slept - slept_before) / 1000);
+                        }
+                        std::printf("hen: gap: %llu ms: %s\n", gap_us / 1000,
+                                    line.empty() ? "nothing counted" : line.c_str());
+                    }
+                    // What the renderer recorded and made between the two frames
+                    // (common/hen_frame_work.h), and the longest time the GPU took to finish a
+                    // frame's drawing among the frames that finished meanwhile: for a gap that is
+                    // one heavy frame, its commands.
+                    {
+                        static unsigned long long work_before[HEN_FRAME_WORK_SLOTS], made_before[HEN_FRAME_WORK_SLOTS];
+                        const unsigned long long gpu_done_ns =
+                            __atomic_exchange_n(&hen_render_latency_gap_max_ns, 0, __ATOMIC_RELAXED);
+                        if (gap_us > 40'000) {
+                            const auto w = [](int k) { return hen_frame_work_total[k] - work_before[k]; };
+                            const auto m = [](int k) { return hen_surface_stats_total[k] - made_before[k]; };
+                            std::printf("hen: gap work: GPU done at most %.1f ms after a flush; %llu passes, clears %llu whole %llu part, "
+                                        "%llu feedback copies (%.1f MiB), scale blits %llu up %llu down, %llu display transfers, "
+                                        "%llu uploads, %llu submits, %llu copies, %llu blits, %llu downloads; images made: %llu under "
+                                        "4 MiB, %llu of 4 to 8, %llu over 8 (%llu scaled anew, %llu draw copies); surfaces: %llu new, "
+                                        "%llu taken back; generic draws: %llu with the depth write (%llu of them because the "
+                                        "depth range cannot carry it), %llu without, %llu vertices, viewports %.2f Mpx (%.2f with "
+                                        "the depth write)\n",
+                                        gpu_done_ns / 1e6, w(HEN_WORK_PASSES), w(HEN_WORK_CLEARS_WHOLE), w(HEN_WORK_CLEARS_PART),
+                                        w(HEN_WORK_FEEDBACK_COPIES), w(HEN_WORK_FEEDBACK_BYTES) / 1048576.0, w(HEN_WORK_SCALE_UP),
+                                        w(HEN_WORK_SCALE_DOWN), w(HEN_WORK_DISPLAY_TRANSFERS), w(HEN_WORK_UPLOADS),
+                                        w(HEN_WORK_SUBMITS), w(HEN_WORK_COPIES), w(HEN_WORK_BLITS), w(HEN_WORK_DOWNLOADS),
+                                        m(HEN_IMAGE_UNDER_4), m(HEN_IMAGE_4_TO_8), m(HEN_IMAGE_OVER_8), m(HEN_IMAGE_SCALE_UP),
+                                        m(HEN_IMAGE_COPY), m(HEN_SURFACE_NEW), m(HEN_SURFACE_RECYCLED_SAME),
+                                        w(HEN_WORK_GENERIC_WITH), w(HEN_WORK_GENERIC_NOT_EXACT), w(HEN_WORK_GENERIC_WITHOUT),
+                                        w(HEN_WORK_GENERIC_VERTICES), w(HEN_WORK_GENERIC_AREA) / 1e6,
+                                        w(HEN_WORK_GENERIC_AREA_WITH) / 1e6);
+                        }
+                        std::memcpy(work_before, hen_frame_work_total, sizeof(work_before));
+                        std::memcpy(made_before, hen_surface_stats_total, sizeof(made_before));
+                    }
+                    std::memcpy(before, totals, sizeof(before));
+                    cpu_before[0] = cpu[0];
+                    cpu_before[1] = cpu[1];
+                    slept_before = slept;
+                }
                 if (gap_us > 70'000) {
                     std::printf("hen: slow: %llu ms between two frames shown\n", gap_us / 1000);
                     hen_blackbox_dump(static_cast<unsigned>(gap_us / 1000));

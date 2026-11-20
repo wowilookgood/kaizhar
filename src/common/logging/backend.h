@@ -27,6 +27,12 @@ void Stop();
 
 void DisableLoggingInTests();
 
+/// (Kaizhar) What the log file's backend holds in its buffer goes to the file now. The
+/// file is otherwise flushed only by a line of level Error or higher, so a program that died
+/// left up to a buffer of its last lines unwritten. Any thread; nothing happens before
+/// Initialize.
+void HenFlushFile();
+
 /**
  * The global filter will prevent any messages from even being processed if they are filtered.
  */

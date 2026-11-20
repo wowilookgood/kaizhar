@@ -102,6 +102,11 @@ public:
         });
     }
 
+    /// (hen) Nothing queued and nothing running, at this instant.
+    bool HenIdle() const noexcept {
+        return work_done.load() >= work_scheduled.load();
+    }
+
     const std::size_t NumWorkers() const noexcept {
         return threads.size();
     }

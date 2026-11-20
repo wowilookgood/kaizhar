@@ -97,6 +97,9 @@ private:
     /// of known system titles to determine the region.
     void ParseRegionLockoutInfo(u64 program_id);
 
+    /// (Kaizhar) icon, banner, logo: through the launch cache when this loader may use it.
+    ResultStatus HenReadSection(const char* name, std::vector<u8>& buffer);
+
     /// Detects whether the NCCH contains GBA Virtual Console.
     bool IsGbaVirtualConsole(std::span<const u8> code);
 

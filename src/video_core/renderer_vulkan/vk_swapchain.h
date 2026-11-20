@@ -24,7 +24,13 @@ public:
     void Create(u32 width, u32 height, vk::SurfaceKHR surface, bool low_refresh_rate);
 
     /// Acquires the next image in the swapchain.
-    bool AcquireNextImage();
+    /// (Kaizhar) with_fence: the image's availability comes in a fence, for the caller to
+    /// wait for on the CPU (WaitAcquired), and not in the image_acquired semaphore.
+    bool AcquireNextImage(bool with_fence = false);
+
+    /// (Kaizhar) Waits until the image acquired with a fence may be drawn to: the display
+    /// has let go of it. Call with no lock held.
+    void WaitAcquired();
 
     /// Presents the current image and move to the next one
     void Present();
@@ -99,6 +105,7 @@ private:
     vk::CompositeAlphaFlagBitsKHR composite_alpha;
     std::vector<vk::Image> images;
     std::vector<vk::Semaphore> image_acquired;
+    vk::Fence acquire_fence{VK_NULL_HANDLE}; ///< (Kaizhar) AcquireNextImage(true)
     std::vector<vk::Semaphore> present_ready;
     u32 width = 0;
     u32 height = 0;

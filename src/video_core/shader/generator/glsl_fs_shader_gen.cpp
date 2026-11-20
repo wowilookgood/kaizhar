@@ -183,7 +183,9 @@ vec4 secondary_fragment_color = vec4(0.0);
     if (config.framebuffer.shadow_rendering) {
         WriteShadow();
     } else {
-        out += "gl_FragDepth = depth;\n";
+        if (!config.framebuffer.hen_no_depth_write) {
+            out += "gl_FragDepth = depth;\n";
+        }
         // Round the final fragment color to maintain the PICA's 8 bits of precision
         out += "combiner_output = byteround(combiner_output);\n";
         WriteBlending();
@@ -204,6 +206,13 @@ void FragmentModule::WriteDepth() {
     // original range of [-1, 0]. If the depth range is [0, 1], so all we need to do is
     // un-negate the value to range [-1, 0]. Once we have z_over_w, we can do our own transformation
     // according to PICA specification.
+    if (config.framebuffer.hen_no_depth_write) {
+        // (hen, --early-depth) Z-buffer mode with the scale and offset in the viewport's depth
+        // range: the rasteriser's depth is the PICA depth already (the fog reads it), and
+        // nothing writes gl_FragDepth, so the depth test may come before this shader.
+        out += "float depth = gl_FragCoord.z;\n";
+        return;
+    }
     if (profile.has_minus_one_to_one_range) {
         out += "float z_over_w = -2.0 * gl_FragCoord.z + 1.0;\n";
     } else {
@@ -1860,7 +1869,7 @@ void FillGenericFragmentConfig(const FSConfig& config, FSUniformData& data) {
                              lighting.lut_rb.GetScale(), 0.0f};
 }
 
-std::string GenerateGenericFragmentShader(const Profile& profile) {
+std::string GenerateGenericFragmentShader(const Profile& profile, bool no_depth_write) {
     std::string out;
     out.reserve(32 * 1024);
     if (profile.has_separable_shaders) {
@@ -2078,16 +2087,24 @@ void main() {
 
     // (WriteDepth)
 )";
-    if (profile.has_minus_one_to_one_range) {
-        out += "    float z_over_w = -2.0 * gl_FragCoord.z + 1.0;\n";
+    if (no_depth_write) {
+        // (as FragmentModule::WriteDepth with hen_no_depth_write: Z-buffer mode, the scale and
+        // offset are in the viewport's depth range, so this is the depth the other variant
+        // computes; only fog reads it)
+        out += "    float depth = gl_FragCoord.z;\n";
     } else {
-        out += "    float z_over_w = -gl_FragCoord.z;\n";
-    }
-    out += R"(    float depth = z_over_w * depth_scale + depth_offset;
+        if (profile.has_minus_one_to_one_range) {
+            out += "    float z_over_w = -2.0 * gl_FragCoord.z + 1.0;\n";
+        } else {
+            out += "    float z_over_w = -gl_FragCoord.z;\n";
+        }
+        out += R"(    float depth = z_over_w * depth_scale + depth_offset;
     if (((fb >> 5) & 1) == 0) {
         depth /= gl_FragCoord.w;
     }
-
+)";
+    }
+    out += R"(
     // (DefineTexUnitSampler: each unit once, and only the units something reads)
     g_tex[0] = vec4(0.0);
     g_tex[1] = vec4(0.0);
@@ -2330,8 +2347,11 @@ void main() {
         g_output.rgb = mix(fog_color.rgb, g_output.rgb, fog_factor);
     }
 
-    gl_FragDepth = depth;
-    g_output = byteround(g_output);
+)";
+    if (!no_depth_write) {
+        out += "    gl_FragDepth = depth;\n";
+    }
+    out += R"(    g_output = byteround(g_output);
     color = g_output;
 }
 )";

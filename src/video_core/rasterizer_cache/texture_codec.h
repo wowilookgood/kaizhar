@@ -16,6 +16,20 @@
 #include "video_core/texture/etc1.h"
 #include "video_core/utils.h"
 
+// (Switch 2 port) ETC1 decodes shared with the renderer's shader workers: see MortonCopy.
+// HEN_ETC1_WORKERS is defined for the console build and by the host test (hen/tests/etc1).
+#if defined(__SWITCH__) && !defined(HEN_ETC1_WORKERS)
+#define HEN_ETC1_WORKERS 1
+#endif
+#ifdef HEN_ETC1_WORKERS
+#include <functional>
+#include "video_core/hen_workers.h"
+extern "C" int hen_etc1_workers;                    // hen/jit/hen_jit.c: --no-etc1-workers
+extern "C" unsigned long long hen_etc1_split[2];    // decodes split, their tiles
+/// Fewer tiles than this (128 x 128 pixels) are not worth handing out.
+inline constexpr unsigned HEN_ETC1_MIN_TILES = 256;
+#endif
+
 namespace VideoCore {
 
 template <typename T>
@@ -464,6 +478,49 @@ static constexpr void MortonCopy(u32 width, u32 height, u32 start_offset, u32 en
         const u32 tile_buffer_size = static_cast<u32>(tiled_buffer.size());
         const u32 buffer_end =
             std::min(tiled_offset + aligned_end_offset - aligned_start_offset, tile_buffer_size);
+#ifdef HEN_ETC1_WORKERS
+        // (Switch 2 port, --no-etc1-workers) ETC1 is the one format whose decode is real work
+        // (18% of what the GPU thread did while the emulation thread waited for it in the gaps
+        // of six cold routes). A tile's place in both buffers follows from its
+        // number alone and no tile reads or writes another's bytes, so runs of tiles go to
+        // the shader workers and this thread together (video_core/hen_workers.h): the same
+        // MortonCopyTile on the same spans as the loop below, in another order. Whole tiles
+        // only, which an upload always is (the assertion above).
+        if constexpr (morton_to_linear &&
+                      (format == PixelFormat::ETC1 || format == PixelFormat::ETC1A4)) {
+            const u32 tiles = buffer_end > tiled_offset ? (buffer_end - tiled_offset) / tile_size : 0;
+            const u32 first_tile = begin_pixel_index / 64 + tiled_offset / tile_size;
+            const u32 tiles_per_row = width / 8;
+            // (a range that runs past the last row of tiles is left to the loop below)
+            if (hen_etc1_workers && tiles >= HEN_ETC1_MIN_TILES && width % 8 == 0 && width != 0 &&
+                height % 8 == 0 &&
+                static_cast<u64>(first_tile) + tiles <= static_cast<u64>(tiles_per_row) * (height / 8) &&
+                !std::is_constant_evaluated()) {
+                const u32 run = std::max<u32>(HEN_ETC1_MIN_TILES / 4, (tiles + 15) / 16);
+                const u32 runs = (tiles + run - 1) / run;
+                const u32 tiled_base = tiled_offset;
+                const auto decode_run = [&](u32 index) {
+                    const u32 from = index * run;
+                    const u32 to = std::min(from + run, tiles);
+                    for (u32 i = from; i < to; i++) {
+                        const u32 tile = first_tile + i;
+                        const u32 tile_x = (tile % tiles_per_row) * 8;
+                        const u32 tile_y = (tile / tiles_per_row) * 8;
+                        const u32 offset =
+                            ((height - 8 - tile_y) * width + tile_x) * aligned_bytes_per_pixel;
+                        MortonCopyTile<morton_to_linear, format, converted>(
+                            width, tiled_buffer.subspan(tiled_base + i * tile_size, tile_size),
+                            linear_buffer.subspan(offset, linear_tile_stride));
+                    }
+                };
+                if (HenWorkers::ParallelFor(runs, decode_run)) {
+                    hen_etc1_split[0]++;
+                    hen_etc1_split[1] += tiles;
+                    return; // (an upload has no part tile before or after)
+                }
+            }
+        }
+#endif
         while (tiled_offset < buffer_end) {
             auto linear_data = linear_buffer.subspan(linear_offset, linear_tile_stride);
             auto tiled_data = tiled_buffer.subspan(tiled_offset, tile_size);

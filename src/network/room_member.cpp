@@ -505,7 +505,7 @@ RoomMember::RoomMember() : room_member_impl{std::make_unique<RoomMemberImpl>()} 
 
 RoomMember::~RoomMember() {
     ASSERT_MSG(!IsConnected(), "RoomMember is being destroyed while connected");
-    if (room_member_impl->loop_thread) {
+    if (room_member_impl->loop_thread || room_member_impl->client) {
         Leave();
     }
 }
@@ -680,11 +680,17 @@ void RoomMember::Unbind(CallbackHandle<T> handle) {
 
 void RoomMember::Leave() {
     room_member_impl->SetState(State::Idle);
-    room_member_impl->loop_thread->join();
-    room_member_impl->loop_thread.reset();
-
-    enet_host_destroy(room_member_impl->client);
-    room_member_impl->client = nullptr;
+    // A connection that never came about has no thread, but Join has made the host, and its
+    // socket stays open until the host is destroyed.
+    if (room_member_impl->loop_thread) {
+        room_member_impl->loop_thread->join();
+        room_member_impl->loop_thread.reset();
+    }
+    if (room_member_impl->client) {
+        enet_host_destroy(room_member_impl->client);
+        room_member_impl->client = nullptr;
+        room_member_impl->server = nullptr; // (the peer was the host's)
+    }
 }
 
 template void RoomMember::Unbind(CallbackHandle<WifiPacket>);

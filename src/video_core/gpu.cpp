@@ -29,6 +29,8 @@ extern "C" int hen_gpu_thread; // hen/jit/hen_jit.c: --gpu-thread (see hen_gpu_t
 static constexpr int hen_gpu_thread = 0;
 #endif
 
+extern "C" int hen_assert_test_frame; // hen/jit/hen_jit.c
+
 namespace VideoCore {
 
 constexpr VAddr VADDR_LCD = 0x1ED02000;
@@ -581,6 +583,11 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    // (Kaizhar, development builds: --assert-test N fails a check on purpose at the Nth frame,
+    // to try the port's handling of failed checks on the emulation thread.)
+    if (hen_assert_test_frame > 0 && --hen_assert_test_frame == 0) {
+        ASSERT_MSG(false, "--assert-test");
+    }
     // (Switch 2 port, --gpu-thread) The blank waits for the GPU thread: what the program
     // submitted before it is in the frame that is swapped below, its interrupts are
     // signalled before the blank's, and the swap, the frame limiter and what runs with it

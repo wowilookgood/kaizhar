@@ -518,6 +518,26 @@ ResultStatus Apploader_Artic::Load(std::shared_ptr<Kernel::Process>& process) {
 
         if (cfg.get()) {
             auto cfg_module = cfg->GetModule();
+#ifdef __SWITCH__
+            // (Kaizhar) The Switch 2 port has no settings screen to choose a country on, and a
+            // first link must not stop here: a country that doesn't belong to the linked
+            // console's region becomes the region's usual one (Japan, United States, United
+            // Kingdom, Australia, China, South Korea, Taiwan), saved in the configuration
+            // savegame before the installer and System Settings start and read it.
+            {
+                static constexpr u8 usual_country[7] = {1, 49, 110, 65, 160, 136, 128};
+                const u32 linked_region = cfg_module->GetRegionValue(true);
+                const u8 country_before = cfg_module->GetCountryCode();
+                if (linked_region < 7 &&
+                    !Service::CFG::Module::IsValidRegionCountry(linked_region, country_before)) {
+                    cfg_module->SetCountryCode(usual_country[linked_region]);
+                    cfg_module->UpdateConfigNANDSavegame();
+                    LOG_INFO(Loader,
+                             "Country {} doesn't belong to the linked console's region {}: set to {}",
+                             country_before, linked_region, usual_country[linked_region]);
+                }
+            }
+#endif
             if (!Service::CFG::Module::IsValidRegionCountry(cfg_module->GetRegionValue(true),
                                                             cfg_module->GetCountryCode())) {
                 // Report mismatch to server.

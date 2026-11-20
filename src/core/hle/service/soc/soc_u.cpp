@@ -3,10 +3,16 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <type_traits>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <fmt/format.h>
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -271,8 +277,395 @@ static const std::unordered_map<int, int> gai_error_map = {{
 }};
 
 /// Converts a network error from platform-specific to 3ds-specific
+#if defined(__SWITCH__) && HEN_DEV
+} // namespace Service::SOC
+// (Kaizhar, --trace-sockets, development builds) One line per call of the emulated
+// console's socket service that matters: "hen: soc: <ms> ..." with the service's socket number,
+// addresses as a.b.c.d:port, byte counts, the host's errno and the answer the program gets.
+// A receive with nothing there (EAGAIN) is said the first time for a socket and then every
+// 200th, with the count; a poll that finds nothing likewise.
+extern "C" {
+int hen_trace_sockets = 0;
+}
+namespace Service::SOC {
+namespace {
+void HenSoc(const char* format, ...) __attribute__((format(printf, 1, 2)));
+void HenSoc(const char* format, ...) {
+    static const auto start = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    char text[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    std::printf("hen: soc: %lld ms %s\n", static_cast<long long>(ms), text);
+}
+std::string HenAddr(const sockaddr* address) {
+    if (address == nullptr) {
+        return "(none)";
+    }
+    if (address->sa_family != AF_INET) {
+        return fmt::format("(family {})", static_cast<int>(address->sa_family));
+    }
+    const auto* in = reinterpret_cast<const sockaddr_in*>(address);
+    const u8* b = reinterpret_cast<const u8*>(&in->sin_addr);
+    return fmt::format("{}.{}.{}.{}:{}", b[0], b[1], b[2], b[3], ntohs(in->sin_port));
+}
+/// An address as the emulated console has it: length, family, port (big endian), four bytes.
+std::string HenCtrAddr(const std::vector<u8>& raw) {
+    if (raw.size() < 8) {
+        return "(none)";
+    }
+    return fmt::format("{}.{}.{}.{}:{}", raw[4], raw[5], raw[6], raw[7], (raw[2] << 8) | raw[3]);
+}
+std::unordered_map<u32, u32> hen_soc_quiet; ///< socket -> receives with nothing there in a row
+u32 hen_poll_quiet = 0;
+} // namespace
+#define HEN_SOC(...)                                                                               \
+    do {                                                                                           \
+        if (hen_trace_sockets) {                                                                   \
+            HenSoc(__VA_ARGS__);                                                                   \
+        }                                                                                          \
+    } while (0)
+#else
+#define HEN_SOC(...)                                                                               \
+    do {                                                                                           \
+    } while (0)
+#endif
+
+} // namespace Service::SOC
+
+// (Kaizhar) The online connection record, in every build: what the emulated console's
+// sockets did, written to the emulator's log file (kaizhar_log.txt) as "online:" lines and
+// counted for a line in last-session.txt. Without it a release build's log holds nothing after
+// the name lookups of Mario Kart 7's NAT check. Per socket: the port asked
+// for and the port the host gave, the first packet to and from every address, counts and byte
+// totals when the socket closes, errors with the host's code, a line for an address that was
+// sent to ten times and never answered; for the two NAT-check servers (names beginning nncs)
+// the replies' words, and whether both servers saw the same address and port. Never: packet
+// contents other than those sixteen bytes' fields, names of accounts, tokens. Addresses outside
+// the private ranges have their last two numbers hidden unless multiplayer.txt has
+// online_log=full.
+extern "C" {
+int hen_online_log_full = 0;
+}
+namespace Service::SOC::HenOnline {
+namespace {
+struct Peer {
+    u32 ip = 0; ///< as its four bytes in network order
+    u16 port = 0;
+    u32 sent = 0, received = 0;
+    u64 sent_bytes = 0, received_bytes = 0;
+    bool said_silent = false;
+};
+struct Sock {
+    bool udp = false, bound = false;
+    u32 pid = 0;
+    u16 asked_port = 0, host_port = 0;
+    std::vector<Peer> peers;
+    u32 more_peers = 0, send_errors = 0, receive_errors = 0;
+};
+std::mutex mutex;
+std::unordered_map<long long, Sock> socks;
+bool said_start = false;
+struct Nat {
+    u32 ip = 0;
+    u32 probes = 0, replies = 0;
+    u32 words[4] = {};
+    bool have = false;
+} nat[2];
+unsigned nat_known = 0;
+struct {
+    u32 udp_sockets = 0, tcp_connects = 0, tcp_failed = 0, peers_tried = 0, peers_answered = 0, send_errors = 0,
+        receive_errors = 0, port_differs = 0, lookups = 0;
+} total;
+const auto origin = std::chrono::steady_clock::now();
+
+double Seconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count();
+}
+bool Private(const u8* b) {
+    return b[0] == 10 || b[0] == 127 || (b[0] == 172 && (b[1] & 0xF0) == 16) || (b[0] == 192 && b[1] == 168) ||
+           (b[0] == 169 && b[1] == 254) || b[0] == 0;
+}
+std::string Address(u32 ip, u16 port) {
+    const u8* b = reinterpret_cast<const u8*>(&ip);
+    if (hen_online_log_full || Private(b)) {
+        return fmt::format("{}.{}.{}.{}:{}", b[0], b[1], b[2], b[3], port);
+    }
+    return fmt::format("{}.{}.x.x:{}", b[0], b[1], port);
+}
+void Start() {
+    if (!said_start) {
+        said_start = true;
+        LOG_INFO(Service_SOC,
+                 "online: record of the emulated console's sockets; addresses outside private networks are shown "
+                 "as a.b.x.x:port (online_log=full in /switch/Kaizhar/multiplayer.txt shows them whole); times are "
+                 "seconds since the first socket");
+    }
+}
+Nat* NatOf(u32 ip) {
+    for (unsigned i = 0; i < nat_known; i++) {
+        if (nat[i].ip == ip) {
+            return &nat[i];
+        }
+    }
+    return nullptr;
+}
+Peer* PeerOf(Sock& sock, u32 ip, u16 port) {
+    for (Peer& peer : sock.peers) {
+        if (peer.ip == ip && peer.port == port) {
+            return &peer;
+        }
+    }
+    if (sock.peers.size() >= 48) {
+        sock.more_peers++;
+        return nullptr;
+    }
+    sock.peers.push_back({ip, port});
+    return &sock.peers.back();
+}
+} // namespace
+
+void Socket(long long fd, u32 pid, bool udp) {
+    std::scoped_lock lock{mutex};
+    Start();
+    Sock& sock = socks[fd];
+    sock = {};
+    sock.udp = udp;
+    sock.pid = pid;
+    total.udp_sockets += udp;
+}
+
+void Bound(long long fd, const sockaddr_in& asked, int host_error) {
+    std::scoped_lock lock{mutex};
+    Sock& sock = socks[fd];
+    sock.asked_port = ntohs(asked.sin_port);
+    if (host_error != 0) {
+        LOG_INFO(Service_SOC, "online: {:.3f} s: {} socket of process {}: bind to port {} failed, host error {} ({})",
+                 Seconds(), sock.udp ? "UDP" : "TCP", sock.pid, sock.asked_port, host_error, std::strerror(host_error));
+        return;
+    }
+    sockaddr_in got{};
+    socklen_t got_len = sizeof(got);
+    if (::getsockname(static_cast<int>(fd), reinterpret_cast<sockaddr*>(&got), &got_len) == 0) {
+        sock.host_port = ntohs(got.sin_port);
+    }
+    sock.bound = true;
+    const bool differs = sock.asked_port != 0 && sock.host_port != sock.asked_port;
+    total.port_differs += differs;
+    LOG_INFO(Service_SOC, "online: {:.3f} s: {} socket of process {}: asked for local port {}, the host gave port {}{}",
+             Seconds(), sock.udp ? "UDP" : "TCP", sock.pid, sock.asked_port, sock.host_port,
+             differs ? " (NOT the port asked for)" : sock.asked_port == 0 ? " (any port was asked for)" : "");
+}
+
+/// ret: the host's result (bytes, or negative with host_error).
+void Sent(long long fd, bool has_address, u32 ip, u16 port, int ret, int host_error) {
+    std::scoped_lock lock{mutex};
+    const auto found = socks.find(fd);
+    if (found == socks.end()) {
+        return;
+    }
+    Sock& sock = found->second;
+    if (ret < 0) {
+        if (host_error != EAGAIN && host_error != EWOULDBLOCK) {
+            total.send_errors++;
+            if (sock.send_errors++ < 8) {
+                LOG_INFO(Service_SOC, "online: {:.3f} s: {} socket (local port {}): send to {} failed, host error {} ({})",
+                         Seconds(), sock.udp ? "UDP" : "TCP", sock.host_port,
+                         has_address ? Address(ip, port) : std::string("its peer"), host_error, std::strerror(host_error));
+            }
+        }
+        return;
+    }
+    if (!sock.udp || !has_address) {
+        return;
+    }
+    if (Nat* server = NatOf(ip)) {
+        server->probes++;
+    }
+    Peer* peer = PeerOf(sock, ip, port);
+    if (peer == nullptr) {
+        return;
+    }
+    peer->sent++;
+    peer->sent_bytes += static_cast<u64>(ret);
+    if (peer->sent == 1) {
+        total.peers_tried++;
+        LOG_INFO(Service_SOC, "online: {:.3f} s: UDP socket (local port {}): first packet to {}, {} bytes{}", Seconds(),
+                 sock.host_port, Address(ip, port), ret, NatOf(ip) != nullptr ? " (a NAT-check server)" : "");
+    } else if (peer->sent == 10 && peer->received == 0 && !peer->said_silent) {
+        peer->said_silent = true;
+        LOG_INFO(Service_SOC, "online: {:.3f} s: UDP socket (local port {}): {} has been sent 10 packets and has not answered",
+                 Seconds(), sock.host_port, Address(ip, port));
+    }
+}
+
+void Received(long long fd, u32 ip, u16 port, int ret, int host_error, const u8* data) {
+    std::scoped_lock lock{mutex};
+    const auto found = socks.find(fd);
+    if (found == socks.end()) {
+        return;
+    }
+    Sock& sock = found->second;
+    if (ret < 0) {
+        if (host_error != 0 && host_error != EAGAIN && host_error != EWOULDBLOCK) {
+            total.receive_errors++;
+            if (sock.receive_errors++ < 8) {
+                LOG_INFO(Service_SOC, "online: {:.3f} s: {} socket (local port {}): receive failed, host error {} ({})",
+                         Seconds(), sock.udp ? "UDP" : "TCP", sock.host_port, host_error, std::strerror(host_error));
+            }
+        }
+        return;
+    }
+    if (!sock.udp || ret == 0) {
+        return;
+    }
+    if (Nat* server = NatOf(ip); server != nullptr && ret >= 16 && data != nullptr) {
+        server->replies++;
+        u32 words[4];
+        for (int i = 0; i < 4; i++) {
+            words[i] = (u32(data[4 * i]) << 24) | (u32(data[4 * i + 1]) << 16) | (u32(data[4 * i + 2]) << 8) | data[4 * i + 3];
+        }
+        if (!server->have || std::memcmp(server->words + 1, words + 1, 12) != 0) {
+            // (what the fields are is from memory of the protocol, not from its source: a type,
+            // then the port and the address the server saw the packet come from, then the
+            // console's own port. Printed as numbers so that a reader can judge.)
+            const u32 seen_ip = htonl(words[2]);
+            LOG_INFO(Service_SOC,
+                     "online: {:.3f} s: NAT check: reply from server {} ({}): words {:08x} {:08x} [{}] {:08x}; read as: "
+                     "the server saw port {} at {}; our local port is {}{}",
+                     Seconds(), static_cast<int>(server - nat) + 1, Address(ip, port), words[0], words[1],
+                     Address(seen_ip, static_cast<u16>(words[1])), words[3], words[1],
+                     Address(seen_ip, static_cast<u16>(words[1])), sock.host_port,
+                     words[1] == sock.host_port ? " (the same port: the router kept it)" : " (another port: the router changed it)");
+        }
+        std::memcpy(server->words, words, sizeof(words));
+        server->have = true;
+        if (nat[0].have && nat[1].have && nat[0].replies + nat[1].replies <= 4) {
+            const bool same = std::memcmp(nat[0].words + 1, nat[1].words + 1, 8) == 0;
+            LOG_INFO(Service_SOC, "online: {:.3f} s: NAT check: the two servers saw {}", Seconds(),
+                     same ? "the same address and port (a router that keeps one mapping: other consoles can reach it)"
+                          : "DIFFERENT addresses or ports (a mapping per destination, \"symmetric\": other consoles "
+                            "usually cannot reach this one)");
+        }
+    }
+    Peer* peer = PeerOf(sock, ip, port);
+    if (peer == nullptr) {
+        return;
+    }
+    peer->received++;
+    peer->received_bytes += static_cast<u64>(ret);
+    if (peer->received == 1) {
+        total.peers_answered++;
+        LOG_INFO(Service_SOC, "online: {:.3f} s: UDP socket (local port {}): first packet from {}, {} bytes (after {} sent to it)",
+                 Seconds(), sock.host_port, Address(ip, port), ret, peer->sent);
+    }
+}
+
+void Connected(long long fd, const sockaddr_in& to, int host_error) {
+    std::scoped_lock lock{mutex};
+    const auto found = socks.find(fd);
+    const bool udp = found != socks.end() && found->second.udp;
+    if (!udp) {
+        total.tcp_connects++;
+        total.tcp_failed += host_error != 0 && host_error != EINPROGRESS;
+    }
+    LOG_INFO(Service_SOC, "online: {:.3f} s: {} connect to {}: {}", Seconds(), udp ? "UDP" : "TCP",
+             Address(to.sin_addr.s_addr, ntohs(to.sin_port)),
+             host_error == 0 ? std::string("ok")
+                             : host_error == EINPROGRESS ? std::string("in progress")
+                                                         : fmt::format("host error {} ({})", host_error, std::strerror(host_error)));
+}
+
+void Closed(long long fd) {
+    std::scoped_lock lock{mutex};
+    const auto found = socks.find(fd);
+    if (found == socks.end()) {
+        return;
+    }
+    const Sock& sock = found->second;
+    if (sock.udp && !sock.peers.empty()) {
+        u32 answered = 0;
+        u64 sent = 0, received = 0;
+        for (const Peer& peer : sock.peers) {
+            answered += peer.received != 0;
+            sent += peer.sent_bytes;
+            received += peer.received_bytes;
+        }
+        LOG_INFO(Service_SOC,
+                 "online: {:.3f} s: UDP socket (local port {}) closed: {} addresses sent to, {} answered; {} bytes sent, {} "
+                 "received; {} send and {} receive errors{}",
+                 Seconds(), sock.host_port, sock.peers.size(), answered, sent, received, sock.send_errors, sock.receive_errors,
+                 sock.more_peers != 0 ? "; more addresses than the record keeps" : "");
+        for (const Peer& peer : sock.peers) {
+            LOG_INFO(Service_SOC, "online:   {}: {} packets, {} bytes sent; {} packets, {} bytes received{}", Address(peer.ip, peer.port),
+                     peer.sent, peer.sent_bytes, peer.received, peer.received_bytes, peer.received == 0 ? "  NEVER ANSWERED" : "");
+        }
+    }
+    socks.erase(found);
+}
+
+void LookedUp(const char* asked, const char* as, const hostent* result) {
+    std::scoped_lock lock{mutex};
+    Start();
+    total.lookups++;
+    u32 ip = 0;
+    if (result != nullptr && result->h_addr_list != nullptr && result->h_addr_list[0] != nullptr) {
+        std::memcpy(&ip, result->h_addr_list[0], 4);
+    }
+    LOG_INFO(Service_SOC, "online: {:.3f} s: name {}{} -> {}", Seconds(), asked,
+             std::strcmp(asked, as) != 0 ? fmt::format(" (looked up as {})", as) : std::string(),
+             ip != 0 ? Address(ip, 0) : std::string("NO ADDRESS"));
+    if (std::strncmp(asked, "nncs", 4) == 0 && ip != 0) {
+        const unsigned index = asked[4] == '2' ? 1 : 0;
+        nat[index] = {};
+        nat[index].ip = ip;
+        nat_known = std::max(nat_known, index + 1);
+    }
+}
+} // namespace Service::SOC::HenOnline
+
+// For last-session.txt: counts and outcomes only, nothing that names a network. 0: nothing to say.
+extern "C" int hen_online_summary(char* out, unsigned long size) {
+    using namespace Service::SOC::HenOnline;
+    std::scoped_lock lock{mutex};
+    if (!said_start || size == 0) {
+        return 0;
+    }
+    std::string nat_text = "not seen";
+    if (nat_known != 0) {
+        const u32 probes = nat[0].probes + nat[1].probes, replies = nat[0].replies + nat[1].replies;
+        nat_text = fmt::format("{} of {} probes answered", replies, probes);
+        if (nat[0].have && nat[1].have) {
+            nat_text += std::memcmp(nat[0].words + 1, nat[1].words + 1, 8) == 0 ? ", both servers saw the same mapping"
+                                                                               : ", the servers saw different mappings (symmetric)";
+        } else if (replies == 0 && probes != 0) {
+            nat_text += " (no reply at all)";
+        }
+    }
+    const std::string text = fmt::format(
+        "online: NAT check: {}; UDP sockets {}; local ports the host changed {}; addresses sent to {}, answered {}; send "
+        "errors {}, receive errors {}; TCP connections {} ({} failed); name lookups {}",
+        nat_text, total.udp_sockets, total.port_differs, total.peers_tried, total.peers_answered, total.send_errors,
+        total.receive_errors, total.tcp_connects, total.tcp_failed, total.lookups);
+    std::snprintf(out, size, "%s", text.c_str());
+    return 1;
+}
+
+namespace Service::SOC {
+
 static int TranslateError(int error) {
     const auto& found = error_map.find(error);
+#if defined(__SWITCH__) && HEN_DEV
+    if (hen_trace_sockets && error != EAGAIN && error != EWOULDBLOCK) {
+        HenSoc("  host errno %d (%s) -> %s", error, std::strerror(error),
+               found != error_map.end() ? fmt::format("3DS -{}", found->second).c_str()
+                                        : "NOT IN THE TABLE: handed on as it is");
+    }
+#endif
     if (found != error_map.end()) {
         return -found->second;
     }
@@ -868,6 +1261,10 @@ void SOC_U::Socket(Kernel::HLERequestContext& ctx) {
         ret = socketHandle;
     }
 
+    if (static_cast<s32>(ret) > 0 && created_sockets.contains(socketHandle)) {
+        HenOnline::Socket(static_cast<long long>(created_sockets[socketHandle].socket_fd), pid, type == SOCK_DGRAM);
+    }
+    HEN_SOC("socket: process %u, %s -> %d", pid, type == SOCK_DGRAM ? "UDP" : "TCP", static_cast<s32>(ret));
     LOG_DEBUG(Service_SOC, "called, pid={}, ret={}", pid, static_cast<s32>(ret));
 
     rb.Push(ResultSuccess);
@@ -893,10 +1290,19 @@ void SOC_U::Bind(Kernel::HLERequestContext& ctx) {
     auto [sock_addr, sock_addr_len] = CTRSockAddr::ToPlatform(ctr_sock_addr);
 
     s32 ret = ::bind(holder.socket_fd, reinterpret_cast<sockaddr*>(&sock_addr), sock_addr_len);
+    {
+        const int bind_error = ret != 0 ? GET_ERRNO : 0;
+        sockaddr_in asked{};
+        std::memcpy(&asked, &sock_addr, std::min(sizeof(asked), sizeof(sock_addr)));
+        HenOnline::Bound(static_cast<long long>(holder.socket_fd), asked, bind_error);
+        errno = bind_error;
+    }
 
     if (ret != 0)
         ret = TranslateError(GET_ERRNO);
 
+    HEN_SOC("bind: socket %u to %s -> %d", socket_handle,
+            HenAddr(reinterpret_cast<sockaddr*>(&sock_addr)).c_str(), ret);
     LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, ret={}", pid, socket_handle,
               static_cast<s32>(ret));
 
@@ -1093,6 +1499,8 @@ void SOC_U::GetHostId(Kernel::HLERequestContext& ctx) {
         host_id = info->address;
     }
 
+    HEN_SOC("gethostid -> %u.%u.%u.%u", host_id & 0xFF, (host_id >> 8) & 0xFF, (host_id >> 16) & 0xFF,
+            host_id >> 24);
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
     rb.Push(host_id);
@@ -1110,6 +1518,7 @@ void SOC_U::Close(Kernel::HLERequestContext& ctx) {
     SocketHolder& holder = socket_holder_optional->get();
 
     s32 ret = 0;
+    HenOnline::Closed(static_cast<long long>(holder.socket_fd));
     ret = closesocket(holder.socket_fd);
 
     if (ret != 0) {
@@ -1118,6 +1527,7 @@ void SOC_U::Close(Kernel::HLERequestContext& ctx) {
         created_sockets.erase(socket_handle);
     }
 
+    HEN_SOC("close: socket %u -> %d", socket_handle, ret);
     LOG_DEBUG(Service_SOC, "pid={}, fd={}, ret={}", pid, socket_handle, static_cast<s32>(ret));
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
@@ -1173,6 +1583,18 @@ void SOC_U::SendToOther(Kernel::HLERequestContext& ctx) {
     }
 
     const auto send_error = (ret == SOCKET_ERROR_VALUE) ? GET_ERRNO : 0;
+    {
+        u32 to_ip = 0;
+        const bool has_to = addr_len >= 8 && dest_addr_buffer.size() >= 8;
+        if (has_to) {
+            std::memcpy(&to_ip, dest_addr_buffer.data() + 4, 4);
+        }
+        HenOnline::Sent(static_cast<long long>(holder.socket_fd), has_to, to_ip,
+                        has_to ? static_cast<u16>((dest_addr_buffer[2] << 8) | dest_addr_buffer[3]) : u16(0), ret, send_error);
+    }
+    HEN_SOC("sendto: socket %u, %u bytes to %s, flags %x -> %d%s", socket_handle, len,
+            addr_len >= 8 ? HenCtrAddr(dest_addr_buffer).c_str() : "(its peer)", flags, ret,
+            ret < 0 ? fmt::format(" (host errno {})", send_error).c_str() : "");
 
 #ifdef _WIN32
     if (dont_wait && was_blocking) {
@@ -1224,6 +1646,19 @@ s32 SOC_U::SendToImpl(SocketHolder& holder, u32 len, u32 flags, u32 addr_len,
     }
 
     auto send_error = (ret == SOCKET_ERROR_VALUE) ? GET_ERRNO : 0;
+    {
+        u32 to_ip = 0;
+        const bool has_to = addr_len >= 8 && dest_addr_buff != nullptr;
+        if (has_to) {
+            std::memcpy(&to_ip, dest_addr_buff + 4, 4);
+        }
+        HenOnline::Sent(static_cast<long long>(holder.socket_fd), has_to, to_ip,
+                        has_to ? static_cast<u16>((dest_addr_buff[2] << 8) | dest_addr_buff[3]) : u16(0), ret, send_error);
+    }
+    HEN_SOC("sendto: fd %d, %u bytes to %s, flags %x -> %d%s", static_cast<int>(holder.socket_fd), len,
+            addr_len >= 8 ? HenCtrAddr(std::vector<u8>(dest_addr_buff, dest_addr_buff + 8)).c_str()
+                          : "(its peer)",
+            flags, ret, ret < 0 ? fmt::format(" (host errno {})", send_error).c_str() : "");
 
 #ifdef _WIN32
     if (dont_wait && was_blocking) {
@@ -1388,6 +1823,36 @@ void SOC_U::RecvFromOther(Kernel::HLERequestContext& ctx) {
 #else
             (void)this;
 #endif
+            {
+                // (the address is as the emulated console gets it: port at 2, four bytes at 4)
+                u32 from_ip = 0;
+                u16 from_port = 0;
+                if (async_data->addr_buff.size() >= 8) {
+                    std::memcpy(&from_ip, async_data->addr_buff.data() + 4, 4);
+                    from_port = static_cast<u16>((async_data->addr_buff[2] << 8) | async_data->addr_buff[3]);
+                }
+                HenOnline::Received(static_cast<long long>(async_data->fd_info->socket_fd), from_ip, from_port,
+                                    async_data->recv_error != 0 ? -1 : static_cast<int>(async_data->ret), async_data->recv_error,
+                                    async_data->output_buff.data());
+            }
+#if defined(__SWITCH__) && HEN_DEV
+            if (hen_trace_sockets) {
+                u32& quiet = hen_soc_quiet[async_data->socket_handle];
+                if (async_data->ret == -6) {
+                    if (quiet++ % 200 == 0) {
+                        HenSoc("recvfrom: socket %u, room for %u bytes: nothing there (EAGAIN -> -6), %u time(s) in a row",
+                               async_data->socket_handle, static_cast<u32>(async_data->len), quiet);
+                    }
+                } else {
+                    HenSoc("recvfrom: socket %u, room for %u bytes -> %d from %s%s%s", async_data->socket_handle,
+                           static_cast<u32>(async_data->len), static_cast<s32>(async_data->ret),
+                           HenCtrAddr(async_data->addr_buff).c_str(),
+                           quiet != 0 ? fmt::format(" (after {} with nothing there)", quiet).c_str() : "",
+                           async_data->ret < 0 ? fmt::format(" (host errno {})", async_data->recv_error).c_str() : "");
+                    quiet = 0;
+                }
+            }
+#endif
             LOG_SEND_RECV(Service_SOC, "called, fd={}, ret={}", async_data->socket_handle,
                           static_cast<s32>(async_data->ret));
 
@@ -1510,6 +1975,36 @@ void SOC_U::RecvFrom(Kernel::HLERequestContext& ctx) {
             // Write only the data we received to avoid overwriting parts of the buffer with zeros
             async_data->output_buff.resize(total_received);
 
+            {
+                // (the address is as the emulated console gets it: port at 2, four bytes at 4)
+                u32 from_ip = 0;
+                u16 from_port = 0;
+                if (async_data->addr_buff.size() >= 8) {
+                    std::memcpy(&from_ip, async_data->addr_buff.data() + 4, 4);
+                    from_port = static_cast<u16>((async_data->addr_buff[2] << 8) | async_data->addr_buff[3]);
+                }
+                HenOnline::Received(static_cast<long long>(async_data->fd_info->socket_fd), from_ip, from_port,
+                                    async_data->recv_error != 0 ? -1 : static_cast<int>(async_data->ret), async_data->recv_error,
+                                    async_data->output_buff.data());
+            }
+#if defined(__SWITCH__) && HEN_DEV
+            if (hen_trace_sockets) {
+                u32& quiet = hen_soc_quiet[async_data->socket_handle];
+                if (async_data->ret == -6) {
+                    if (quiet++ % 200 == 0) {
+                        HenSoc("recvfrom: socket %u, room for %u bytes: nothing there (EAGAIN -> -6), %u time(s) in a row",
+                               async_data->socket_handle, static_cast<u32>(async_data->len), quiet);
+                    }
+                } else {
+                    HenSoc("recvfrom: socket %u, room for %u bytes -> %d from %s%s%s", async_data->socket_handle,
+                           static_cast<u32>(async_data->len), static_cast<s32>(async_data->ret),
+                           HenCtrAddr(async_data->addr_buff).c_str(),
+                           quiet != 0 ? fmt::format(" (after {} with nothing there)", quiet).c_str() : "",
+                           async_data->ret < 0 ? fmt::format(" (host errno {})", async_data->recv_error).c_str() : "");
+                    quiet = 0;
+                }
+            }
+#endif
             LOG_SEND_RECV(Service_SOC, "called, fd={}, ret={}", async_data->socket_handle,
                           static_cast<s32>(async_data->ret));
 
@@ -1594,6 +2089,27 @@ void SOC_U::Poll(Kernel::HLERequestContext& ctx) {
             rb.Push(async_data->ret);
             rb.PushStaticBuffer(std::move(output_fds), 0);
 
+#if defined(__SWITCH__) && HEN_DEV
+            if (hen_trace_sockets) {
+                if (async_data->ret == 0) {
+                    if (hen_poll_quiet++ % 200 == 0) {
+                        HenSoc("poll: %u socket(s), first %u, timeout %d ms: nothing ready, %u time(s) in a row",
+                               async_data->nfds, async_data->nfds ? static_cast<u32>(async_data->ctr_fds[0].fd) : 0u,
+                               static_cast<int>(async_data->timeout), hen_poll_quiet);
+                    }
+                } else {
+                    std::string ready;
+                    for (u32 i = 0; i < async_data->nfds && i < 8; i++) {
+                        ready += fmt::format(" {}:{:x}", static_cast<u32>(async_data->ctr_fds[i].fd),
+                                             static_cast<u32>(async_data->platform_pollfd[i].revents));
+                    }
+                    HenSoc("poll: %u socket(s), timeout %d ms -> %d; socket:host revents%s%s", async_data->nfds,
+                           static_cast<int>(async_data->timeout), static_cast<s32>(async_data->ret), ready.c_str(),
+                           hen_poll_quiet != 0 ? fmt::format(" (after {} with nothing ready)", hen_poll_quiet).c_str() : "");
+                    hen_poll_quiet = 0;
+                }
+            }
+#endif
             LOG_POLL(Service_SOC, "called, fd_count={}, ret={}", async_data->nfds,
                      static_cast<s32>(async_data->ret));
         },
@@ -1629,6 +2145,8 @@ void SOC_U::GetSockName(Kernel::HLERequestContext& ctx) {
         dest_addr_buff.resize(max_addr_len);
     }
 
+    HEN_SOC("getsockname: socket %u -> %d, %s", socket_handle, ret,
+            HenAddr(reinterpret_cast<sockaddr*>(&dest_addr)).c_str());
     LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, ret={}", pid, socket_handle,
               static_cast<s32>(ret));
 
@@ -1665,6 +2183,46 @@ void SOC_U::Shutdown(Kernel::HLERequestContext& ctx) {
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
     rb.Push(ret);
+}
+
+// (Kaizhar, hen_soc_rules) Names the emulated console looks up go through the
+// HTTP service's URL replacement rules first, as its HTTP requests' hosts do.
+// Why: on a console set to Pretendo, Pretendo's patch of the socket module rewrites the NAT
+// check servers' names in gethostbyname and getaddrinfo (nncs1/nncs2.app.nintendowifi.net ->
+// .app.pretendo.cc; github.com/PretendoNetwork/nimbus, patches/socket). On Azahar Nimbus only
+// registers rules with the HTTP service ("nintendowifi\.net" -> "pretendo.cc" and two more), and
+// this service is not the console's own module, so the patch never applies: Mario Kart 7 looks
+// up nncs1.app.nintendowifi.net, sends its six 16-byte NAT probes there and gets no answer (a
+// home network that blocks Nintendo's names answers 127.0.0.1; one that does not sends the
+// probes to Nintendo). With the rules applied the name becomes nncs1.app.pretendo.cc.
+// No rules (Nintendo selected in Nimbus, or never used): names stay as they are.
+// --no-soc-rules: not done, to compare.
+} // namespace Service::SOC
+namespace Service::HTTP {
+std::string HenApplyUrlRules(const std::string& host);
+}
+extern "C" {
+int hen_soc_rules = 1;
+}
+namespace Service::SOC {
+static std::string HenLookupName(const char* name) {
+    std::string asked(name);
+    if (!hen_soc_rules || asked.empty()) {
+        return asked;
+    }
+    std::string now = Service::HTTP::HenApplyUrlRules(asked);
+    if (now != asked) {
+        LOG_INFO(Service_SOC, "name lookup: {} is looked up as {} (the URL replacement rules)", asked, now);
+    }
+    return now;
+}
+
+// (Kaizhar) A frontend's own answer to a name the emulated console looks up, asked before the
+// platform's resolver: 1 with an IPv4 address in network byte order. Null (always, outside
+// "Link a 3DS" on the Switch 2 port: citra_switch/guest_dns.h): no such thing. The HTTP
+// service asks it too (http_c.cpp).
+extern "C" {
+int (*hen_guest_lookup)(const char* name, unsigned* ipv4) = nullptr;
 }
 
 static std::vector<u8> HostEntToHostByNameData(struct hostent* result) {
@@ -1727,7 +2285,41 @@ void SOC_U::GetHostByName(Kernel::HLERequestContext& ctx) {
     [[maybe_unused]] u32 out_buf_len = rp.Pop<u32>();
     auto host_name = rp.PopStaticBuffer();
 
-    struct hostent* result = ::gethostbyname(reinterpret_cast<char*>(host_name.data()));
+    struct hostent* result = nullptr;
+    // (Kaizhar) the frontend's answer, if it has one (hen_guest_lookup above)
+    struct hostent own {};
+    in_addr own_address{};
+    char* own_addresses[2] = {reinterpret_cast<char*>(&own_address), nullptr};
+    char* own_aliases[1] = {nullptr};
+    unsigned own_ipv4 = 0;
+    if (hen_guest_lookup != nullptr && !host_name.empty() &&
+        std::find(host_name.begin(), host_name.end(), u8{0}) != host_name.end() &&
+        hen_guest_lookup(reinterpret_cast<const char*>(host_name.data()), &own_ipv4) == 1) {
+        own_address.s_addr = own_ipv4;
+        own.h_name = reinterpret_cast<char*>(host_name.data());
+        own.h_aliases = own_aliases;
+        own.h_addrtype = AF_INET;
+        own.h_length = sizeof(own_address);
+        own.h_addr_list = own_addresses;
+        result = &own;
+    } else if (std::find(host_name.begin(), host_name.end(), u8{0}) != host_name.end()) {
+        const std::string looked_up = HenLookupName(reinterpret_cast<const char*>(host_name.data()));
+        result = ::gethostbyname(looked_up.c_str());
+        HenOnline::LookedUp(reinterpret_cast<const char*>(host_name.data()), looked_up.c_str(), result);
+        HEN_SOC("gethostbyname: %s%s -> %s", reinterpret_cast<const char*>(host_name.data()),
+                looked_up != reinterpret_cast<const char*>(host_name.data())
+                    ? fmt::format(" (looked up as {})", looked_up).c_str()
+                    : "",
+                result != nullptr && result->h_addr_list != nullptr && result->h_addr_list[0] != nullptr
+                    ? fmt::format("{}.{}.{}.{}", static_cast<u8>(result->h_addr_list[0][0]),
+                                  static_cast<u8>(result->h_addr_list[0][1]),
+                                  static_cast<u8>(result->h_addr_list[0][2]),
+                                  static_cast<u8>(result->h_addr_list[0][3]))
+                          .c_str()
+                    : "no address");
+    } else {
+        result = ::gethostbyname(reinterpret_cast<char*>(host_name.data()));
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
     rb.Push(ResultSuccess);
@@ -1827,10 +2419,19 @@ void SOC_U::Connect(Kernel::HLERequestContext& ctx) {
             return 0;
         },
         [async_data](Kernel::HLERequestContext& ctx) {
+            {
+                sockaddr_in to{};
+                std::memcpy(&to, &async_data->input_addr.first, std::min(sizeof(to), sizeof(async_data->input_addr.first)));
+                HenOnline::Connected(static_cast<long long>(async_data->fd_info->socket_fd), to,
+                                     async_data->ret != 0 ? async_data->connect_error : 0);
+            }
             if (async_data->ret != 0) {
                 async_data->ret = TranslateError(async_data->connect_error);
             }
 
+            HEN_SOC("connect: socket %u to %s -> %d", async_data->socket_handle,
+                    HenAddr(reinterpret_cast<sockaddr*>(&async_data->input_addr.first)).c_str(),
+                    static_cast<s32>(async_data->ret));
             LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, ret={}", async_data->pid,
                       async_data->socket_handle, static_cast<s32>(async_data->ret));
 
@@ -1969,6 +2570,8 @@ void SOC_U::SetSockOpt(Kernel::HLERequestContext& ctx) {
         }
     }
 
+    HEN_SOC("setsockopt: socket %u, level %x, option %x, %u bytes -> %d", socket_handle, level,
+            static_cast<u32>(optname), optlen, static_cast<s32>(err));
     LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, ret={}", pid, socket_handle,
               static_cast<s32>(err));
 
@@ -2045,6 +2648,30 @@ void SOC_U::GetAddrInfoImpl(Kernel::HLERequestContext& ctx) {
     const char* node_data = node_length > 0 ? reinterpret_cast<const char*>(node.data()) : nullptr;
     const char* service_data =
         service_length > 0 ? reinterpret_cast<const char*>(service.data()) : nullptr;
+
+    // (Kaizhar) the frontend's answer, if it has one (hen_guest_lookup above): the name becomes
+    // that address, which the platform's resolver takes as it is.
+    char own_node[INET_ADDRSTRLEN] = {};
+    unsigned own_ipv4 = 0;
+    if (hen_guest_lookup != nullptr && node_data != nullptr &&
+        std::find(node.begin(), node.end(), u8{0}) != node.end() &&
+        hen_guest_lookup(node_data, &own_ipv4) == 1) {
+        in_addr own_address{};
+        own_address.s_addr = own_ipv4;
+        if (inet_ntop(AF_INET, &own_address, own_node, sizeof(own_node)) != nullptr) {
+            node_data = own_node;
+        }
+    }
+
+    // (hen_soc_rules, above)
+    std::string hen_node;
+    if (node_data != nullptr && node_data != own_node &&
+        std::find(node.begin(), node.end(), u8{0}) != node.end()) {
+        hen_node = HenLookupName(node_data);
+        HEN_SOC("getaddrinfo: %s%s", node_data,
+                hen_node != node_data ? fmt::format(" (looked up as {})", hen_node).c_str() : "");
+        node_data = hen_node.c_str();
+    }
 
     s32 ret = -1;
     addrinfo* out = nullptr;

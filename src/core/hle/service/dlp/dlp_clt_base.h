@@ -29,8 +29,12 @@ struct DLPServerInfo {
     u16 unk3;    // node bitmask?
     u32 padding; // all zeros
     std::array<DLPNodeInfo, 16> node_info;
-    u32 unk4;
-    u32 unk5;
+    /// The system tick (svcGetSystemTick) at which this server was last heard. Programs compare
+    /// it with the tick now and drop a server that has been silent for some seconds (Mario Kart
+    /// 7: five). It was two unknown words holding a constant, which read as a moment 96 seconds
+    /// after the start: from 101 seconds on, every server found was dropped at once, and no
+    /// local game could be joined any more until the emulated console was restarted.
+    u64 last_heard_tick;
     std::vector<u8> ToBuffer() {
         std::vector<u8> out;
         out.resize(sizeof(DLPServerInfo));
@@ -42,6 +46,11 @@ struct DLPServerInfo {
 static_assert(sizeof(DLPServerInfo) == 0x298);
 
 class DLP_Clt_Base : public DLP_Base {
+public:
+    /// Ends the scan and the connection thread, and waits for the thread. Before the emulated
+    /// system is taken apart: the thread looks services up while it runs.
+    void StopWorker();
+
 protected:
     DLP_Clt_Base(Core::System& s, std::string unique_string_id);
     virtual ~DLP_Clt_Base();
@@ -73,6 +82,11 @@ protected:
     std::vector<std::pair<DLPTitleInfo, DLPServerInfo>> scanned_title_info;
     std::map<Network::MacAddress, bool>
         ignore_servers_list; // ignore servers which give us bad broadcast data
+    /// Times in a row a server was connected to and sent nothing of its announcement in time.
+    /// One such try proves little (a host that has just opened its game, or runs slowly for a
+    /// moment, is late with it): a server is ignored for the rest of the scan after this many.
+    std::map<Network::MacAddress, u32> silent_probes;
+    constexpr static inline u32 max_silent_probes = 5;
     u64 scan_title_id_filter;
     Network::MacAddress scan_mac_address_filter;
     Network::MacAddress host_mac_address;
@@ -105,7 +119,10 @@ protected:
     void CacheBeaconTitleInfo(Network::WifiPacket& beacon);
     int GetCachedTitleInfoIdx(Network::MacAddress mac_addr);
     bool TitleInfoIsCached(Network::MacAddress mac_addr);
-    DLPServerInfo GetDLPServerInfoFromRawBeacon(Network::WifiPacket& beacon);
+    /// is_dlp_network (may be null): whether the beacon announces a download play network. Other
+    /// local wireless networks (a game's own, once it has started) are not ours to look into.
+    DLPServerInfo GetDLPServerInfoFromRawBeacon(Network::WifiPacket& beacon,
+                                                bool* is_dlp_network = nullptr);
     bool NeedsContentDownload(Network::MacAddress mac_addr);
     bool InstallEncryptedCIAFromFragments(std::set<ReceivedFragment>& frags);
     void DisconnectFromServer();

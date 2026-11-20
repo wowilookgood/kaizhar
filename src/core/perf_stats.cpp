@@ -299,11 +299,13 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         Core::System::GetInstance().CoreTiming(),
         duration_cast<microseconds>(now - previous_walltime).count(),
         static_cast<s64>((current_system_time_us - previous_system_time_us).count() / sleep_scale));
+#if HEN_DEV
     // (not counted: more than 5 s behind, which is time in the title list or the app suspended)
     if (frame_limiting_delta_err < -max_lag_time_us &&
         frame_limiting_delta_err > -microseconds(5'000'000)) {
         hen_limiter_given_up_us += (-max_lag_time_us - frame_limiting_delta_err).count();
     }
+#endif
 #endif
     frame_limiting_delta_err =
         std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);

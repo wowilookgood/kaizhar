@@ -29,6 +29,7 @@ EmuWindow_Switch::EmuWindow_Switch() {
         std::scoped_lock lock{input_mutex};
         input_state = {};
     }
+    sw_stick_pointer_reset();
     window_info.type = Frontend::WindowSystemType::Switch;
     window_info.render_surface = sw_window();
     unsigned width, height;
@@ -37,6 +38,12 @@ EmuWindow_Switch::EmuWindow_Switch() {
 }
 
 EmuWindow_Switch::~EmuWindow_Switch() = default;
+
+void EmuWindow_Switch::Relayout() {
+    unsigned width, height;
+    sw_window_size(&width, &height);
+    UpdateCurrentFramebufferLayout(width, height);
+}
 
 sw_input EmuWindow_Switch::Input() {
     // Read by the emulation thread while PollEvents writes.
@@ -51,7 +58,8 @@ void EmuWindow_Switch::PollEvents() {
         std::scoped_lock lock{input_mutex};
         input_state = now;
     }
-    // (The Joy-Con mouse is the stylus when the finger is not on the panel.)
+    // (The Joy-Con mouse, or the right stick as a pointer, is the stylus when the finger is not
+    // on the panel.)
     if (!now.touching && now.pointer && now.pointer_down) {
         const auto& layout = GetFramebufferLayout();
         const auto [x, y] = InBottomScreen(layout, now.pointer_x, now.pointer_y);

@@ -36,12 +36,34 @@ enum HenGfxKind {
     HEN_GFX_KINDS
 };
 
+/// Statements that only feed the development builds' reports are written inside HEN_STAT():
+/// the other builds compile none of them.
+#if defined(__SWITCH__) && HEN_DEV
+#define HEN_STAT(...) __VA_ARGS__
+#else
+#define HEN_STAT(...)
+#endif
+
 #ifdef __SWITCH__
-extern "C" void hen_gfx_note(int kind, unsigned long long ns);
+/// (video_core/renderer_vulkan/vk_graphics_pipeline.cpp) One event of a kind, and its time.
+extern "C" void hen_gfx_count(int kind, unsigned long long ns);
 #if HEN_DEV
+inline void hen_gfx_note(int kind, unsigned long long ns) {
+    hen_gfx_count(kind, ns);
+}
 extern "C" void hen_blackbox_dump(unsigned ms); // hen/jit/hen_jit.c
+#else
+/// A release build reads one kind, the pipelines compiled (the session report): a note of any
+/// other kind is nothing there.
+inline void hen_gfx_note(int kind, unsigned long long ns) {
+    if (kind == HEN_GFX_PIPELINE_COMPILE) {
+        hen_gfx_count(kind, ns);
+    }
+}
 #endif
 /// Adds the time from its construction to its destruction to a counter.
+/// Development builds only (HEN_DEV): a release build reads none of the kinds it is used for.
+#if HEN_DEV
 struct HenGfxTimer {
     explicit HenGfxTimer(int kind_) : kind{kind_}, start{std::chrono::steady_clock::now()} {}
     ~HenGfxTimer() {
@@ -52,6 +74,11 @@ struct HenGfxTimer {
     int kind;
     std::chrono::steady_clock::time_point start;
 };
+#else
+struct HenGfxTimer {
+    explicit HenGfxTimer(int) {}
+};
+#endif
 /// Says so if the time from its construction to its destruction is over the limit: for the
 /// emulation thread's work outside the emulated CPU, where one long call is one stutter.
 /// Development builds only (HEN_DEV): nothing otherwise.

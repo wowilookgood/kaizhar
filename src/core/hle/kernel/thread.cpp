@@ -151,8 +151,16 @@ void Thread::Stop() {
 // call to tell whether the reschedule the call asked for can do anything.
 unsigned long long hen_ready_changes = 0;
 
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" unsigned long long hen_emu_count[12]; // ("hen: emu:": 4 = switches between emulated threads)
+extern "C" unsigned long long hen_wait_count[16]; // ("hen: emu svc:": hen/jit/hen_jit.c)
+#endif
+
 void ThreadManager::SwitchContext(Thread* new_thread) {
     hen_ready_changes++;
+#if defined(__SWITCH__) && HEN_DEV
+    hen_emu_count[4]++;
+#endif
     Thread* previous_thread = GetCurrentThread();
     std::shared_ptr<Process> previous_process = nullptr;
 
@@ -295,6 +303,14 @@ void ThreadManager::ThreadWakeupCallback(u64 thread_id, s64 cycles_late) {
     if (thread->status == ThreadStatus::Running || thread->status == ThreadStatus::Ready) {
         ++hen_wake_not_waiting;
     }
+#if defined(__SWITCH__) && HEN_DEV
+    // ("hen: emu svc:") waits that ended by their timeout: 3 on objects, 5 on an arbiter
+    if (thread->status == ThreadStatus::WaitSynchAny || thread->status == ThreadStatus::WaitSynchAll) {
+        hen_wait_count[3]++;
+    } else if (thread->status == ThreadStatus::WaitArb) {
+        hen_wait_count[5]++;
+    }
+#endif
     if (thread->status == ThreadStatus::WaitSynchAny ||
         thread->status == ThreadStatus::WaitSynchAll || thread->status == ThreadStatus::WaitArb ||
         thread->status == ThreadStatus::WaitHleEvent) {

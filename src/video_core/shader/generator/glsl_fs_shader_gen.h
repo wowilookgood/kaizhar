@@ -106,7 +106,10 @@ std::string GenerateFragmentShader(const FSConfig& config, const UserConfig& use
 /// from the uniform block (FSUniformData::hen_cfg) and does at run time what a generated
 /// shader has decided when it was written. Slower per pixel, there from the start: for a draw
 /// whose own fragment shader is still being compiled. Vulkan only.
-std::string GenerateGenericFragmentShader(const Profile& profile);
+/// no_depth_write: the variant for draws whose depth the viewport's depth range carries (early
+/// depth, FramebufferConfig::hen_no_depth_write): Z-buffer mode only, depth is gl_FragCoord.z
+/// and the shader does not write it.
+std::string GenerateGenericFragmentShader(const Profile& profile, bool no_depth_write = false);
 
 /// (hen) Whether the generic fragment shader draws this configuration as its own would.
 bool GenericFragmentSupports(const FSConfig& config, const UserConfig& user);

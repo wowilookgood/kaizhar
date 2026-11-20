@@ -149,6 +149,7 @@ private:
     vk::ShaderModule cursor_vertex_shader{};
     vk::ShaderModule cursor_fragment_shader{};
     vk::Pipeline cursor_pipeline{};
+    vk::Pipeline cursor_solid_pipeline{}; ///< (Kaizhar) the same without blending: plain black and white
     vk::UniquePipelineLayout cursor_pipeline_layout{};
     bool isSecondaryWindow;
     bool secondaryWindowEnabled;

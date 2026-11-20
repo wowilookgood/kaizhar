@@ -19,17 +19,23 @@ enum {
     SW_MENU_OPTION,  ///< X
     SW_MENU_REFRESH, ///< Y
     SW_MENU_EXIT,    ///< +, or the system asked the app to close
+    SW_MENU_BACK,    ///< B
+    SW_MENU_EXTRA,   ///< -
+    SW_MENU_SETTINGS, ///< L (the title list: its Settings page; nothing in the other lists)
 };
 
 struct sw_menu_item {
     const char* title;
     const char* detail; ///< shown smaller at the right; may be null
+    bool dim;           ///< greyed: something that can't be used now (it can still be chosen)
 };
 
 /// Takes the display for the menu. False if it couldn't.
 bool sw_menu_open(void);
 /// Gives the display back (before a title starts).
 void sw_menu_close(void);
+/// At the program's end: closes the instance and the device the list kept for the session.
+void sw_menu_shutdown(void);
 
 /// Portrait: the menu is drawn for a console held with its left side up (flipped: its right
 /// side), and left and right move the selection.
@@ -40,9 +46,25 @@ void sw_menu_set_portrait(bool portrait, bool flipped);
 int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count, int* selected,
                   const char* option_line, const char* hint_line); ///< hint_line may hold several lines
 
+/// The same for a list that isn't the titles': info_line (may be null) stands where the screens
+/// line does, as it is; empty_text is shown for a list without entries.
+int sw_menu_list(const char* title, const struct sw_menu_item* items, int count, int* selected,
+                 const char* info_line, const char* hint_line, const char* empty_text);
+
+/// A line of text typed with the controller: a grid of characters on the menu's screen, for
+/// where the system's keyboard can't be shown. allowed: the characters offered besides letters
+/// and digits. @returns 1 with the text in out, 0 if cancelled, -1 once the system asks the app
+/// to close
+int sw_menu_text(const char* title, const char* prompt, const char* initial, unsigned max_length,
+                 const char* allowed, char* out, unsigned out_size);
+
 /// Draws a message, with a progress bar if progress is 0..1 (none if negative).
 /// @returns false once the system asks the app to close
 bool sw_menu_message(const char* title, const char* line1, const char* line2, float progress);
+
+/// A page of text, wrapped to the screen (new lines as given), shown until a button is pressed.
+/// @returns SW_MENU_SELECT (A), SW_MENU_BACK (B) or SW_MENU_EXIT
+int sw_menu_page(const char* title, const char* text, const char* hint_line);
 
 /// Waits for A or B. False once the system asks the app to close.
 bool sw_menu_wait_button(void);

@@ -467,8 +467,35 @@ std::string GetTitleMetadataPath(Service::FS::MediaType media_type, u64 tid, boo
  * @param update set true if the incoming TMD should be used instead of the current TMD
  * @returns string path to the .app file
  */
+/// (Kaizhar) A number that changes whenever a title is installed or removed through this
+/// program: what was worked out from the installed titles is good while it stands.
+unsigned HenTitleChanges();
+
+/// (Kaizhar) Which titles are on the emulated console's own storage, found without
+/// opening a file of any of them: the folder names of the title folder (about a dozen folder
+/// listings), and the saved list of installed titles if it fits those names (the list a title
+/// manager scan writes: kaizhar_title_list.txt). For screens of the front end that ask about
+/// a few hundred titles at once (the online setup screen: both system title sets).
+struct HenNandTitles {
+    bool valid = false;           ///< false: nothing is known, every answer comes from the card
+    bool from_saved_list = false; ///< listed is filled
+    const char* why_no_list = ""; ///< why the saved list was not used
+    std::set<u64> folders;        ///< titles whose folder is there
+    std::set<u64> listed;         ///< titles of the saved list: they load, so their metadata is there
+    std::size_t asked_card = 0;   ///< answers that needed the card after all
+    /// The answer of FileUtil::Exists(GetTitleMetadataPath(NAND, tid, false)): from the lists
+    /// where they settle it (no folder: no; in the saved list: yes), from the card otherwise.
+    bool HasMetadata(u64 tid);
+};
+HenNandTitles HenReadNandTitles();
+
 std::string GetTitleContentPath(FS::MediaType media_type, u64 tid, std::size_t index = 0,
                                 bool update = false);
+
+/// (Kaizhar) GetTitleContentPath(media_type, tid) for the code that starts a title: on the
+/// Switch 2 port the answer is kept for the run (am.cpp, hen_content_paths), so starting the
+/// same title again does not list its content folder and read its metadata again.
+std::string GetTitleContentPathForLaunch(FS::MediaType media_type, u64 tid);
 
 /**
  * Get the folder for a title's installed content.
@@ -496,6 +523,8 @@ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_
  * @return result of the uninstall operation
  */
 Result UninstallProgram(const FS::MediaType media_type, const u64 title_id);
+
+class AmListLock;
 
 class Module final {
 public:
@@ -1171,6 +1200,27 @@ private:
      */
     void ScanForAllTitles();
 
+    friend class AmListLock; // (am.cpp: a request's lock on one of the lists)
+    /// (Kaizhar) The scan as the service starts: the tickets, and the installed titles too for a
+    /// system title; for any other title those wait for the first request that needs their list
+    /// (NeedLists).
+    void StartupScan();
+    /// (Kaizhar) A request is about to read one of the lists. If it is the installed titles'
+    /// and they have not been scanned yet, a thread is started to scan them, and this returns
+    /// once that thread holds the list's lock.
+    void NeedLists(const char* request, bool titles);
+    /// (Kaizhar) The saved list of installed titles (am.cpp, SavedTitleListPath). All with
+    /// am_lists_mutex held, but StartTitleScan, which starts the thread that takes it and
+    /// returns once it is held (startup_mutex held by the caller).
+    void StartTitleScan(const char* request, const char* at_start);
+    void ScanTitlesHoldingLock();
+    bool LoadSavedTitleList(const char*& why_not, std::size_t& names_checked);
+    void SaveTitleList();
+    /// The names of the folders in nand's and the SD card's title folder as the last scan (or
+    /// the last check of the saved list) read them, and whether that was a complete reading.
+    std::array<std::vector<std::string>, 2> title_folder_names;
+    std::array<bool, 2> title_folder_names_known{};
+
     Core::System& system;
     bool cia_installing = false;
     bool force_old_device_id = false;
@@ -1180,7 +1230,16 @@ private:
     std::future<void> scan_tickets_future;
     std::future<void> scan_titles_future;
     std::future<void> scan_all_future;
+    /// (Kaizhar) am_title_list's lock, and am_ticket_list's of its own: a request for tickets
+    /// does not wait for the scan of the installed titles (ScanForAllTitles). Where both are
+    /// taken: the tickets' first.
     std::mutex am_lists_mutex;
+    std::mutex am_tickets_mutex;
+    /// (Kaizhar) The whole scan, with both locks held by the caller; the tickets' is let go
+    /// once the tickets are scanned.
+    void ScanAllHoldingLocks(std::unique_lock<std::mutex>& tickets_lock);
+    std::mutex startup_mutex; ///< one request at a time starts the scan of the installed titles
+    std::atomic<bool> titles_pending = false; ///< the installed titles are scanned on first need, not yet
     std::array<std::vector<u64_le>, 3> am_title_list;
     std::multimap<u64, u64> am_ticket_list;
 

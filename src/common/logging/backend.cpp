@@ -287,6 +287,13 @@ public:
         logging_initialized = true;
     }
 #endif
+    /// (Kaizhar: stdio's own lock keeps this apart from the log thread's writes)
+    static void HenFlushFile() {
+        if (instance) {
+            instance->file_backend.Flush();
+        }
+    }
+
     static void Initialize(std::string_view log_file) {
         if (instance) {
             LOG_WARNING(Log, "Reinitializing logging backend");
@@ -581,6 +588,12 @@ void Stop() {
 
 void DisableLoggingInTests() {
     initialization_in_progress_suppress_logging = true;
+}
+
+void HenFlushFile() {
+    if (logging_initialized) {
+        Impl::HenFlushFile();
+    }
 }
 
 void SetGlobalFilter(const Filter& filter) {

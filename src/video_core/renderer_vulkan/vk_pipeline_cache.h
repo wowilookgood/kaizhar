@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <unordered_map>
 
 #include <bitset>
@@ -69,11 +71,7 @@ public:
                      const VideoCore::DiskResourceLoadCallback& callback = {});
 
     /// Binds a pipeline using the provided information
-    /// standin (Switch 2 port): the draw's vertices were shaded on the CPU, so the pipeline has
-    /// the trivial vertex shader. With --substitute, when such a pipeline is not ready yet the
-    /// last one bound with the same state and another fragment shader is used in its place.
-    bool BindPipeline(PipelineInfo& info, bool wait_built = false, bool fast_lane = false,
-                      bool standin = false);
+    bool BindPipeline(PipelineInfo& info, bool wait_built = false, bool fast_lane = false);
 
     /// (Switch 2 port) The pipeline the last BindPipeline that returned false was for.
     GraphicsPipeline* HenPendingPipeline() const {
@@ -99,21 +97,30 @@ public:
     /// (hen) The pipeline with the generic fragment shader for a draw whose vertices were
     /// shaded on the CPU (the trivial vertex shader is current), or null if it is not ready:
     /// the first one for a pair of render target formats is built by a worker.
-    GraphicsPipeline* HenGenericPipeline(PipelineInfo& info);
+    /// no_depth_write: with the variant of the shader that leaves depth to the rasteriser, for
+    /// a draw whose viewport carries the PICA depth range (early depth). Null too while that
+    /// variant is not ready or is switched off: the caller then takes the other one, which
+    /// is right for every draw under the range 0..1.
+    GraphicsPipeline* HenGenericPipeline(PipelineInfo& info, bool no_depth_write = false);
     /// (hen) Binds it (after the configuration is in the uniforms).
-    bool HenBindGeneric(PipelineInfo& info, GraphicsPipeline* pipeline);
+    bool HenBindGeneric(PipelineInfo& info, GraphicsPipeline* pipeline,
+                        bool no_depth_write = false);
     void HenDropUnbuiltGeneric();
     /// (hen) Called for every draw: the first one to a pair of render target formats starts
     /// the generic pipeline for them on a worker, so it is there (about 200 ms later) before
     /// a draw needs it. Whatever vertex shader is current will do: the slow part is the
-    /// fragment shader's, kept for every pipeline that follows.
+    /// fragment shader's, kept for every pipeline that follows. Both variants of the shader
+    /// are started: the first as soon as its module is there, the variant without the depth
+    /// write when it competes with nothing (HenGenericVariantMayStart).
     void HenSeedGeneric(const PipelineInfo& info);
     const Pica::Shader::Profile& HenProfile() const {
         return profile;
     }
 
     /// Binds a fragment shader generated from PICA state
-    void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user);
+    /// (hen) no_depth_write: the variant that leaves depth to the rasteriser (--early-depth)
+    void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
+                           bool no_depth_write = false);
 
     /// Gets the current program ID
     u64 GetProgramID() const {
@@ -137,6 +144,10 @@ private:
 
     /// Stores the generated pipeline cache
     void SaveDriverPipelineDiskCache();
+
+    /// (Switch 2 port) Stores one title's driver pipeline cache. only_if_grown: not written if
+    /// it is as long as when it was read from the card or last written.
+    void HenSaveDriverPipelineCache(u64 program_id, vk::PipelineCache cache, bool only_if_grown);
 
     /// Loads the shader disk cache
     /// Loads the disk cache if no cache is current yet
@@ -175,6 +186,13 @@ private:
 
     Pica::Shader::Profile profile{};
     vk::UniquePipelineCache driver_pipeline_cache;
+    /// (Switch 2 port, hen_driver_cache_keep) The driver pipeline caches of the titles that
+    /// held the GPU right earlier in this run and do not now, by title: see SwitchCache.
+    std::unordered_map<u64, vk::UniquePipelineCache> hen_parked_driver_caches;
+    /// Bytes of each title's driver pipeline cache when it was read from the card or last
+    /// written there.
+    std::unordered_map<u64, std::size_t> hen_driver_cache_bytes;
+    unsigned hen_driver_cache_switches[2]{}; ///< taken from memory, read from the card
     vk::UniquePipelineLayout pipeline_layout;
     std::size_t num_worker_threads;
     Common::ThreadWorker pipeline_workers;
@@ -187,10 +205,17 @@ private:
     /// written to its files.
     std::unordered_map<u64, std::unique_ptr<GraphicsPipeline>> hen_generic_pipelines;
     GraphicsPipeline* hen_forced_pipeline{};
-    /// (the first generic pipeline for each pair of render target formats)
+    /// (the first generic pipeline for each pair of render target formats and each variant
+    /// of the shader: HenGenericTargetsKey)
     std::unordered_map<u64, GraphicsPipeline*> hen_generic_targets;
-    u64 hen_generic_seeded = 0;
-    std::unordered_map<u64, GraphicsPipeline*> hen_substitutes; ///< by state without the fragment shader
+    std::array<u64, 2> hen_generic_seeded{}; ///< (by variant: with, without the depth write)
+    /// (hen) The variant's first pipeline for a pair of render target formats is held
+    /// back until it competes with nothing (HenGenericVariantMayStart): when it was first
+    /// wanted, by HenGenericTargetsKey; how many are being built (one at a time).
+    bool HenGenericVariantMayStart(const PipelineInfo& info);
+    std::unordered_map<u64, std::chrono::steady_clock::time_point> hen_generic_nd_wanted;
+    std::atomic<u32> hen_generic_nd_building{0};
+    std::chrono::steady_clock::time_point hen_created = std::chrono::steady_clock::now();
     std::array<DescriptorHeap, NumDescriptorHeaps> descriptor_heaps;
     std::array<vk::DescriptorSet, NumRasterizerSets> bound_descriptor_sets{};
     std::array<u32, NumDynamicOffsets> offsets{};
@@ -200,6 +225,7 @@ private:
 
     Shader trivial_vertex_shader;
     Shader hen_generic_fragment_shader;
+    Shader hen_generic_nd_fragment_shader; ///< (the variant without the depth write)
 
     u64 current_program_id{0};
     std::vector<std::shared_ptr<ShaderDiskCache>> disk_caches;

@@ -126,6 +126,13 @@ public:
     /// Title ID corresponding to the process
     u64 program_id;
 
+    /// (Kaizhar, Switch 2 port; not saved) A hash of `memory` as the loader made it, for a
+    /// title started while another runs; 0: not known. With the segments' addresses and sizes
+    /// it says whether a later process is the same program at the same addresses, so that the
+    /// translated code of an ended one can be handed on (core/arm/dynarmic/arm_dynarmic.cpp,
+    /// "Parked JITs").
+    u64 hen_image_hash = 0;
+
 private:
     friend class boost::serialization::access;
     template <class Archive>
@@ -134,6 +141,13 @@ private:
 
 class Process final : public Object {
 public:
+    /// (Kaizhar, Switch 2 port) Called once by KernelSystem::CreateProcess, before anything is
+    /// mapped: if the JITs of an ended process that was the same program at the same addresses
+    /// are parked, this process takes that process's page table (emptied), and with it its
+    /// translated code (core/arm/dynarmic/arm_dynarmic.cpp, "Parked JITs"). Other platforms,
+    /// and code sets whose image hash is not known: nothing.
+    void HenParkedJits(const CodeSet& code_set);
+
     explicit Process(Kernel::KernelSystem& kernel);
     ~Process() override;
 

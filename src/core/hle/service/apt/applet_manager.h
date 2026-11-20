@@ -430,6 +430,13 @@ public:
         return app_jump_parameters;
     }
 
+    /// Kaizhar: whether an applet (library applet, system applet, HOME Menu) is the one in
+    /// front, not the application (citra_switch/main.cpp, RightStickRole).
+    bool HenAppletInFront() const {
+        return active_slot == AppletSlot::LibraryApplet || active_slot == AppletSlot::SystemApplet ||
+               active_slot == AppletSlot::HomeMenu;
+    }
+
     ResultVal<Service::FS::MediaType> Unknown54(u32 in_param);
     TargetPlatform GetTargetPlatform();
     ApplicationRunningMode GetApplicationRunningMode();

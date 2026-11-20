@@ -17,7 +17,7 @@ constexpr bool TevOpUsesSource3(TevOperation op) {
            op == TevOperation::AddThenMultiply;
 }
 
-// (hen; the idea is dekopon's, PalindromicBreadLoaf/dekopon, GPLv2.) Zeroes the sources and
+// (hen; the idea is from dekopon, a Switch 1 port of Azahar, GPLv2.) Zeroes the sources and
 // modifiers a stage's operations never read. Both generators write the three operands of
 // every stage out, but the combiner expression only uses those of its operation, so stages
 // that differ in an unread operand compute the same thing. Stage 0 keeps its third source:

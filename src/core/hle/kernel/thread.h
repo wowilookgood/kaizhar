@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <memory>
 #include <span>
 #include <string>
@@ -74,6 +76,14 @@ public:
                         std::shared_ptr<WaitObject> object) = 0;
 
     virtual bool SupportsSerialization() {
+        return true;
+    }
+
+    /// (Kaizhar) Work on another host thread that this callback waits for (a service call's
+    /// file read, say), which uses what the callback holds: true once it has ended, waiting up
+    /// to the time given. True where there is none. Asked when the emulated system shuts down
+    /// with the thread still asleep (System::Shutdown), before the callback is let go.
+    virtual bool HostWorkEnded(std::chrono::milliseconds wait) {
         return true;
     }
 

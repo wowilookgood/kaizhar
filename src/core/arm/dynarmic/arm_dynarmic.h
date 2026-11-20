@@ -6,6 +6,7 @@
 
 #include <map>
 #include <memory>
+#include <vector>
 #include <dynarmic/interface/A32/a32.h>
 #include "common/common_types.h"
 #include "core/arm/arm_interface.h"
@@ -89,6 +90,21 @@ private:
     Dynarmic::A32::Jit* jit = nullptr;
     std::shared_ptr<Memory::PageTable> current_page_table = nullptr;
     std::map<std::shared_ptr<Memory::PageTable>, std::unique_ptr<Dynarmic::A32::Jit>> jits;
+#ifdef __SWITCH__
+    /// Destroys the JITs of processes that have ended (arm_dynarmic.cpp, HenForgetPageTable),
+    /// but for the one in use when called.
+    void HenPurgeEndedJits(const Dynarmic::A32::Jit* in_use);
+    u16 hen_jits_made = 0;
+    /// (arm_dynarmic.cpp, "Parked JITs") JITs of this core that a new process has taken over
+    /// and whose blocks are checked against the new process's code before any of them runs.
+    struct HenTakenOver {
+        Dynarmic::A32::Jit* jit;
+        u64 program_id;
+    };
+    std::vector<HenTakenOver> hen_taken_over;
+    void HenCheckTakenOver();
+    friend struct HenParkAccess;
+#endif
 };
 
 } // namespace Core

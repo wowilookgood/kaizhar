@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include "common/polyfill_thread.h"
@@ -36,6 +37,11 @@ struct Frame {
 
 class PresentWindow final {
 public:
+#ifdef __SWITCH__
+    /// (Kaizhar) A frame's drawing was flushed just now with this scheduler tick: the
+    /// watcher thread times how long the GPU takes to reach it. Never waits.
+    void HenWatchFrame(u64 tick, unsigned long long flush_ns);
+#endif
     explicit PresentWindow(Frontend::EmuWindow& emu_window, const Instance& instance,
                            Scheduler& scheduler, bool low_refresh_rate);
     ~PresentWindow();
@@ -69,8 +75,22 @@ public:
 
 private:
     void PresentThread(std::stop_token token);
+#ifdef __SWITCH__
+    void HenWatchThread(std::stop_token token);
+#endif
 
-    void CopyToSwapchain(Frame* frame);
+    /// acquired: AcquireImage(frame) has been called for this frame already.
+    void CopyToSwapchain(Frame* frame, bool acquired = false);
+    /// (Kaizhar) The first part of CopyToSwapchain: the swapchain brought to the frame's
+    /// size and its next image acquired. With --present-cpu-acquire it also waits, on this
+    /// thread, until the display has let go of that image.
+    void AcquireImage(Frame* frame);
+    /// (Kaizhar, --present-cpu-acquire) Right after a present: the next frame's image is
+    /// acquired and the display's release of it waited for now, while that frame is still being
+    /// made. Present thread only, no lock held.
+    void PreAcquire();
+    /// The acquire and the timed wait of AcquireImage and PreAcquire.
+    void HenWaitAcquired();
 
     vk::RenderPass CreateRenderpass();
 
@@ -96,6 +116,19 @@ private:
     std::mutex queue_mutex;
     std::mutex free_mutex;
     std::jthread present_thread;
+    /// (Kaizhar, under queue_mutex) The present thread has taken a frame from the queue
+    /// and has not finished presenting it: what WaitPresent waits for when the thread does not
+    /// hold swapchain_mutex all the way (--present-cpu-acquire).
+    bool presenting{false};
+    /// (present thread only) PreAcquire's image is waiting for its frame.
+    bool pre_acquired{false};
+#ifdef __SWITCH__
+    // Frames whose drawing the watcher has yet to see finished: tick and flush time.
+    std::mutex hen_watch_mutex;
+    std::condition_variable_any hen_watch_cv;
+    std::deque<std::pair<u64, unsigned long long>> hen_watch_queue;
+    std::jthread hen_watch_thread; // (last: it ends first)
+#endif
     bool vsync_enabled{};
     bool blit_supported;
     bool use_present_thread{true};

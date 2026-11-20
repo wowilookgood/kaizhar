@@ -112,6 +112,13 @@ void FragmentModule::WriteDepth() {
     const Id input_pointer_id{TypePointer(spv::StorageClass::Input, f32_id)};
     const Id gl_frag_coord_z{
         OpLoad(f32_id, OpAccessChain(input_pointer_id, gl_frag_coord_id, ConstU32(2u)))};
+    if (config.framebuffer.hen_no_depth_write) {
+        // (hen, --early-depth) Z-buffer mode with the scale and offset in the viewport's depth
+        // range: the rasteriser's depth is the PICA depth already (the fog reads it). No
+        // FragDepth output and no DepthReplacing: the depth test may come before this shader.
+        depth = gl_frag_coord_z;
+        return;
+    }
     const Id z_over_w{OpFNegate(f32_id, gl_frag_coord_z)};
     const Id depth_scale{GetShaderDataMember(f32_id, ConstS32(2))};
     const Id depth_offset{GetShaderDataMember(f32_id, ConstS32(3))};
@@ -1513,17 +1520,23 @@ void FragmentModule::DefineEntryPoint() {
     const Id main_type{TypeFunction(TypeVoid())};
     const Id main_func{OpFunction(TypeVoid(), spv::FunctionControlMask::MaskNone, main_type)};
 
+    const bool writes_depth = !config.framebuffer.hen_no_depth_write;
     boost::container::small_vector<Id, 11> interface_ids{
-        primary_color_id, texcoord_id[0], texcoord_id[1], texcoord_id[2],   texcoord0_w_id,
-        normquat_id,      view_id,        color_id,       gl_frag_coord_id, gl_frag_depth_id,
+        primary_color_id, texcoord_id[0], texcoord_id[1], texcoord_id[2], texcoord0_w_id,
+        normquat_id,      view_id,        color_id,       gl_frag_coord_id,
     };
+    if (writes_depth) {
+        interface_ids.push_back(gl_frag_depth_id);
+    }
     if (use_fragment_shader_barycentric) {
         interface_ids.push_back(gl_bary_coord_id);
     }
 
     AddEntryPoint(spv::ExecutionModel::Fragment, main_func, "main", interface_ids);
     AddExecutionMode(main_func, spv::ExecutionMode::OriginUpperLeft);
-    AddExecutionMode(main_func, spv::ExecutionMode::DepthReplacing);
+    if (writes_depth) {
+        AddExecutionMode(main_func, spv::ExecutionMode::DepthReplacing);
+    }
 }
 
 void FragmentModule::DefineUniformStructs() {
@@ -1606,9 +1619,11 @@ void FragmentModule::DefineInterface() {
 
     // Define built-ins
     gl_frag_coord_id = DefineVar(vec_ids.Get(4), spv::StorageClass::Input);
-    gl_frag_depth_id = DefineVar(f32_id, spv::StorageClass::Output);
     Decorate(gl_frag_coord_id, spv::Decoration::BuiltIn, spv::BuiltIn::FragCoord);
-    Decorate(gl_frag_depth_id, spv::Decoration::BuiltIn, spv::BuiltIn::FragDepth);
+    if (!config.framebuffer.hen_no_depth_write) {
+        gl_frag_depth_id = DefineVar(f32_id, spv::StorageClass::Output);
+        Decorate(gl_frag_depth_id, spv::Decoration::BuiltIn, spv::BuiltIn::FragDepth);
+    }
     if (use_fragment_shader_barycentric) {
         gl_bary_coord_id = DefineVar(vec_ids.Get(3), spv::StorageClass::Input);
         Decorate(gl_bary_coord_id, spv::Decoration::BuiltIn, spv::BuiltIn::BaryCoordKHR);

@@ -8,8 +8,13 @@
 #include <boost/serialization/vector.hpp>
 #include "common/archives.h"
 #include "core/hle/kernel/client_port.h"
+#include "common/hen_gap.h"
 #include "core/hle/kernel/client_session.h"
+#include "core/hle/kernel/hen_ipc_trace.h"
 #include "core/hle/kernel/hle_ipc.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/process.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/server_session.h"
 #include "core/hle/kernel/session.h"
 #include "core/hle/kernel/thread.h"
@@ -88,6 +93,21 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
     // from its ClientSession, so wake up any threads that may be waiting on a svcReplyAndReceive or
     // similar.
 
+#if HEN_DEV
+    // (Kaizhar) What this thread asks, for the report of the emulated threads (hen_ipc_trace.h).
+    // An application's requests are also traced in the log.
+    if (const auto asking = thread->owner_process.lock()) {
+        u32 asked[5] = {};
+        kernel.memory.ReadBlock(*asking, thread->GetCommandBufferAddress(), asked, sizeof(asked));
+        const bool app = asking->codeset && static_cast<u32>(asking->codeset->program_id >> 32) != 0x00040130;
+        HenIpc::Request(thread->thread_id, asking->process_id, app, hle_handler == nullptr, name, asked,
+                        static_cast<u64>(kernel.timing.GetGlobalTimeUs().count()));
+        if (hle_handler == nullptr) {
+            HenIpc::Pending(thread->thread_id);
+        }
+    }
+#endif
+
     // If this ServerSession has an associated HLE handler, forward the request to it.
     if (hle_handler != nullptr) {
         std::array<u32_le, IPC::COMMAND_BUFFER_LENGTH + 2 * IPC::MAX_STATIC_BUFFERS> cmd_buf;
@@ -103,7 +123,10 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
 #if defined(__SWITCH__) && HEN_DEV
         const unsigned long long hen_t0 = hen_jit_now_ns();
         hle_handler->HandleSyncRequest(*context);
-        if (const unsigned long long took = hen_jit_now_ns() - hen_t0; took > 20'000'000ull) {
+        const unsigned long long hen_took = hen_jit_now_ns() - hen_t0;
+        hen_gap_add(HEN_GAP_SERVICE_CALLS, hen_took);
+        hen_gap_longest(HEN_GAP_LONGEST_SERVICE, hen_took, name.c_str(), static_cast<unsigned>(cmd_buf[0]));
+        if (const unsigned long long took = hen_took; took > 20'000'000ull) {
             // (the emulation thread was in this call: nothing else of the program ran)
             std::printf("hen: slow: %.0f ms in a service call, session %s, command %08x\n", took / 1e6,
                         GetName().c_str(), static_cast<unsigned>(cmd_buf[0]));
@@ -124,6 +147,12 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
             context->WriteToOutgoingCommandBuffer(cmd_buf.data(), *current_process);
             kernel.memory.WriteBlock(*current_process, thread->GetCommandBufferAddress(),
                                      cmd_buf.data(), cmd_buf.size() * sizeof(u32));
+#if HEN_DEV
+            HenIpc::Answer(thread->thread_id, reinterpret_cast<const u32*>(cmd_buf.data()),
+                           static_cast<u64>(kernel.timing.GetGlobalTimeUs().count()));
+        } else {
+            HenIpc::Pending(thread->thread_id);
+#endif
         }
     }
 

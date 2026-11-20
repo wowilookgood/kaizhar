@@ -38,6 +38,17 @@ bool VirtualMemoryArea::CanBeMergedWith(const VirtualMemoryArea& next) const {
         backing_memory.GetPtr() + size != next.backing_memory.GetPtr()) {
         return false;
     }
+    // (Kaizhar) ...and the same block of host memory. Two separate blocks that happen
+    // to lie one after the other in the host's heap passed the test above (the guard pages of two
+    // buffers mapped for one request to a system module that runs as real code, each buffer a
+    // block of its own): the merged area then referred to the first block only, and splitting it
+    // again stepped past that block's end ("Assertion Failed" in MemoryRef::operator+=; Mario Kart
+    // 7's StreetPass screen, cecd:u 0x0007 with two buffers). An area may only grow over memory
+    // its own reference covers.
+    if (type == VMAType::BackingMemory &&
+        backing_memory.GetSize() < static_cast<std::size_t>(size) + next.size) {
+        return false;
+    }
     return true;
 }
 

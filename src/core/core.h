@@ -198,6 +198,12 @@ public:
     /// Prepare the core emulation for a reschedule
     void PrepareReschedule();
 
+    /// (Kaizhar) From a thread other than the emulation thread: asks every emulated
+    /// core to leave generated code at its next block, so that RunLoop returns soon although
+    /// the emulated program is in a long stretch without a system call or an event (the
+    /// frontend's way out of a title must not depend on the title). Nothing if no system runs.
+    void HenKick();
+
     [[nodiscard]] PerfStats::Results GetAndResetPerfStats();
 
     void ReportArticTraffic(u32 bytes) {
@@ -593,6 +599,7 @@ private:
     u64 title_id;
 
     std::mutex signal_mutex;
+    std::mutex hen_kick_mutex; ///< HenKick against the cores being made or destroyed
     Signal current_signal;
     u32 signal_param;
 

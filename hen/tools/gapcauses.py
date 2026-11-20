@@ -34,7 +34,8 @@ def main():
         i = sys.argv.index('--detail'); detail = sys.argv[i + 1]; del sys.argv[i:i + 2]
     elf, logs = sys.argv[1], sys.argv[2:]
     detailed = collections.Counter()
-    tool = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-addr2line'
+    # (the devkit's addr2line: DEVKITPRO, as for the build; its usual place if that is not set)
+    tool = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64/bin/aarch64-none-elf-addr2line')
     gaps, samples = [], []  # samples: (thread, token)
     for log in logs:
         t = open(log, 'rb').read().decode('latin-1').replace('\r', '')

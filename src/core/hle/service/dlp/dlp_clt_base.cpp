@@ -7,8 +7,10 @@
 #include "common/alignment.h"
 #include "common/string_util.h"
 #include "common/timer.h"
+#include "core/core.h"
 #include "core/hle/ipc_helpers.h"
 #include "core/hle/service/am/am.h"
+#include "core/hle/service/hid/hid_test_input.h"
 #include "core/hle/service/nwm/uds_beacon.h"
 
 namespace Service::DLP {
@@ -21,7 +23,14 @@ DLP_Clt_Base::DLP_Clt_Base(Core::System& s, std::string unique_string_id) : DLP_
         });
 }
 
+#ifdef __SWITCH__
+extern "C" void hen_room_step(const char* text); // citra_switch/room_link.h
+#endif
+
 DLP_Clt_Base::~DLP_Clt_Base() {
+#ifdef __SWITCH__
+    hen_room_step("download play client ending");
+#endif
     {
         std::scoped_lock lock(beacon_mutex);
         is_scanning = false;
@@ -29,6 +38,9 @@ DLP_Clt_Base::~DLP_Clt_Base() {
     }
 
     DisconnectFromServer();
+#ifdef __SWITCH__
+    hen_room_step("download play client ended");
+#endif
 }
 
 void DLP_Clt_Base::InitializeCltBase(u32 shared_mem_size, u32 max_beacons, u32 constant_mem_size,
@@ -133,6 +145,7 @@ void DLP_Clt_Base::StartScan(Kernel::HLERequestContext& ctx) {
     // reset scan dependent variables
     scanned_title_info.clear();
     ignore_servers_list.clear();
+    silent_probes.clear();
     title_info_index = 0;
 
     clt_state = DLP_Clt_State::Scanning;
@@ -212,6 +225,18 @@ void DLP_Clt_Base::GetTitleInfoInOrder(Kernel::HLERequestContext& ctx) {
     }
 
     std::vector<u8> buffer = scanned_title_info[title_info_index].first.ToBuffer();
+#ifndef __SWITCH__
+    if (std::getenv("KAIZHAR_TEST_TRACE") != nullptr) {
+        // (all but the icon: the first 0x1D8 bytes, and the last 8)
+        std::string bytes;
+        for (std::size_t i = 0; i < buffer.size(); i++) {
+            if (i < 0x28 || i >= buffer.size() - 8) {
+                bytes += fmt::format("{:02x}", buffer[i]);
+            }
+        }
+        LOG_INFO(Service_DLP, "TRACE title info ({} bytes), head and tail: {}", buffer.size(), bytes);
+    }
+#endif
 
     ++title_info_index;
 
@@ -224,6 +249,7 @@ void DLP_Clt_Base::DeleteScanInfo(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
     LOG_INFO(Service_DLP, "Called");
+    HID::TestInput::TraceDiscard(system); // (tests on a computer: hid_test_input.h)
 
     auto mac_addr = rp.PopRaw<Network::MacAddress>();
 
@@ -259,6 +285,15 @@ void DLP_Clt_Base::GetServerInfo(Kernel::HLERequestContext& ctx) {
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
 
     auto buffer = scanned_title_info[GetCachedTitleInfoIdx(mac_addr)].second.ToBuffer();
+#ifndef __SWITCH__
+    if (std::getenv("KAIZHAR_TEST_TRACE") != nullptr) {
+        std::string bytes;
+        for (std::size_t i = 0; i < buffer.size(); i++) {
+            bytes += fmt::format("{:02x}", buffer[i]);
+        }
+        LOG_INFO(Service_DLP, "TRACE server info ({} bytes): {}", buffer.size(), bytes);
+    }
+#endif
 
     rb.Push(ResultSuccess);
     rb.PushStaticBuffer(std::move(buffer), 0);
@@ -298,6 +333,9 @@ bool DLP_Clt_Base::OnConnectCallback() {
         return false;
     }
 
+    // (a thread of an earlier connection that has ended by itself is still to be joined:
+    // assigning over it would end the program)
+    DisconnectFromServer();
     is_connected = true;
 
     client_connection_worker = std::thread([this] { ClientConnectionManager(); });
@@ -348,7 +386,7 @@ void DLP_Clt_Base::StartSession(Kernel::HLERequestContext& ctx) {
     clt_state = DLP_Clt_State::Joined;
 
     auto uds = GetUDS();
-    NWM::NetworkInfo net_info;
+    NWM::NetworkInfo net_info{}; // (every field: what isn't set below was whatever the stack held)
     net_info.host_mac_address = mac_addr;
     net_info.channel = dlp_net_info_channel;
     net_info.initialized = true;
@@ -469,12 +507,22 @@ void DLP_Clt_Base::BeaconScanCallback(std::uintptr_t user_data, s64 cycles_late)
             auto b = GetDLPServerInfoFromRawBeacon(beacon);
             scanned_title_info[idx].second.clients_joined =
                 b.clients_joined; // we only want to update clients joined
+            // (...and when it was last heard: a program drops a server that has gone silent)
+            scanned_title_info[idx].second.last_heard_tick = b.last_heard_tick;
             continue;
         }
         if (scanned_title_info.size() >= max_title_info) {
             break;
         }
         if (ignore_servers_list[beacon.transmitter_address]) {
+            continue;
+        }
+        // Only download play networks: connecting to any other network as a spectator to ask
+        // for an announcement it doesn't make costs a second of waiting each time, and is no
+        // business of this service.
+        bool is_dlp_network = false;
+        GetDLPServerInfoFromRawBeacon(beacon, &is_dlp_network);
+        if (!is_dlp_network) {
             continue;
         }
 
@@ -495,7 +543,7 @@ void DLP_Clt_Base::CacheBeaconTitleInfo(Network::WifiPacket& beacon) {
 
     auto uds = GetUDS();
 
-    NWM::NetworkInfo net_info;
+    NWM::NetworkInfo net_info{}; // (every field: what isn't set below was whatever the stack held)
     net_info.host_mac_address = beacon.transmitter_address;
     net_info.channel = dlp_net_info_channel;
     net_info.initialized = true;
@@ -553,12 +601,16 @@ void DLP_Clt_Base::CacheBeaconTitleInfo(Network::WifiPacket& beacon) {
     if (!got_all_packets) {
         if (!got_broadcast_packet.size()) {
             // we didn't get ANY packet info from this server
-            // so we add it to the ignore list
-            ignore_servers_list[beacon.transmitter_address] = true;
+            // so we add it to the ignore list, once that has happened several times in a row
+            // (the first try after a host opens its game often comes before its announcement)
+            if (++silent_probes[beacon.transmitter_address] >= max_silent_probes) {
+                ignore_servers_list[beacon.transmitter_address] = true;
+            }
         }
         LOG_ERROR(Service_DLP, "Connected to beacon, but could not receive all dlp packets");
         return;
     }
+    silent_probes.erase(beacon.transmitter_address);
 
     // parse packets into cached DLPServerInfo and DLPTitleInfo
     auto broad_pk1 = reinterpret_cast<DLPBroadcastPacket1*>(broadcast_packet_idx_buf[0].data());
@@ -606,25 +658,41 @@ void DLP_Clt_Base::CacheBeaconTitleInfo(Network::WifiPacket& beacon) {
         std::copy(broad_pk4->icon_part.begin(), broad_pk4->icon_part.end(), icon_copy_loc);
 
     LOG_INFO(Service_DLP, "Got title info");
+#ifndef __SWITCH__
+    if (std::getenv("KAIZHAR_TEST_TRACE") != nullptr) {
+        LOG_INFO(Service_DLP, "TRACE title info: unique id {:#x}, variation {}, version {}, size {}, child {:#x}, "
+                              "server: {} of {} clients",
+                 c_title_info.unique_id, c_title_info.variation, c_title_info.version, c_title_info.size,
+                 static_cast<u64>(broad_pk1->child_title_id), c_server_info.clients_joined,
+                 c_server_info.max_clients);
+    }
+#endif
 
     scanned_title_info.emplace_back(c_title_info, c_server_info);
 
     dlp_status_event->Signal();
 }
 
-DLPServerInfo DLP_Clt_Base::GetDLPServerInfoFromRawBeacon(Network::WifiPacket& beacon) {
+DLPServerInfo DLP_Clt_Base::GetDLPServerInfoFromRawBeacon(Network::WifiPacket& beacon,
+                                                         bool* is_dlp_network) {
+    if (is_dlp_network != nullptr) {
+        *is_dlp_network = false;
+    }
     // get networkinfo from beacon
     auto p_beacon = beacon.data.data();
+    const auto p_end = p_beacon + beacon.data.size();
 
     bool found_net_info = false;
-    NWM::NetworkInfo net_info;
+    NWM::NetworkInfo net_info{}; // (every field: what isn't set below was whatever the stack held)
 
-    // find networkinfo tag
-    for (auto place = p_beacon + sizeof(NWM::BeaconFrameHeader); place < place + beacon.data.size();
+    // find networkinfo tag (within the frame: a beacon without one ended the walk nowhere)
+    for (auto place = p_beacon + sizeof(NWM::BeaconFrameHeader);
+         place + sizeof(NWM::TagHeader) <= p_end;
          place += reinterpret_cast<NWM::TagHeader*>(place)->length + sizeof(NWM::TagHeader)) {
         auto th = reinterpret_cast<NWM::TagHeader*>(place);
         if (th->tag_id == static_cast<u8>(NWM::TagId::VendorSpecific) &&
-            th->length <= sizeof(NWM::NetworkInfoTag) - sizeof(NWM::TagHeader)) {
+            th->length <= sizeof(NWM::NetworkInfoTag) - sizeof(NWM::TagHeader) &&
+            place + sizeof(NWM::TagHeader) + sizeof(NWM::NetworkInfoTag::network_info) <= p_end) {
             // cast to network info and check if correct
             auto ni_tag = reinterpret_cast<NWM::NetworkInfoTag*>(place);
             memcpy(&net_info.oui_value, ni_tag->network_info.data(), ni_tag->network_info.size());
@@ -641,13 +709,22 @@ DLPServerInfo DLP_Clt_Base::GetDLPServerInfoFromRawBeacon(Network::WifiPacket& b
         LOG_ERROR(Service_DLP, "Unable to find network info in beacon payload");
         return DLPServerInfo{};
     }
+    if (is_dlp_network != nullptr) {
+        *is_dlp_network = static_cast<u32>(net_info.wlan_comm_id) == dlp_wlan_comm_id;
+    }
 
     DLPServerInfo srv_info{};
     srv_info.mac_addr = beacon.transmitter_address;
     srv_info.max_clients = net_info.max_nodes;
     srv_info.clients_joined = net_info.total_nodes;
     srv_info.signal_strength = DLPSignalStrength::Strong;
-    srv_info.unk5 = 0x6;
+    srv_info.last_heard_tick = static_cast<u64>(system.GetRunningCore().GetTimer().GetTicks());
+#ifndef __SWITCH__
+    // (tests on a computer: the constant that stood here before, to show the test catching it)
+    if (std::getenv("KAIZHAR_TEST_OLD_SERVER_TICK") != nullptr) {
+        srv_info.last_heard_tick = 0x6ull << 32;
+    }
+#endif
     // TODO: decrypt node info and load it in here
     return srv_info;
 }
@@ -857,6 +934,14 @@ bool DLP_Clt_Base::InstallEncryptedCIAFromFragments(std::set<ReceivedFragment>& 
     }
     cia_file->Close();
     return !install_errored;
+}
+
+void DLP_Clt_Base::StopWorker() {
+    {
+        std::scoped_lock lock(beacon_mutex);
+        is_scanning = false;
+    }
+    DisconnectFromServer();
 }
 
 void DLP_Clt_Base::DisconnectFromServer() {

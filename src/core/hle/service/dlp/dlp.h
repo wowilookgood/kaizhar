@@ -15,4 +15,8 @@ namespace Service::DLP {
 /// Initializes the DLP services.
 void InstallInterfaces(Core::System& system);
 
+/// Ends the services' threads (a hosting or a download in progress) and waits for them. They
+/// look other services up while they run, so this comes first when the system shuts down.
+void StopWorkers(Core::System& system);
+
 } // namespace Service::DLP

@@ -153,6 +153,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/kernel/event.h
     hle/kernel/handle_table.cpp
     hle/kernel/handle_table.h
+    hle/kernel/hen_ipc_trace.cpp
+    hle/kernel/hen_ipc_trace.h
     hle/kernel/hle_ipc.cpp
     hle/kernel/hle_ipc.h
     hle/kernel/ipc.cpp
@@ -326,6 +328,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/service/gsp/gsp_lcd.h
     hle/service/hid/hid.cpp
     hle/service/hid/hid.h
+    hle/service/hid/hid_test_input.cpp
+    hle/service/hid/hid_test_input.h
     hle/service/hid/hid_spvr.cpp
     hle/service/hid/hid_spvr.h
     hle/service/hid/hid_user.cpp
@@ -557,4 +561,13 @@ endif()
 
 if (CITRA_USE_PRECOMPILED_HEADERS)
     target_precompile_headers(citra_core PRIVATE precompiled_headers.h)
+endif()
+
+# (Kaizhar) hen/idbe: the Friend List's title icon request (hen/idbe/README.md).
+if (NINTENDO_SWITCH)
+    target_sources(citra_core PRIVATE
+        ${PROJECT_SOURCE_DIR}/hen/idbe/idbe_passthrough.cpp
+        ${PROJECT_SOURCE_DIR}/hen/idbe/idbe_passthrough.h
+    )
+    target_include_directories(citra_core PUBLIC ${PROJECT_SOURCE_DIR}/hen/idbe)
 endif()

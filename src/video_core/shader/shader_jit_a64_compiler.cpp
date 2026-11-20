@@ -982,7 +982,8 @@ void JitShader::FindReturnOffsets() {
 }
 
 void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_code_,
-                        const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data_) {
+                        const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data_,
+                        bool finalize) {
     program_code = program_code_;
     swizzle_data = swizzle_data_;
 
@@ -1036,6 +1037,17 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
     swizzle_data = nullptr;
     return_offsets.clear();
     return_offsets.shrink_to_fit();
+
+    // (Switch 2 port) A compile on a worker thread stops here, with the code in an ordinary
+    // vector: the executable memory is made by the thread that will run it (HenFinalize).
+    hen_program_offset = program_offset;
+    if (finalize) {
+        HenFinalize();
+    }
+}
+
+void JitShader::HenFinalize() {
+    const std::uintptr_t program_offset = hen_program_offset;
 
     // Copy to executable memory
     const size_t code_size = code_vec.size() * sizeof(u32);

@@ -273,6 +273,16 @@ struct DynamicPipelineInfo {
 
     Common::Rectangle<u32> scissor;
     Common::Rectangle<s32> viewport;
+    // (hen, --early-depth) The viewport's depth range. 0..1 with a fragment shader that writes
+    // depth; the PICA depth offset and offset - scale with one that does not (no_depth_write:
+    // the two kinds of shader must never be exchanged for one another under one range).
+    f32 min_depth = 0.f;
+    f32 max_depth = 1.f;
+    u32 no_depth_write = 0;
+    // (hen) The side of the square of pixels one run of the fragment shader colours: 0 or 1 for
+    // every draw but those of the generic fragment shader, which may take 2 or 4 (coverage and
+    // depth stay per pixel). Only where the device has the dynamic state (Instance::HenCoarseShading).
+    u32 shading_rate = 0;
 
     bool operator==(const DynamicPipelineInfo& other) const noexcept {
         return std::memcmp(this, &other, sizeof(DynamicPipelineInfo)) == 0;
@@ -318,8 +328,13 @@ struct Shader : public Common::AsyncHandle {
 void HenDestroyPipelineParts(vk::Device device);
 #endif
 
-/// (hen) The id of the generic fragment shader in a pipeline's shader ids ("generic").
+/// (hen) The id of the generic fragment shader in a pipeline's shader ids ("generic"), and of
+/// its variant without the depth write (early depth: PipelineCache::HenGenericPipeline).
 inline constexpr u64 HEN_GENERIC_FS_ID = 0x0067656e65726963ull;
+inline constexpr u64 HEN_GENERIC_ND_FS_ID = 0x0167656e65726963ull;
+inline constexpr bool HenIsGenericFs(u64 id) {
+    return id == HEN_GENERIC_FS_ID || id == HEN_GENERIC_ND_FS_ID;
+}
 
 class GraphicsPipeline : public Common::AsyncHandle {
 public:

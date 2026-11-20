@@ -126,6 +126,16 @@ private:
 // Returns true if file filename exists
 [[nodiscard]] bool Exists(const std::string& filename);
 
+#ifdef __SWITCH__
+// (Kaizhar, hen_launch_cache; see file_util.cpp, hen_absent) While a thread is inside a scope,
+// read-only opens and Exists() calls that fail are remembered for the run and answered from
+// memory the next time. +1 to enter, -1 to leave.
+void HenAbsentScope(int delta);
+/// Everything remembered is forgotten (an install or a removal is beginning).
+void HenAbsentClear();
+void HenAbsentStats(unsigned* answered, unsigned* remembered);
+#endif
+
 // Returns true if filename is a directory
 [[nodiscard]] bool IsDirectory(const std::string& filename);
 

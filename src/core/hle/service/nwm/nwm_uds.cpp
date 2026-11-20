@@ -77,16 +77,43 @@ std::list<Network::WifiPacket> NWM_UDS::GetReceivedBeacons(const MacAddress& sen
     return std::move(received_beacons);
 }
 
+#ifdef __SWITCH__
+// citra_switch/room_link.h: counts for the log, and a line for what happens to a network.
+extern "C" void hen_room_frame_sent(int type, int sent);
+extern "C" void hen_room_note(const char* text);
+#define HEN_ROOM_NOTE(...) hen_room_note(fmt::format(__VA_ARGS__).c_str())
+#else
+#define HEN_ROOM_NOTE(...) (void)0
+#endif
+
 /// Sends a WifiPacket to the room we're currently connected to.
 void SendPacket(Network::WifiPacket& packet) {
+    bool sent = false;
     if (auto room_member = Network::GetRoomMember().lock()) {
         if (room_member->GetState() == Network::RoomMember::State::Joined ||
             room_member->GetState() == Network::RoomMember::State::Moderator) {
 
             packet.transmitter_address = room_member->GetMacAddress();
             room_member->SendWifiPacket(packet);
+            sent = true;
         }
     }
+#ifdef __SWITCH__
+    hen_room_frame_sent(static_cast<int>(packet.type), sent ? 1 : 0);
+#else
+    (void)sent;
+#endif
+}
+
+/// Tells everyone that the network this console hosted is gone: a deauthentication frame from
+/// the host. (Clients of builds that don't know the frame from a host ignore it.)
+static void SendHostGone(u8 channel) {
+    Network::WifiPacket deauth;
+    deauth.channel = channel;
+    deauth.data = {};
+    deauth.destination_address = Network::BroadcastMac;
+    deauth.type = Network::WifiPacket::PacketType::Deauthentication;
+    SendPacket(deauth);
 }
 
 u16 NWM_UDS::GetNextAvailableNodeId() {
@@ -243,9 +270,15 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
             node_map[packet.transmitter_address].node_id = node.network_node_id;
             node_map[packet.transmitter_address].connected = true;
             node_map[packet.transmitter_address].spec = false;
+            HEN_ROOM_NOTE("a client joined this console's network as node {} ({} of {})", static_cast<u32>(node_id),
+                          static_cast<u32>(connection_status.total_nodes),
+                          static_cast<u32>(connection_status.max_nodes));
 
             BroadcastNodeMap();
         } else if (eapol_start.connection_type == ConnectionType::Spectator) {
+#ifdef __SWITCH__
+            hen_room_frame_sent(-1, 1); // (counted: a console looking for games reads this one's)
+#endif
             node_map[packet.transmitter_address].node_id = NodeIDSpec;
             node_map[packet.transmitter_address].connected = true;
             node_map[packet.transmitter_address].spec = true;
@@ -302,6 +335,8 @@ void NWM_UDS::HandleEAPoLPacket(const Network::WifiPacket& packet) {
 
         if (conn_type == ConnectionType::Client) {
             connection_status.status = NetworkStatus::ConnectedAsClient;
+            HEN_ROOM_NOTE("joined a network as node {} ({} of {})", static_cast<u32>(logoff.assigned_node_id),
+                          static_cast<u32>(logoff.connected_nodes), static_cast<u32>(logoff.max_nodes));
         } else if (conn_type == ConnectionType::Spectator) {
             connection_status.status = NetworkStatus::ConnectedAsSpectator;
         } else {
@@ -499,6 +534,27 @@ void NWM_UDS::HandleAuthenticationFrame(const Network::WifiPacket& packet) {
 void NWM_UDS::HandleDeauthenticationFrame(const Network::WifiPacket& packet) {
     LOG_DEBUG(Service_NWM, "called");
     std::scoped_lock lock{connection_status_mutex};
+
+    // From the host of the network this console is in: that network is gone (the host ended it,
+    // or its title ended). The program is told that the connection is lost, as it would be on a
+    // console that no longer hears the host's beacons; without this it stays "connected" to
+    // nothing until it gives up by itself, if it does.
+    if ((connection_status.status == NetworkStatus::ConnectedAsClient ||
+         connection_status.status == NetworkStatus::ConnectedAsSpectator) &&
+        packet.transmitter_address == network_info.host_mac_address) {
+        HEN_ROOM_NOTE("the host of this console's network ended it: connection lost");
+        const u16_le node_id = connection_status.network_node_id;
+        connection_status = {};
+        connection_status.status = NetworkStatus::NotConnected;
+        connection_status.status_change_reason = NetworkStatusChangeReason::ConnectionLost;
+        connection_status.network_node_id = node_id;
+        node_map.clear();
+        SignalEventAsync(connection_status_event);
+        for (auto& bind_node : channel_data) {
+            SignalEventAsync(bind_node.second.event);
+        }
+        return;
+    }
 
     if (connection_status.status != NetworkStatus::ConnectedAsHost) {
         LOG_ERROR(Service_NWM, "Got deauthentication frame but we are not the host");
@@ -990,6 +1046,12 @@ Result NWM_UDS::BeginHostingNetwork(std::span<const u8> network_info_buffer,
     }
 
     SignalEventAsync(connection_status_event);
+    HEN_ROOM_NOTE("hosting a network: id {:08x}, sub-id {}, attributes {:04x}, network id {:08x}, channel {}, "
+                  "{} nodes at most, {} bytes of application data",
+                  static_cast<u32>(network_info.wlan_comm_id), static_cast<u32>(network_info.id),
+                  static_cast<u32>(network_info.attributes), static_cast<u32>(network_info.network_id),
+                  static_cast<u32>(network_channel), static_cast<u32>(network_info.max_nodes),
+                  static_cast<u32>(network_info.application_data_size));
 
     // Start broadcasting the network, send a beacon frame every 102.4ms.
     system.CoreTiming().ScheduleEvent(msToCycles(DefaultBeaconInterval * MillisecondsPerTU),
@@ -1122,6 +1184,11 @@ Result NWM_UDS::DestroyNetworkHLE() {
     }
 
     // TODO(B3N30): Send 3 Deauth packets
+    // (Not from here: download play ends its own network just before the program hosts the real
+    // one from the same address, and its clients are still reading what they were sent. The
+    // frames go out where nothing follows: when the title ends, ~NWM_UDS.)
+    HEN_ROOM_NOTE("the network this console hosted ends ({} nodes)",
+                  static_cast<u32>(connection_status.total_nodes));
 
     u16_le tmp_node_id = connection_status.network_node_id;
     connection_status = {};
@@ -1739,11 +1806,29 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
     }
 }
 
+#ifdef __SWITCH__
+extern "C" void hen_room_step(const char* text); // citra_switch/room_link.h
+#endif
+
 NWM_UDS::~NWM_UDS() {
+#ifdef __SWITCH__
+    hen_room_step("wireless service ending");
+#endif
+    // A title that ends while it hosts a network leaves without a word otherwise.
+    if (connection_status.status == NetworkStatus::ConnectedAsHost) {
+        HEN_ROOM_NOTE("the title ends while hosting a network ({} nodes)",
+                      static_cast<u32>(connection_status.total_nodes));
+        for (int i = 0; i < 3; i++) {
+            SendHostGone(network_channel);
+        }
+    }
     if (auto room_member = Network::GetRoomMember().lock())
         room_member->Unbind(wifi_packet_received);
 
     system.CoreTiming().UnscheduleEvent(beacon_broadcast_event, 0);
+#ifdef __SWITCH__
+    hen_room_step("wireless service ended");
+#endif
 }
 
 } // namespace Service::NWM

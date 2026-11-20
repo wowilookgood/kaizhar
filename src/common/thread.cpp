@@ -28,6 +28,10 @@
 #define cpu_set_t cpuset_t
 #endif
 
+#ifdef __SWITCH__
+extern "C" void hen_thread_name(const char* name); // hen/platform/hen_thread.c
+#endif
+
 namespace Common {
 
 #ifdef _WIN32
@@ -98,7 +102,7 @@ void SetCurrentThreadName(const char* name) {
 #if !defined(_WIN32) || defined(_MSC_VER)
 void SetCurrentThreadName(const char* name) {
 #ifdef __SWITCH__
-    (void)name; // no thread names in libnx's pthreads
+    hen_thread_name(name); // no thread names in libnx's pthreads: kept for "hen: threads:"
 #elif defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)

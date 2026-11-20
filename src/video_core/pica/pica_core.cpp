@@ -18,6 +18,12 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader/shader.h"
 
+#ifdef __SWITCH__
+namespace Pica::Shader {
+extern u32 hen_setup_vertices; // (shader/shader_jit.cpp)
+}
+#endif
+
 namespace Pica {
 
 MICROPROFILE_DEFINE(GPU_Drawing, "GPU", "Drawing", MP_RGB(50, 50, 240));
@@ -1119,10 +1125,12 @@ void PicaCore::DrawArrays(bool is_indexed) {
         // (vk_rasterizer.cpp, AccelerateDrawBatchInternal): measured, not estimated.
         const unsigned long long hen_took = hen_jit_now_ns() - hen_start;
         hen_cpu_shade_debt_ns += static_cast<long long>(hen_took);
+#if HEN_DEV
         const u32 hen_count = regs.internal.pipeline.num_vertices;
         if (hen_count >= 64) {
             hen_cpu_shade_ns_per_vertex = (hen_cpu_shade_ns_per_vertex * 7 + hen_took / hen_count) / 8;
         }
+#endif
 #else
         LoadVertices(is_indexed);
 #endif
@@ -1165,7 +1173,15 @@ void PicaCore::LoadVertices(bool is_indexed) {
     // Compile the vertex shader for this batch.
     ShaderUnit shader_unit;
     AttributeBuffer vs_output;
+#ifdef __SWITCH__
+    // (shader/shader_jit.cpp, --vs-jit-async: how large the draw is decides what a program
+    // that is not compiled yet costs least)
+    Shader::hen_setup_vertices = pipeline.num_vertices;
+#endif
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+#ifdef __SWITCH__
+    Shader::hen_setup_vertices = 0; // (an engine that did not read it)
+#endif
 
     // Setup geometry pipeline in case we are using a geometry shader.
     geometry_pipeline.Reconfigure();

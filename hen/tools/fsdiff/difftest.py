@@ -12,6 +12,12 @@ import os, re, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 # CANON=1: instead of the generic shader, the generated shader for the configuration made
 # canonical (FSConfig::Canonicalize) against the one for the configuration as it is.
+# ND=1: the generic shader's variant without the depth write (early depth) against the generated
+# shader WITH the depth write, Z-buffer mode only. The generated shader gets gl_FragCoord.z = zv
+# under the range 0..1; the variant gets what the rasteriser makes of zv under the range
+# depth_offset .. depth_offset - depth_scale. Colours (fog reads depth) must agree and the depth
+# the first writes must be the depth the second is given.
+ND = bool(os.environ.get('ND'))
 CANON = bool(os.environ.get('CANON'))
 BATCH = 20
 
@@ -106,7 +112,9 @@ def main():
     first = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     cases = int(sys.argv[2]) if len(sys.argv) > 2 else 100
     samples = int(sys.argv[3]) if len(sys.argv) > 3 else 400
-    generic = subprocess.run([f'{HERE}/gen', 'generic', '0'], capture_output=True, text=True, check=True).stdout
+    generic = subprocess.run([f'{HERE}/gen', 'generic', '0'] + (['nd'] if ND else []), capture_output=True, text=True, check=True).stdout
+    if ND:
+        assert 'gl_FragDepth' not in generic and 'depth_scale' not in generic.split('void main()')[1]
     # MUTATE='old=>new': a deliberate fault in the generic shader, to see that the test notices.
     if os.environ.get('MUTATE'):
         old, new = os.environ['MUTATE'].split('=>')
@@ -119,7 +127,7 @@ def main():
         src = [PRELUDE, to_cpp(generic, 'gen')]
         used = []
         for seed in seeds:
-            text = subprocess.run([f'{HERE}/gen', 'case', str(seed)], capture_output=True, text=True, check=True).stdout
+            text = subprocess.run([f'{HERE}/gen', 'case', str(seed)] + (['zbuf'] if ND else []), capture_output=True, text=True, check=True).stdout
             head, rest = text.split('\n', 3)[:3], text.split('\n', 3)[3]
             if head[0].strip() != '//SUPPORTED 1':
                 totals['unsupported'] += 1
@@ -141,7 +149,10 @@ def main():
         rng.seed({seed}); int bad = 0, kept = 0; float worst = 0;
         for (int s = 0; s < {samples}; s++) {{
             randomize();
-            const Result a = run(c{seed}::shader_main), b = run({'k' + str(seed) if CANON else 'gen'}::shader_main);
+            const Result a = run(c{seed}::shader_main);
+            {'const float zv = gl_FragCoord.z, lo = depth_offset, hi = depth_offset - depth_scale; gl_FragCoord.z = lo + zv * (hi - lo);' if ND else ''}
+            Result b = run({'k' + str(seed) if CANON else 'gen'}::shader_main);
+            {'b.depth = gl_FragCoord.z;' if ND else ''}
             if (a.discarded != b.discarded) {{ bad++; continue; }}
             if (a.discarded) continue;
             kept++;

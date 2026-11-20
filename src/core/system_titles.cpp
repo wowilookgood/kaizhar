@@ -1209,7 +1209,7 @@ std::optional<u32> GetSystemTitleRegion(u64 title_id) {
     return std::nullopt;
 }
 
-std::pair<bool, bool> AreSystemTitlesInstalled() {
+std::pair<bool, bool> AreSystemTitlesInstalled(const std::function<bool(u64)>& has_metadata) {
     std::array<u32, NUM_SYSTEM_TITLE_REGIONS> o_installed_titles{};
     std::array<u32, NUM_SYSTEM_TITLE_REGIONS> o_total_titles{};
 
@@ -1238,8 +1238,9 @@ std::pair<bool, bool> AreSystemTitlesInstalled() {
 
                 // TODO(PabloMK7) Switch to a better solution once available, so it's not as slow as
                 // checking everything
-                if (FileUtil::Exists(Service::AM::GetTitleMetadataPath(Service::FS::MediaType::NAND,
-                                                                       program_id, false))) {
+                if (has_metadata ? has_metadata(program_id)
+                                 : FileUtil::Exists(Service::AM::GetTitleMetadataPath(
+                                       Service::FS::MediaType::NAND, program_id, false))) {
                     if (title->sets & SystemTitleSet::Old3ds) {
                         o_installed_titles[i]++;
                     }

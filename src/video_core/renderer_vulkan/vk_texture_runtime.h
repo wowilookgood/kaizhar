@@ -284,6 +284,23 @@ public:
     /// Returns the pipeline stage flags indicative of the surface
     vk::PipelineStageFlags PipelineStageFlags() const noexcept;
 
+    /// (Switch 2 port, --recycle-surfaces: rasterizer_cache.h) True if this surface, once
+    /// unregistered, may be kept for another: a plain 2D surface whose images are the ones
+    /// its constructor made.
+    bool HenPoolable() const noexcept;
+
+    /// The image memory the surface holds, in bytes.
+    u64 HenImageBytes() const;
+
+    /// True if the constructor would make the images this surface has for params and flags.
+    bool HenFits(const VideoCore::SurfaceParams& params,
+                 const VideoCore::SurfaceFlagBits& initial_flags) const;
+
+    /// Makes the surface over for params: everything but the images and their views starts
+    /// as in a new surface.
+    void HenRecycle(const VideoCore::SurfaceParams& params,
+                    const VideoCore::SurfaceFlagBits& initial_flags);
+
 private:
     /// Performs blit between the scaled/unscaled images
     void BlitScale(const VideoCore::TextureBlit& blit, bool up_scale);
@@ -304,6 +321,7 @@ public:
     vk::UniqueImageView storage_view;
     bool is_framebuffer{};
     bool is_storage{};
+    bool hen_scaled_up{}; ///< (Switch 2 port) ScaleUp made the scaled image, not the constructor
 };
 
 class Framebuffer : public VideoCore::FramebufferParams {
@@ -371,6 +389,11 @@ public:
 
     u32 Scale() const noexcept {
         return res_scale;
+    }
+
+    /// The area every attachment covers
+    [[nodiscard]] vk::Extent2D Extent() const noexcept {
+        return vk::Extent2D{width, height};
     }
 
 private:

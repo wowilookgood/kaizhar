@@ -18,6 +18,7 @@
 extern "C" unsigned long long hen_jit_now_ns(void); // hen/jit/hen_jit.c
 extern "C" int hen_translation_worker;
 extern "C" int hen_tier;
+extern "C" void hen_resort_title_start(void); // hen/jit/hen_jit.c
 
 namespace Core::HenBlockList {
 
@@ -148,6 +149,7 @@ void SetSpeculation(bool enabled) {
 }
 
 void Open(u64 title_id, unsigned start_budget_ms, const char* folder) {
+    hen_resort_title_start(); // (what "started at" and --jit-resort-at count from)
     TakeListsBack();
     struct GiveAfter {
         ~GiveAfter() { GiveLists(); }
@@ -262,9 +264,11 @@ void UpgradeLinks() {
     // time. The first version held it across the call into the JIT, which hung outright:
     // the worker takes the two locks the other way round. upgrade_jits is only touched on
     // this thread, in Attach, Detach and here.)
-    const u64 deadline_ns = hen_jit_now_ns() + 300'000;
+    const u64 now_ns = hen_jit_now_ns();
+    const u64 deadline_ns = now_ns + 300'000;
     for (Dynarmic::A32::Jit* jit : upgrade_jits) {
         jit->HenUpgradeLinks(deadline_ns, 384);
+        jit->HenResortTick(now_ns); // (whether a background re-sort of its code is to begin)
     }
 }
 

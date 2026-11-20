@@ -16,7 +16,6 @@
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/hen_gpu_thread.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/shader/generator/glsl_fs_shader_gen.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -27,11 +26,18 @@ extern "C" unsigned long long hen_homebrew_cache_id;
 #endif
 
 #ifdef __SWITCH__
-extern "C" int hen_cpu_vertex_limit;  // --cpu-vertex-limit N
+extern "C" int hen_early_depth;                          // hen/jit/hen_jit.c: --no-early-depth
+extern "C" unsigned long long hen_early_depth_stats[3]; // (the frontend's report)
+#else
+static constexpr int hen_early_depth = 0;
+static unsigned long long hen_early_depth_stats[3];
+#endif
+static bool hen_early_depth_draw[2]; // (this draw: could go without the write; and no discard)
+
+#ifdef __SWITCH__
 extern "C" int hen_cpu_shade_share; // --cpu-shade-share P
 extern "C" long long hen_cpu_shade_debt_ns;
 extern "C" long long hen_recent_spare_ns; // core/perf_stats.cpp
-extern "C" int hen_standin_window;        // hen/jit/hen_jit.c: --standin-rule
 static long long hen_standin_frame_ns = 0;
 extern "C" unsigned long long hen_cpu_shade_ns_per_vertex; // hen/jit/hen_jit.c
 extern "C" unsigned long long hen_standin_stats[7]; // hen_jit.c
@@ -39,7 +45,43 @@ extern "C" __thread int hen_standin_build;
 extern "C" unsigned long long hen_fast_lane_skips;
 extern "C" int hen_generic_fs; // (0 off, 1 for draws whose stand-in is not ready, 2 for all it can)
 extern "C" unsigned long long hen_generic_unsupported;
-extern "C" int hen_generic_first; // (of the draws left out: those waiting for their stand-in pipeline)
+extern "C" int hen_generic_early_depth; // (hen_jit.c: --no-generic-early-depth)
+// (the frontend's report: the generic shader's draws by frame; hen_jit.c)
+extern "C" unsigned long long hen_generic_frame_stats[6];
+extern "C" int hen_generic_shading_rate; // hen/jit/hen_jit.c: --generic-shading-rate
+HEN_STAT(static unsigned long long hen_generic_frame_now[2];) // (this frame: with, without the depth write)
+extern "C" int hen_sw_standin; // (hen_jit.c: --no-sw-standin)
+// software draws that were not stand-ins and whose pipeline was not ready: drawn with the
+// generic fragment shader; waited for their own pipeline (hen_jit.c; the frontend's report)
+// ([2] waited because the GPU had no time to spare, [3] generic because the draw covers little)
+extern "C" unsigned long long hen_sw_standin_stats[4];
+extern "C" int hen_gpu_headroom;      // vk_present_window.cpp keeps it
+extern "C" int hen_sw_standin_area;   // --sw-standin-area PERCENT
+static float hen_sw_standin_frame_share = 0.0f; // (of the target, admitted by area this frame)
+namespace {
+/// The share of the viewport that the bounding box of a batch of shaded vertices covers, 0 to 1.
+/// A vertex behind the eye makes it 1 (its triangle may cover anything).
+template <typename Batch>
+float HenBatchCoverage(const Batch& batch) {
+    if (batch.empty()) {
+        return 0.0f;
+    }
+    float min_x = 1.0f, max_x = -1.0f, min_y = 1.0f, max_y = -1.0f;
+    for (const auto& vertex : batch) {
+        const float w = vertex.position.w;
+        if (!(w > 0.0f)) {
+            return 1.0f;
+        }
+        const float x = std::clamp(vertex.position.x / w, -1.0f, 1.0f);
+        const float y = std::clamp(vertex.position.y / w, -1.0f, 1.0f);
+        min_x = std::min(min_x, x);
+        max_x = std::max(max_x, x);
+        min_y = std::min(min_y, y);
+        max_y = std::max(max_y, y);
+    }
+    return (max_x - min_x) * (max_y - min_y) / 4.0f;
+}
+} // namespace
 #include <chrono>
 #include <utility>
 #endif
@@ -169,6 +211,16 @@ void RasterizerVulkan::TickFrame() {
     HEN_CRUMB("RasterizerVulkan::TickFrame");
 #ifdef __SWITCH__
     hen_standin_frame_ns = 0; // (stand-in pipelines built on this thread during the frame)
+    hen_sw_standin_frame_share = 0.0f;
+    // (the worst frame, not only the report's sum: one frame of them is what a scene start costs)
+    HEN_STAT(if (const unsigned long long with = hen_generic_frame_now[0], without = hen_generic_frame_now[1];
+        with + without != 0) {
+        hen_generic_frame_stats[0]++;
+        hen_generic_frame_stats[1] = std::max(hen_generic_frame_stats[1], with + without);
+        hen_generic_frame_stats[2] = std::max(hen_generic_frame_stats[2], with);
+        hen_generic_frame_stats[3] = std::max(hen_generic_frame_stats[3], without);
+        hen_generic_frame_now[0] = hen_generic_frame_now[1] = 0;
+    })
 #endif
     scheduler.WaitWorker();
     res_cache.TickFrame();
@@ -529,8 +581,7 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
     // upstream does. Measured on a cold start of Pokemon Omega Ruby's title scene: with fixed
     // caps of 4000 vertices a draw and 16000 in 16 ms, 1730 draws (1.3 M vertices) were still
     // left out; with none, nothing was, at 86% speed for 5 s.
-    bool cpu_instead = async_shaders && hen_cpu_vertex_limit != 0 &&
-                       regs.pipeline.num_vertices <= static_cast<u32>(hen_cpu_vertex_limit);
+    bool cpu_instead = async_shaders && regs.pipeline.num_vertices <= 1000000u;
     {
         static std::chrono::steady_clock::time_point last{};
         const auto now = std::chrono::steady_clock::now();
@@ -580,11 +631,11 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
             hen_gfx_note(HEN_GFX_CPU_INSTEAD, 0);
             hen_fallback_draw = regs.pipeline.num_vertices > 6;
             // (The debt is charged by PicaCore with the time the draw really takes on the CPU,
-            // once it has run. It used to be an estimate added here, 500 ns a vertex: with the
+            // once it has run. Not an estimate added here, such as 500 ns a vertex: with the
             // CPU boost on, a vertex costs about half that and frames finish sooner, so the
-            // estimate ran the debt up and Pokemon Omega Ruby's cold title scene left 270 to
+            // estimate runs the debt up and Pokemon Omega Ruby's cold title scene leaves 270 to
             // 315 draws out where it leaves 90 without the boost. A running mean of the
-            // measured cost per vertex was tried too and was worse: 1200 left out.)
+            // measured cost per vertex is worse still: 1200 left out.)
             return false;
         }
 #ifdef __SWITCH__
@@ -706,9 +757,57 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     SyncTextureUnits(framebuffer);
     SyncUtilityTextures(framebuffer);
 
+    // (hen, --early-depth) Can this draw's depth come from the rasteriser alone?
+    // Today: viewport depth range 0..1, so gl_FragCoord.z = zv (the Vulkan depth -z/w of the
+    // PICA position, 0..1 after clipping), and the shader writes
+    //     depth = (-zv) * depth_scale + depth_offset.
+    // With minDepth = depth_offset and maxDepth = depth_offset - depth_scale the rasteriser
+    // itself gives minDepth + zv * (maxDepth - minDepth), the same number, and the shader has
+    // nothing to write. Only where that is exact:
+    // - Z-buffer mode (W-buffer mode divides by w per pixel: not a viewport transform);
+    // - not shadow rendering and not gas mode (their shaders treat depth in their own way);
+    // - both ends inside 0..1 (a viewport may not leave it on this device; outside it today's
+    //   written depth is clamped by the hardware, which the range could not express);
+    // - maxDepth - minDepth, as the driver computes the scale, is -depth_scale exactly
+    //   (PICA floats have 16 bits of mantissa, so it nearly always is; NaN fails here too).
+    // Everything else keeps the shader with the depth write and the range 0..1.
+    bool hen_no_depth_write = false;
+    f32 hen_min_depth = 0.f, hen_max_depth = 1.f;
+    {
+        const f32 scale = Pica::f24::FromRaw(regs.rasterizer.viewport_depth_range).ToFloat32();
+        const f32 offset = Pica::f24::FromRaw(regs.rasterizer.viewport_depth_near_plane).ToFloat32();
+        const f32 near_depth = offset + 0.f; // (-0 becomes +0)
+        const f32 far_depth = offset - scale;
+        const bool exact =
+            regs.rasterizer.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::ZBuffering &&
+            !regs.framebuffer.IsShadowRendering() &&
+            regs.texturing.fog_mode != Pica::TexturingRegs::FogMode::Gas &&
+            near_depth >= 0.f && near_depth <= 1.f && far_depth >= 0.f && far_depth <= 1.f &&
+            far_depth - near_depth == -scale;
+        // (counted with the flag off too: what the flag would change in this scene)
+        hen_early_depth_draw[0] = exact;
+        hen_early_depth_draw[1] =
+            exact &&
+            (!regs.framebuffer.output_merger.alpha_test.enable ||
+             regs.framebuffer.output_merger.alpha_test.func ==
+                 Pica::FramebufferRegs::CompareFunc::Always) &&
+            regs.rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Disabled;
+        HEN_STAT(hen_early_depth_stats[exact ? 1 : 0]++;)
+        HEN_STAT(hen_early_depth_stats[2] += hen_early_depth_draw[1];)
+        if (exact && hen_early_depth) {
+            hen_no_depth_write = true;
+            hen_min_depth = near_depth;
+            hen_max_depth = far_depth;
+        }
+    }
+    pipeline_info.dynamic_info.min_depth = hen_min_depth;
+    pipeline_info.dynamic_info.max_depth = hen_max_depth;
+    pipeline_info.dynamic_info.no_depth_write = hen_no_depth_write;
+    pipeline_info.dynamic_info.shading_rate = 0;
+
     // Sync and bind the shader
     HEN_CRUMB("Draw: UseFragmentShader");
-    pipeline_cache.UseFragmentShader(regs, user_config);
+    pipeline_cache.UseFragmentShader(regs, user_config, hen_no_depth_write);
 
     // Sync the LUTs within the texture buffer
     HEN_CRUMB("Draw: LUTs and uniforms");
@@ -748,30 +847,22 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
             // for a frame or two: the user saw those as black flashes in Pokemon Moon's
             // opening, so they are kept for the case that would freeze.)
             const auto before = std::chrono::steady_clock::now();
-            // (2026-11-12) The allowance is per frame of the program, and it is the time the
+            // The allowance is per frame of the program, and it is the time the
             // last half second's frames had to spare (a thirtieth of what the limiter slept,
             // one vertical blank's share). The first rule, 6 ms in any 33 ms of wall time, started
             // a new allowance every 33 ms inside one long frame: a scene start in Mario Kart 7
             // built stand-ins for 112 ms in a single frame. A frame with nothing to spare now
             // sends them all to the workers.
-            // (--standin-rule 0; 2 is the default) And not at all while the GPU thread is behind:
-            // the emulation thread waiting for it, or more work queued. A stand-in built here
-            // then is 3 to 14 ms added to a frame that is already late; the workers build it
-            // and the draw is left out for a frame or two instead. 2: without this part.
-            // (--generic-first, an experiment: with the generic fragment shader to draw it
+            // (With the generic fragment shader to draw it
             // meanwhile, no stand-in is built here at all: every one is a worker's job, and
             // the 3 to 9 ms each costs stays out of the frame)
-            const bool here =
-                hen_generic_fs == 2 || (hen_generic_fs && hen_generic_first) ? false :
-                hen_standin_frame_ns < hen_recent_spare_ns / 30 &&
-                    !(hen_standin_window == 0 && VideoCore::HenGpu::OnThread() &&
-                      VideoCore::HenGpu::Behind());
+            const bool here = !hen_generic_fs && hen_standin_frame_ns < hen_recent_spare_ns / 30;
             hen_standin_build = here;
-            const bool hen_bound = pipeline_cache.BindPipeline(pipeline_info, true, !here, true);
+            const bool hen_bound = pipeline_cache.BindPipeline(pipeline_info, true, !here);
             hen_standin_build = 0;
-            // (2026-11-13) Its stand-in is not ready: drawn with the generic fragment shader,
+            // Its stand-in is not ready: drawn with the generic fragment shader,
             // which reads the configuration from the uniforms, rather than left out.
-            // --no-generic-fs: left out, as before. --generic-all: every draw that comes this
+            // --no-generic-fs: left out. --generic-all: every draw that comes this
             // way is drawn with it, to compare its pictures with the generated shaders'.
             bool hen_generic_bound = false;
             if (!hen_bound && hen_generic_fs) {
@@ -779,7 +870,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
             }
             if (!hen_bound && !hen_generic_bound) {
                 hen_gfx_note(HEN_GFX_DRAW_SKIPPED, static_cast<u32>(vertex_batch.size()));
-                hen_fast_lane_skips++;
+                HEN_STAT(hen_fast_lane_skips++;)
                 vertex_batch.clear();
                 return true;
             }
@@ -788,20 +879,64 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
                                            std::chrono::steady_clock::now() - before)
                                            .count();
                 hen_standin_frame_ns += took;
-                if (took >= 100'000) { // (under 0.1 ms: it was built already)
+                // (under 0.1 ms: it was built already)
+                HEN_STAT(if (took >= 100'000) {
                     hen_standin_stats[0]++;
                     hen_standin_stats[1] += took;
                     hen_standin_stats[2] = std::max<unsigned long long>(hen_standin_stats[2], took);
                 } else {
                     hen_standin_stats[6]++;
-                }
+                })
             }
         } else {
             bool hen_generic_bound = false;
             if (hen_generic_fs == 2) {
                 hen_generic_bound = HenDrawGeneric();
             }
-            if (!hen_generic_bound) {
+            // (--no-sw-standin: compiled here) A software draw that is not a
+            // stand-in: six vertices or fewer (AccelerateDrawBatchInternal marks only larger
+            // ones), or one never offered to the hardware path. Its pipeline (the trivial
+            // vertex shader and a fragment shader perhaps seen for the first time), if
+            // compiled right here, on the GPU thread, keeps the emulation thread waiting: 100
+            // of 340 ms sampled in the gaps of six cold routes. So as for a stand-in when
+            // the generic fragment shader is the rule: the shader workers build the pipeline,
+            // and until it is there the draw is drawn with the generic fragment shader, which
+            // computes the same colours from the same configuration (hen/tools/fsdiff). A
+            // draw the generic shader cannot take (a configuration it does not support, or
+            // its own pipeline for these render targets not built yet) waits for it: these
+            // draws are often whole-screen quads, and none is ever left out.
+            if (hen_generic_bound) {
+                // (--generic-all)
+            } else if (hen_sw_standin && hen_generic_fs == 1) {
+                // (fast lane: bound if it is built or the driver has it; else queued)
+                if (!pipeline_cache.BindPipeline(pipeline_info, true, true)) {
+                    // The generic shader costs GPU time per pixel, and
+                    // these draws are often whole-screen quads: with the GPU already the
+                    // bottleneck (handheld Xenoblade, Kid Icarus) they turned a 74 ms gap
+                    // into 41 + 120 ms, the emulation thread waiting for the GPU at the frame
+                    // swap. So only while the GPU has time to spare (hen_gpu_headroom,
+                    // vk_present_window.cpp); without it the draw waits for its own pipeline,
+                    // which a shader worker is building (the bind below finds it pending and
+                    // waits for it: no compile on this thread). One exception: draws that
+                    // cover little, up to a quarter of the target a frame in all, cost the
+                    // GPU little whatever its state (--sw-standin-area PERCENT; 0: none).
+                    bool allowed = __atomic_load_n(&hen_gpu_headroom, __ATOMIC_RELAXED) != 0;
+                    bool by_area = false;
+                    if (!allowed && hen_sw_standin_area > 0) {
+                        const float share = HenBatchCoverage(vertex_batch);
+                        if (share * 100.0f <= static_cast<float>(hen_sw_standin_area) &&
+                            hen_sw_standin_frame_share + share <= 0.25f) {
+                            hen_sw_standin_frame_share += share;
+                            allowed = by_area = true;
+                        }
+                    }
+                    const bool generic = allowed && HenDrawGeneric();
+                    HEN_STAT(hen_sw_standin_stats[generic ? (by_area ? 3 : 0) : (allowed ? 1 : 2)]++;)
+                    if (!generic) {
+                        pipeline_cache.BindPipeline(pipeline_info, true);
+                    }
+                }
+            } else {
                 pipeline_cache.BindPipeline(pipeline_info, true);
             }
         }
@@ -837,14 +972,71 @@ bool RasterizerVulkan::HenDrawGeneric() {
         hen_generic_unsupported++;
         return false;
     }
-    GraphicsPipeline* const pipeline = pipeline_cache.HenGenericPipeline(pipeline_info);
+    // (early depth) A draw whose depth the viewport's range carries (Draw decided: Z-buffer
+    // mode, the range inside 0..1 and exact, no shadow rendering, no gas) takes the variant of
+    // the generic shader that does not write depth and keeps its range, so the hardware may
+    // reject its hidden pixels before this shader runs: the dearest one per pixel, and at a
+    // scene start it draws much of the frame. While that variant's pipeline for these render
+    // targets is not there (or with --no-generic-early-depth) the draw takes the first
+    // variant, which writes depth from the scale and offset itself, under the range 0..1, as
+    // every other draw does here.
+    const auto own_dynamic = pipeline_info.dynamic_info;
+    bool no_depth_write = own_dynamic.no_depth_write != 0 &&
+                          __atomic_load_n(&hen_generic_early_depth, __ATOMIC_RELAXED) != 0;
+    GraphicsPipeline* pipeline =
+        no_depth_write ? pipeline_cache.HenGenericPipeline(pipeline_info, true) : nullptr;
+    if (pipeline == nullptr) {
+        no_depth_write = false;
+        pipeline = pipeline_cache.HenGenericPipeline(pipeline_info, false);
+    }
     if (pipeline == nullptr) {
         return false;
     }
     Pica::Shader::Generator::GLSL::FillGenericFragmentConfig(config, fs_data);
     fs_data_dirty = true;
     UploadUniforms(false);
-    return pipeline_cache.HenBindGeneric(pipeline_info, pipeline);
+    // (put back if it is not bound after all, for the draw's own pipeline)
+    if (!no_depth_write) {
+        pipeline_info.dynamic_info.min_depth = 0.f;
+        pipeline_info.dynamic_info.max_depth = 1.f;
+        pipeline_info.dynamic_info.no_depth_write = 0;
+    }
+    // (the dearest shader per pixel, on screen for the few frames its draw's own pipeline takes:
+    // one run of it colours a square of pixels; edges and depth stay at the full resolution)
+    pipeline_info.dynamic_info.shading_rate =
+        static_cast<u32>(__atomic_load_n(&hen_generic_shading_rate, __ATOMIC_RELAXED));
+    if (!pipeline_cache.HenBindGeneric(pipeline_info, pipeline, no_depth_write)) {
+        pipeline_info.dynamic_info = own_dynamic;
+        return false;
+    }
+    HEN_STAT(hen_generic_frame_now[no_depth_write ? 1 : 0]++;)
+    HEN_STAT(hen_generic_frame_stats[no_depth_write ? 5 : 4]++;)
+    {
+        // (for the gap line: how much these draws can cover)
+        const auto& viewport = pipeline_info.dynamic_info.viewport;
+        const unsigned long long area =
+            static_cast<unsigned long long>(std::abs(viewport.right - viewport.left)) *
+            static_cast<unsigned long long>(std::abs(viewport.bottom - viewport.top));
+        HEN_WORK_COUNT(no_depth_write ? HEN_WORK_GENERIC_WITHOUT : HEN_WORK_GENERIC_WITH, 1);
+        HEN_WORK_COUNT(HEN_WORK_GENERIC_AREA, area);
+        HEN_WORK_COUNT(HEN_WORK_GENERIC_VERTICES, vertex_batch.size());
+        if (!no_depth_write) {
+            HEN_WORK_COUNT(HEN_WORK_GENERIC_AREA_WITH, area);
+            HEN_WORK_COUNT(HEN_WORK_GENERIC_NOT_EXACT, own_dynamic.no_depth_write == 0);
+        }
+    }
+    // (counted as a draw without the depth write when the draw was set up)
+    // (the report on another thread may have emptied the counts in between)
+    HEN_STAT(if (own_dynamic.no_depth_write && !no_depth_write) {
+        if (hen_early_depth_stats[1] != 0) {
+            hen_early_depth_stats[1]--;
+        }
+        if (hen_early_depth_draw[1] && hen_early_depth_stats[2] != 0) {
+            hen_early_depth_stats[2]--;
+        }
+        hen_early_depth_stats[0]++;
+    })
+    return true;
 }
 #endif
 

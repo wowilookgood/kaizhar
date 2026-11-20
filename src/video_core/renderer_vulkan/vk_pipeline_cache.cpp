@@ -2,8 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include "common/hen_stats.h"
 #include "common/common_paths.h"
@@ -14,6 +16,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
+#include "video_core/hen_workers.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
@@ -31,14 +34,35 @@ using Pica::Shader::FSConfig;
 
 MICROPROFILE_DEFINE(Vulkan_Bind, "Vulkan", "Pipeline Bind", MP_RGB(192, 32, 32));
 
-extern "C" int hen_substitute;                 // hen/jit/hen_jit.c: --substitute
-extern "C" unsigned long long hen_substituted; // draws made with a substitute pipeline
-
 #ifdef __SWITCH__
 extern "C" int hen_generic_fs, hen_stale_profile, hen_generic_seed;
+extern "C" int hen_early_depth; // hen/jit/hen_jit.c: --no-early-depth
+extern "C" int hen_generic_early_depth; // hen/jit/hen_jit.c: --no-generic-early-depth
+extern "C" int hen_generic_shading_rate; // hen/jit/hen_jit.c: --generic-shading-rate
+extern "C" int hen_recycle_surfaces; // hen/jit/hen_jit.c: --recycle-surfaces
+extern "C" unsigned hen_recycle_cap_mib, hen_recycle_age_frames;
 // Since the last report: draws with the generic fragment shader, its pipelines linked on the
 // renderer's thread, ns in that.
 extern "C" unsigned long long hen_generic_stats[3];
+extern "C" {
+// The driver pipeline cache when the GPU right changes hands (SwitchCache below).
+// Upstream writes the cache of the title losing the right to its file and reads the other
+// title's file, every time: with the console's own keyboard run as a title, that is one write
+// of about 0.5 MiB and one read at every open and at every close, on the emulation thread
+// inside the service call (System Settings: 54 to 75 ms at open, 22 to 43 ms at close).
+// 1: the cache losing the right stays in memory, by title, and comes back from there; a
+// title's file is read once a run. Written: the current title's at the end as before, and
+// then those kept in memory that have grown since they were read or last written.
+// The trade: written each time a title lost the right, its file held after a crash what had
+// been compiled up to the last applet opened; kept in memory, it holds what the last clean
+// exit left. (A title that opens no applet is only ever written at the end.) What is
+// lost then is the driver's part only: the shaders and pipeline descriptions are in the disk
+// shader cache's own files, appended as they are made, and the driver has its own cache file.
+// 0: --no-driver-cache-keep, as upstream, to compare.
+int hen_driver_cache_keep = 1;
+}
+#else
+static constexpr int hen_driver_cache_keep = 0;
 #endif
 
 namespace Vulkan {
@@ -92,13 +116,18 @@ constexpr std::array<vk::DescriptorSetLayoutBinding, 2> UTILITY_BINDINGS = {{
      vk::ShaderStageFlagBits::eFragment}, // tex_normal
 }};
 
+#ifdef __SWITCH__
+extern "C" int hen_compile_workers; // hen/jit/hen_jit.c
+#endif
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              RenderManager& renderpass_cache_, DescriptorUpdateQueue& update_queue_)
     : instance{instance_}, scheduler{scheduler_}, renderpass_cache{renderpass_cache_},
       update_queue{update_queue_},
 #ifdef __SWITCH__
       // hardware_concurrency() is 0 here; threads can use six cores (hen_thread.c spreads them).
-      num_worker_threads{4},
+      // (--compile-workers N, for --nir-timing: one compile at a time)
+      num_worker_threads{static_cast<u32>(std::clamp(hen_compile_workers, 1, 8))},
 #else
       num_worker_threads{std::max(std::thread::hardware_concurrency(), 2U) / 2},
 #endif
@@ -111,11 +140,31 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       trivial_vertex_shader{
           instance, vk::ShaderStageFlagBits::eVertex,
           GLSL::GenerateTrivialVertexShader(instance.IsShaderClipDistanceSupported(), true)},
-      hen_generic_fragment_shader{instance} {
+      hen_generic_fragment_shader{instance}, hen_generic_nd_fragment_shader{instance} {
 #ifdef __SWITCH__
     GraphicsPipeline::hen_fast_worker = &shader_workers; // (see GraphicsPipeline::TryBuild)
+    // (work from outside the renderer: the PICA vertex JIT, texture decodes; hen_workers.h)
+    VideoCore::HenWorkers::Set(
+        [](void* owner, std::function<void()> work) {
+            static_cast<PipelineCache*>(owner)->shader_workers.QueueWork(std::move(work));
+        },
+        this);
     std::printf("hen: gfx: %u pipeline worker(s), %u shader worker(s) (%u hardware threads)\n",
                 num_worker_threads, num_worker_threads, std::thread::hardware_concurrency());
+    std::printf("hen: gfx: early depth: %s; for the generic fragment shader's draws: %s\n",
+                hen_early_depth ? "on" : "off",
+                hen_early_depth && hen_generic_early_depth && hen_generic_fs ? "on" : "off");
+    std::printf("hen: gfx: coarse shading of the generic fragment shader's draws: %dx%d asked, the device offers up to %ux%u\n",
+                hen_generic_shading_rate, hen_generic_shading_rate, instance.HenCoarseShading(),
+                instance.HenCoarseShading());
+    // What the driver was told as this title's Vulkan instance was made: every build
+    // says it, so a log shows whether the driver's compression is on (unset) or off.
+    {
+        const char* const nvk_debug = std::getenv("NVK_DEBUG");
+        std::printf("hen: driver: NVK_DEBUG=%s\n", nvk_debug ? nvk_debug : "(unset: compression on)");
+    }
+    std::printf("hen: gfx: surface recycling: %s, cap %u MiB, age %u frames\n",
+                hen_recycle_surfaces ? "on" : "off", hen_recycle_cap_mib, hen_recycle_age_frames);
 #endif
     scheduler.RegisterOnDispatch([this] { update_queue.Flush(); });
     profile = Pica::Shader::Profile{
@@ -140,27 +189,39 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (hen_stale_profile) {
         profile.has_gl_arm_framebuffer_fetch = 1;
     }
-    // (after the profile is set: the first version queued this before, the worker generated the
-    // shader for an empty profile, it did not compile, and the pipeline made from the empty
-    // module took the emulator down; 2026-11-13)
-    if (hen_generic_fs) {
-        shader_workers.QueueWork([this, generic_profile = profile] {
+    // (after the profile is set: queued before it, the worker generates the shader for an
+    // empty profile, it does not compile, and the pipeline made from the empty module takes
+    // the emulator down)
+    // And its variant without the depth write, for draws whose depth the viewport's
+    // range carries (early depth): a job of its own, queued with the first, so both modules
+    // are there before the title draws. One that fails is never marked done and its draws
+    // take the first variant under the range 0..1.
+    for (const bool no_depth_write : {false, true}) {
+        if (!hen_generic_fs || (no_depth_write && !(hen_early_depth && hen_generic_early_depth))) {
+            continue;
+        }
+        shader_workers.QueueWork([this, generic_profile = profile, no_depth_write] {
             const auto before = std::chrono::steady_clock::now();
-            const std::string code = GLSL::GenerateGenericFragmentShader(generic_profile);
+            const char* const which = no_depth_write ? " without the depth write" : "";
+            Shader& shader =
+                no_depth_write ? hen_generic_nd_fragment_shader : hen_generic_fragment_shader;
+            const std::string code =
+                GLSL::GenerateGenericFragmentShader(generic_profile, no_depth_write);
             const std::vector<u32> spirv = CompileGLSL(code, vk::ShaderStageFlagBits::eFragment);
             if (spirv.empty()) {
                 // (never marked done: draws are left out as before)
-                std::printf("hen: gfx: the generic fragment shader did not compile\n");
+                std::printf("hen: gfx: the generic fragment shader%s did not compile\n", which);
                 return;
             }
-            hen_generic_fragment_shader.module = CompileSPV(spirv, this->instance.GetDevice());
-            if (!hen_generic_fragment_shader.module) {
-                std::printf("hen: gfx: the generic fragment shader's module was refused\n");
+            shader.module = CompileSPV(spirv, this->instance.GetDevice());
+            if (!shader.module) {
+                std::printf("hen: gfx: the generic fragment shader%s: its module was refused\n",
+                            which);
                 return;
             }
-            hen_generic_fragment_shader.MarkDone();
-            std::printf("hen: gfx: generic fragment shader: %zu words of SPIR-V in %.1f ms\n",
-                        spirv.size(),
+            shader.MarkDone();
+            std::printf("hen: gfx: generic fragment shader%s: %zu words of SPIR-V in %.1f ms\n",
+                        which, spirv.size(),
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - before)
                             .count());
@@ -204,6 +265,10 @@ void PipelineCache::BuildLayout() {
 PipelineCache::~PipelineCache() {
     GraphicsPipeline::hen_fast_worker = nullptr;
 #ifdef __SWITCH__
+    // (before the wait below: nothing more is queued from outside once this returns)
+    VideoCore::HenWorkers::Clear(this);
+#endif
+#ifdef __SWITCH__
     // (a shader cache still being regenerated by the shader workers: they finish the entry
     // they are on and stop, or the wait below would last until the whole cache is done)
     for (const auto& disk_cache : disk_caches) {
@@ -213,6 +278,21 @@ PipelineCache::~PipelineCache() {
     pipeline_workers.WaitForRequests();
     shader_workers.WaitForRequests();
     SaveDriverPipelineDiskCache();
+    // (hen_driver_cache_keep: the titles whose caches were kept in memory when they lost the
+    // GPU right; none without the switch)
+    for (const auto& [program_id, cache] : hen_parked_driver_caches) {
+        if (cache) {
+            HenSaveDriverPipelineCache(program_id, *cache, true);
+        }
+    }
+#if defined(__SWITCH__) && HEN_DEV
+    if (hen_driver_cache_switches[0] + hen_driver_cache_switches[1] != 0) {
+        std::printf("hen: driver cache: %u change(s) of title answered from memory, %u from the "
+                    "card; %zu title(s) kept in memory at the end\n",
+                    hen_driver_cache_switches[0], hen_driver_cache_switches[1],
+                    hen_parked_driver_caches.size());
+    }
+#endif
 #ifdef __SWITCH__
     HenDestroyPipelineParts(instance.GetDevice());
 #endif
@@ -247,7 +327,13 @@ void PipelineCache::SwitchCache(u64 title_id, const std::atomic_bool& stop_loadi
     LOG_INFO(Render_Vulkan, "Switching pipeline cache to title_id={:016X}", title_id);
 
     // Save current driver cache, update program ID and load the new driver cache
-    SaveDriverPipelineDiskCache();
+    if (hen_driver_cache_keep) {
+        // (kept in memory under its title instead; written at the end, ~PipelineCache. The
+        // handle stays valid, so a pipeline of that title still being built keeps a cache.)
+        hen_parked_driver_caches[GetProgramID()] = std::move(driver_pipeline_cache);
+    } else {
+        SaveDriverPipelineDiskCache();
+    }
     SetProgramID(title_id);
 #ifdef __SWITCH__
     // (HenDropUnbuiltGeneric waits for the shader workers to have nothing queued: a deferred
@@ -257,7 +343,20 @@ void PipelineCache::SwitchCache(u64 title_id, const std::atomic_bool& stop_loadi
     }
     HenDropUnbuiltGeneric();
 #endif
-    LoadDriverPipelineDiskCache(stop_loading, nullptr);
+    const auto parked = hen_parked_driver_caches.find(title_id);
+    if (hen_driver_cache_keep && parked != hen_parked_driver_caches.end() && parked->second) {
+        driver_pipeline_cache = std::move(parked->second);
+        hen_parked_driver_caches.erase(parked);
+        hen_driver_cache_switches[0]++;
+        LOG_INFO(Render_Vulkan, "Pipeline cache for title_id={:016X} was kept in memory",
+                 title_id);
+    } else {
+        if (parked != hen_parked_driver_caches.end()) {
+            hen_parked_driver_caches.erase(parked);
+        }
+        hen_driver_cache_switches[1]++;
+        LoadDriverPipelineDiskCache(stop_loading, nullptr);
+    }
 
     // Switch the disk shader cache after driver cache is switched
     SwitchDiskCache(title_id, stop_loading, callback);
@@ -344,6 +443,8 @@ void PipelineCache::LoadDriverPipelineDiskCache(
 
     cache_info.initialDataSize = cache_file_size;
     cache_info.pInitialData = cache_data.data();
+    // (for HenSaveDriverPipelineCache: what this title's file holds)
+    hen_driver_cache_bytes[program_id] = static_cast<std::size_t>(cache_file_size);
     load_cache(true);
 }
 
@@ -352,11 +453,36 @@ void PipelineCache::SaveDriverPipelineDiskCache() {
     if (!Settings::values.use_disk_shader_cache || !driver_pipeline_cache) {
         return;
     }
+    // (Switch 2 port: the body moved to HenSaveDriverPipelineCache, which takes the title and
+    // the cache, for the caches kept in memory)
+    HenSaveDriverPipelineCache(GetProgramID(), *driver_pipeline_cache, false);
+}
+
+void PipelineCache::HenSaveDriverPipelineCache(u64 program_id, vk::PipelineCache cache,
+                                               bool only_if_grown) {
+    if (!Settings::values.use_disk_shader_cache || !cache) {
+        return;
+    }
+
+    const vk::Device device = instance.GetDevice();
+    std::vector<u8> cache_data;
+    try {
+        cache_data = device.getPipelineCacheData(cache);
+    } catch (const vk::SystemError& err) {
+        LOG_ERROR(Render_Vulkan, "Unable to get the pipeline cache's data: {}", err.what());
+        return;
+    }
+    if (only_if_grown) {
+        // (a pipeline cache only gains entries: the same length is taken as the same content)
+        const auto known = hen_driver_cache_bytes.find(program_id);
+        if (known != hen_driver_cache_bytes.end() && known->second == cache_data.size()) {
+            return;
+        }
+    }
 
     const auto cache_dir = GetPipelineCacheDir();
     const u32 vendor_id = instance.GetVendorID();
     const u32 device_id = instance.GetDeviceID();
-    const u64 program_id = GetProgramID();
     // Include both device info and program id in cache path to handle both GPU changes and
     // different games
     const auto cache_file_path =
@@ -368,12 +494,11 @@ void PipelineCache::SaveDriverPipelineDiskCache() {
         return;
     }
 
-    const vk::Device device = instance.GetDevice();
-    const auto cache_data = device.getPipelineCacheData(*driver_pipeline_cache);
     if (cache_file.WriteBytes(cache_data.data(), cache_data.size()) != cache_data.size()) {
         LOG_ERROR(Render_Vulkan, "Error during pipeline cache write");
         return;
     }
+    hen_driver_cache_bytes[program_id] = cache_data.size();
 }
 
 void PipelineCache::LoadDiskCache(const std::atomic_bool& stop_loading,
@@ -452,14 +577,45 @@ void PipelineCache::SwitchDiskCache(u64 title_id, const std::atomic_bool& stop_l
     }
 }
 
-GraphicsPipeline* PipelineCache::HenGenericPipeline(PipelineInfo& info) {
-    if (!hen_generic_fs || !hen_generic_fragment_shader.IsDone()) {
+// (the two variants of the generic shader have their first pipelines apart)
+static u64 HenGenericTargetsKey(const PipelineInfo& info, bool no_depth_write) {
+    const u64 targets = Common::ComputeStructHash64(info.state.attachments);
+    return no_depth_write ? targets ^ 0x9E3779B97F4A7C15ull : targets;
+}
+
+// The variant without the depth write is an improvement, not a need: the first module
+// draws every draw correctly meanwhile. Its first pipeline for a pair of render target formats
+// is 130 to 180 ms of a shader worker, and started with the first module's at the title's first
+// draws it took the last free worker: the title's own first fragment shader waited in the queue
+// behind four generic pipelines, the GPU thread waited for that shader (Build, WaitDone) and
+// the emulation thread for the GPU thread, 146 ms (Mario Kart 7). So it starts
+// only when the first module's pipeline for these targets is there, no other one of its kind
+// is being built, and both worker pools have nothing queued or running at this instant. Asked
+// again at every draw until then.
+bool PipelineCache::HenGenericVariantMayStart(const PipelineInfo& info) {
+    hen_generic_nd_wanted.try_emplace(HenGenericTargetsKey(info, true),
+                                      std::chrono::steady_clock::now());
+    if (hen_generic_nd_building.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    const auto first = hen_generic_targets.find(HenGenericTargetsKey(info, false));
+    if (first == hen_generic_targets.end() || !first->second->IsDone()) {
+        return false;
+    }
+    return shader_workers.HenIdle() && pipeline_workers.HenIdle();
+}
+
+GraphicsPipeline* PipelineCache::HenGenericPipeline(PipelineInfo& info, bool no_depth_write) {
+    Shader& generic_shader =
+        no_depth_write ? hen_generic_nd_fragment_shader : hen_generic_fragment_shader;
+    if (!hen_generic_fs || !generic_shader.IsDone() ||
+        (no_depth_write && !__atomic_load_n(&hen_generic_early_depth, __ATOMIC_RELAXED))) {
         return nullptr;
     }
     const auto saved_shader = current_shaders[ProgramType::FS];
     const auto saved_hash = shader_hashes[ProgramType::FS];
-    current_shaders[ProgramType::FS] = &hen_generic_fragment_shader;
-    shader_hashes[ProgramType::FS] = HEN_GENERIC_FS_ID;
+    current_shaders[ProgramType::FS] = &generic_shader;
+    shader_hashes[ProgramType::FS] = no_depth_write ? HEN_GENERIC_ND_FS_ID : HEN_GENERIC_FS_ID;
     for (u32 i = 0; i < MAX_SHADER_STAGES; i++) {
         info.state.shader_ids[i] = shader_hashes[i];
     }
@@ -473,18 +629,22 @@ GraphicsPipeline* PipelineCache::HenGenericPipeline(PipelineInfo& info) {
     GraphicsPipeline* const pipeline = it->second.get();
     current_shaders[ProgramType::FS] = saved_shader;
     shader_hashes[ProgramType::FS] = saved_hash;
-    // (the driver refusing one, or leaving it unbuilt, must cost the feature, not the session)
-    const auto build = [](GraphicsPipeline* p) {
+    // (the driver refusing one, or leaving it unbuilt, must cost the feature, not the session;
+    // for the variant without the depth write it costs the variant: its draws go back to the
+    // first one)
+    const auto build = [no_depth_write](GraphicsPipeline* p) {
+        const char* const off = no_depth_write ? "its variant without the depth write off"
+                                               : "generic fragment shader off";
         try {
             if (p->Build() && p->IsDone()) {
                 return true;
             }
-            std::printf("hen: gfx: a generic pipeline was not built: generic fragment shader off\n");
+            std::printf("hen: gfx: a generic pipeline was not built: %s\n", off);
         } catch (const std::exception& e) {
-            std::printf("hen: gfx: generic pipeline refused (%s): generic fragment shader off\n",
-                        e.what());
+            std::printf("hen: gfx: generic pipeline refused (%s): %s\n", e.what(), off);
         }
-        __atomic_store_n(&hen_generic_fs, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(no_depth_write ? &hen_generic_early_depth : &hen_generic_fs, 0,
+                         __ATOMIC_RELAXED);
         return false;
     };
     if (!pipeline->IsDone()) {
@@ -492,66 +652,101 @@ GraphicsPipeline* PipelineCache::HenGenericPipeline(PipelineInfo& info) {
         // once for a pair of render target formats (kept after that: the cache of parts in
         // vk_graphics_pipeline.cpp). The first pipeline for a pair is a worker's job and the
         // draw is left out meanwhile; the others are linked here from what is there.
-        const u64 targets = Common::ComputeStructHash64(info.state.attachments);
+        const u64 targets = HenGenericTargetsKey(info, no_depth_write);
         const auto ready = hen_generic_targets.find(targets);
         if (ready == hen_generic_targets.end()) {
+            if (no_depth_write && !HenGenericVariantMayStart(info)) {
+                return nullptr; // (held back: the caller takes the first module)
+            }
             hen_generic_targets.emplace(targets, pipeline);
-            shader_workers.QueueWork([pipeline, build] {
+            if (no_depth_write) {
+                hen_generic_nd_building.fetch_add(1, std::memory_order_relaxed);
+            }
+            const auto wanted = no_depth_write ? hen_generic_nd_wanted[targets]
+                                               : std::chrono::steady_clock::time_point{};
+            shader_workers.QueueWork([this, pipeline, build, no_depth_write, wanted] {
                 const auto before = std::chrono::steady_clock::now();
-                if (build(pipeline)) {
+                const bool built = build(pipeline);
+                const auto after = std::chrono::steady_clock::now();
+                const double took = std::chrono::duration<double, std::milli>(after - before).count();
+                if (built && no_depth_write) {
+                    std::printf("hen: gfx: generic pipeline (without the depth write) for new render "
+                                "targets built in %.1f ms; ready %.2f s after the renderer's start, "
+                                "held back %.0f ms for the first module's pipeline and idle workers\n",
+                                took, std::chrono::duration<double>(after - hen_created).count(),
+                                std::chrono::duration<double, std::milli>(before - wanted).count());
+                } else if (built) {
                     std::printf("hen: gfx: generic pipeline for new render targets built in %.1f ms\n",
-                                std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - before)
-                                    .count());
+                                took);
+                }
+                if (no_depth_write) {
+                    hen_generic_nd_building.fetch_sub(1, std::memory_order_relaxed);
                 }
             });
         } else if (ready->second->IsDone() && pipeline != ready->second) {
-            const auto before = std::chrono::steady_clock::now();
+            HEN_STAT(const auto before = std::chrono::steady_clock::now();)
             build(pipeline);
-            hen_generic_stats[1]++;
-            hen_generic_stats[2] += static_cast<unsigned long long>(
+            HEN_STAT(hen_generic_stats[1]++;)
+            HEN_STAT(hen_generic_stats[2] += static_cast<unsigned long long>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - before)
-                    .count());
+                    .count());)
         }
     }
     return pipeline->IsDone() ? pipeline : nullptr;
 }
 
-bool PipelineCache::HenBindGeneric(PipelineInfo& info, GraphicsPipeline* pipeline) {
+bool PipelineCache::HenBindGeneric(PipelineInfo& info, GraphicsPipeline* pipeline,
+                                   bool no_depth_write) {
     const auto saved_hash = shader_hashes[ProgramType::FS];
-    shader_hashes[ProgramType::FS] = HEN_GENERIC_FS_ID; // (BindPipeline copies the ids into info)
+    // (BindPipeline copies the ids into info)
+    shader_hashes[ProgramType::FS] = no_depth_write ? HEN_GENERIC_ND_FS_ID : HEN_GENERIC_FS_ID;
     hen_forced_pipeline = pipeline;
     const bool bound = BindPipeline(info, true);
     hen_forced_pipeline = nullptr;
     shader_hashes[ProgramType::FS] = saved_hash;
-    hen_generic_stats[0]++;
+    HEN_STAT(hen_generic_stats[0]++;)
     return bound;
 }
 
 void PipelineCache::HenSeedGeneric(const PipelineInfo& info) {
-    if (!hen_generic_fs || !hen_generic_seed || !hen_generic_fragment_shader.IsDone()) {
+    if (!hen_generic_fs || !hen_generic_seed) {
         return;
     }
-    const u64 targets = Common::ComputeStructHash64(info.state.attachments);
-    if (targets == hen_generic_seeded) {
-        return;
-    }
-    Shader* const vertex_shader = current_shaders[ProgramType::VS];
-    if (vertex_shader == nullptr || !vertex_shader->IsDone()) {
-        return; // (a later draw will do)
-    }
-    hen_generic_seeded = targets;
-    if (!hen_generic_targets.contains(targets)) {
+    // (each variant when its own module is there: the second is compiled after the first)
+    for (const bool no_depth_write : {false, true}) {
+        Shader& generic_shader =
+            no_depth_write ? hen_generic_nd_fragment_shader : hen_generic_fragment_shader;
+        if (!generic_shader.IsDone()) {
+            continue;
+        }
+        const u64 targets = HenGenericTargetsKey(info, no_depth_write);
+        if (targets == hen_generic_seeded[no_depth_write]) {
+            continue;
+        }
+        Shader* const vertex_shader = current_shaders[ProgramType::VS];
+        if (vertex_shader == nullptr || !vertex_shader->IsDone()) {
+            return; // (a later draw will do)
+        }
+        if (hen_generic_targets.contains(targets)) {
+            hen_generic_seeded[no_depth_write] = targets;
+            continue;
+        }
+        // (the variant waits its turn, and is asked for again at the next draw)
+        if (no_depth_write && !HenGenericVariantMayStart(info)) {
+            continue;
+        }
+        hen_generic_seeded[no_depth_write] = targets;
         PipelineInfo copy = info;
-        HenGenericPipeline(copy);
+        HenGenericPipeline(copy, no_depth_write);
     }
 }
 
 void PipelineCache::HenDropUnbuiltGeneric() {
     // (before the driver's pipeline cache is replaced: a generic pipeline not built yet holds
     // the old cache's handle. Built ones stay: a pipeline needs no cache once it exists.)
-    hen_generic_seeded = 0;
+    hen_generic_seeded = {};
+    hen_generic_nd_wanted.clear();
     shader_workers.WaitForRequests();
     for (auto it = hen_generic_targets.begin(); it != hen_generic_targets.end();) {
         it = it->second->IsDone() ? std::next(it) : hen_generic_targets.erase(it);
@@ -561,7 +756,7 @@ void PipelineCache::HenDropUnbuiltGeneric() {
     }
 }
 
-bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, bool fast_lane, bool standin) {
+bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, bool fast_lane) {
     MICROPROFILE_SCOPE(Vulkan_Bind);
 
     for (u32 i = 0; i < MAX_SHADER_STAGES; i++) {
@@ -574,34 +769,10 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, bool fast_
 #endif
     GraphicsPipeline* pipeline =
         hen_forced_pipeline ? hen_forced_pipeline : curr_disk_cache->GetPipeline(info);
-#ifdef __SWITCH__
-    // (--substitute, an experiment for the eye) A stand-in pipeline that is still being built
-    // would leave its draw out for a frame or two: the object is missing, or black where it
-    // covers something. Drawn with the last stand-in of the same state (blending, depth,
-    // targets, vertex layout) and another fragment shader, it is there, shaded a little wrong.
-    u64 hen_sub_key = 0;
-    if (standin && hen_substitute && !hen_forced_pipeline) {
-        auto without_fs = info.state;
-        without_fs.shader_ids[ProgramType::FS] = 0;
-        hen_sub_key = without_fs.OptimizedHash(instance) | 1;
-    }
-    if (!pipeline->IsDone() && !pipeline->TryBuild(wait_built, fast_lane)) {
-        hen_pending_pipeline = pipeline;
-        const auto substitute = hen_sub_key != 0 ? hen_substitutes.find(hen_sub_key) : hen_substitutes.end();
-        if (substitute == hen_substitutes.end()) {
-            return false;
-        }
-        pipeline = substitute->second;
-        hen_substituted++;
-    } else if (hen_sub_key != 0) {
-        hen_substitutes[hen_sub_key] = pipeline;
-    }
-#else
     if (!pipeline->IsDone() && !pipeline->TryBuild(wait_built, fast_lane)) {
         hen_pending_pipeline = pipeline;
         return false;
     }
-#endif
 
     const bool is_dirty = scheduler.IsStateDirty(StateFlags::Pipeline);
     const bool pipeline_dirty = (current_pipeline != pipeline) || is_dirty;
@@ -612,16 +783,32 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, bool fast_
                       current_depth_stencil = current_info.state.depth_stencil,
                       rasterization = info.state.rasterization,
                       depth_stencil = info.state.depth_stencil](vk::CommandBuffer cmdbuf) {
-        if (dynamic.viewport != current_dynamic.viewport || is_dirty) {
+        if (dynamic.viewport != current_dynamic.viewport ||
+            dynamic.min_depth != current_dynamic.min_depth ||
+            dynamic.max_depth != current_dynamic.max_depth || is_dirty) {
+            // (hen, --early-depth: the depth range is 0..1 unless the draw's fragment shader
+            // leaves depth to the rasteriser; vk_rasterizer.cpp, HenEarlyDepth)
             const vk::Viewport vk_viewport = {
                 .x = static_cast<f32>(dynamic.viewport.left),
                 .y = static_cast<f32>(dynamic.viewport.top),
                 .width = static_cast<f32>(dynamic.viewport.GetWidth()),
                 .height = static_cast<f32>(dynamic.viewport.GetHeight()),
-                .minDepth = 0.f,
-                .maxDepth = 1.f,
+                .minDepth = dynamic.min_depth,
+                .maxDepth = dynamic.max_depth,
             };
             cmdbuf.setViewport(0, vk_viewport);
+        }
+
+        if (instance.HenCoarseShading() != 0 &&
+            (dynamic.shading_rate != current_dynamic.shading_rate || is_dirty)) {
+            const u32 side = dynamic.shading_rate >= 4 && instance.HenCoarseShading() >= 4 ? 4
+                             : dynamic.shading_rate >= 2 ? 2 : 1;
+            const vk::Extent2D size{side, side};
+            const vk::FragmentShadingRateCombinerOpKHR combiners[2] = {
+                vk::FragmentShadingRateCombinerOpKHR::eKeep,
+                vk::FragmentShadingRateCombinerOpKHR::eKeep,
+            };
+            cmdbuf.setFragmentShadingRateKHR(size, combiners);
         }
 
         if (dynamic.scissor != current_dynamic.scissor || is_dirty) {
@@ -801,10 +988,10 @@ void PipelineCache::UseTrivialGeometryShader() {
 }
 
 void PipelineCache::UseFragmentShader(const Pica::RegsInternal& regs,
-                                      const Pica::Shader::UserConfig& user) {
+                                      const Pica::Shader::UserConfig& user, bool no_depth_write) {
 
     EnsureDiskCache();
-    auto res = curr_disk_cache->UseFragmentShader(regs, user);
+    auto res = curr_disk_cache->UseFragmentShader(regs, user, no_depth_write);
 
     if (res.has_value()) {
         current_shaders[ProgramType::FS] = (*res).second;

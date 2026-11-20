@@ -21,15 +21,15 @@ The table gives lag, the time the frame limiter gave up.
 | Mario Kart 7 | 39–57 ms | 0 ms |
 | Super Smash Bros. | 1–28 ms | 71 ms |
 
-The table is from a development build on a pre-release HEN. The release build lost 214 ms over the five first launches together. In handheld (a development build of 2126.2-kaizhar2, one first launch each with recorded input): Pokémon Omega Ruby, Ocarina of Time 3D and Kid Icarus: Uprising hold 98 to 100% speed after their first five seconds.
+The table is from a development build. The release build lost 214 ms over the five first launches together. In handheld (a development build of 2126.2-kaizhar2, one first launch each with recorded input): Pokémon Omega Ruby, Ocarina of Time 3D and Kid Icarus: Uprising hold 98 to 100% speed after their first five seconds.
 
 A first launch compiles code and shaders as it goes: expect short hitches and breaks in the sound. New 3DS titles get an emulated CPU clock that follows what the console keeps up with: a 130 s Xenoblade route held 29.8 to 30.0 fps.
 
 Known issues:
 
 - Kid Icarus: Uprising stutters in its first five seconds on a first launch.
-- The CPU clock is raised while a title loads (docked) and while a New 3DS title runs (handheld too). In handheld the system's CPU boost mode is held for as long as any title runs. Heat and battery cost are unmeasured.
-- No settings screen, camera or HTTPS.
+- The CPU clock is raised while a title loads (docked) and while a New 3DS title runs (handheld too). Heat and battery cost are unmeasured.
+- No camera.
 - Microphone input works in a test program (record and play back); no commercial title was tried.
 - Untested: touch in the right-side-up portrait layout, motion in portrait, quitting during a shader cache rebuild.
 
@@ -42,6 +42,18 @@ No games are included.
 - A `.cia` is listed as "Install ..." and can be deleted afterwards. Installed titles and saves are in `/switch/Kaizhar/sdmc/Nintendo 3DS/`, 3DS homebrew in `/switch/Kaizhar/sdmc/3ds/`.
 
 An existing `/switch/Azahar` folder (earlier test builds) is renamed to `/switch/Kaizhar` on first start, unless `/switch/Kaizhar` exists.
+
+### What a release build writes and sends without being asked
+
+Everything is under `/switch/Kaizhar` on the card:
+
+- `log/`: the emulator's log (`kaizhar_log.txt`), a report of the last session (`last-session.txt`), what the program left behind as it closed (`exit.txt`), and after a crash or a hang `crash.txt` or `hang.txt`. The one before each is kept as `.old`.
+- `mic-service.txt`: whether the lookup of the system's audio input service returned. Where it never did, the microphone stays off at later starts until the file is deleted.
+- `ouncevk/`: the graphics driver's shader cache, and a mark (`copied-from-shared`) that the shared cache folder's files were offered to it once.
+- `sdmc/3ds/dspfirm.cdc`: a placeholder, written only if the file is absent. 3DS homebrew looks for it; a file you put there is never touched.
+- Shader caches, lists of compiled blocks, the list of installed titles and the settings of the Settings page.
+
+A release build that is sent to the console from a computer over the network connects back to that computer and sends its log lines there, as a development build does. Started from the homebrew menu it opens no such connection.
 
 ## Controls
 
@@ -59,7 +71,7 @@ Five layouts: stacked, large top screen, side by side, two portrait. Buttons are
 
 ## Building
 
-You need the ounce devkit 20261113f. Fetch the submodules and apply `hen/patches` (commands at the top of `hen/tools/configure.sh`), then:
+You need the ounce devkit 20261117, with the graphics driver the release is built on: upstream ouncevk at f31c0d8 (tag 20261120), or the published ouncevk package once one carries that tag. The release is tested with fragment-shader barycentrics not used. Fetch the submodules and apply `hen/patches` (commands at the top of `hen/tools/configure.sh`), then:
 
 ```
 DEVKITPRO=/path/to/devkit hen/tools/configure.sh build

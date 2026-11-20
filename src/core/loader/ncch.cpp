@@ -5,10 +5,14 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <mutex>
+#include <map>
 #include <vector>
 #include <fmt/format.h>
 #include "common/file_derived.h"
 #include "common/file_util.h"
+#include "common/hash.h"
 #include "common/literals.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
@@ -31,11 +35,82 @@
 #include "core/system_titles.h"
 #include "network/network.h"
 
+// (Switch 2 port, development builds) Where a title launch spends its time: the parts of
+// LoadExec, added up for the "hen: launch:" line of core/hle/service/apt/ns.cpp.
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" unsigned long long hen_jit_now_ns(void); // hen/jit/hen_jit.c
+namespace Service::NS {
+// reading the code, patching it, Process::Run, the look-up of an update title, making the
+// code set and the process, registering the title's own archive, the region look-up
+extern unsigned long long hen_launch_ns[7];
+}
+#define HEN_LAUNCH_NOW() hen_jit_now_ns()
+#define HEN_LAUNCH_ADD(part, since) (Service::NS::hen_launch_ns[part] += hen_jit_now_ns() - (since))
+#else
+#define HEN_LAUNCH_NOW() 0ull
+#define HEN_LAUNCH_ADD(part, since) ((void)(since))
+#endif
+
+#ifdef __SWITCH__
+extern "C" int hen_launch_cache; // hen/jit/hen_jit.c: --no-launch-cache
+extern "C" int hen_jit_park;     // hen/jit/hen_jit.c: --no-jit-park
+#else
+static constexpr int hen_launch_cache = 0; // (other platforms: as upstream)
+static constexpr int hen_jit_park = 0;
+#endif
+
 namespace Loader {
 
 using namespace Common::Literals;
 static constexpr u64 UPDATE_TID_HIGH = 0x0004000e00000000;
 static constexpr u64 DLP_CHILD_TID_HIGH = 0x0004000100000000;
+
+// (Kaizhar, hen_launch_cache) What starting a title read, kept for the run.
+// An application that opens the console's keyboard starts that title as a new process each
+// time, and each start would read and decompress the same code from the card, look for the
+// same update title that is not there, and read the same icon, logo and banner (System
+// Settings: 52 to 60 ms in APT's PrepareToStartLibraryApplet at every open). For a title
+// started through Service::NS::LaunchTitle (AppLoader::hen_relaunchable) the loader keeps, by
+// the path of the title's file:
+//  - the code image as it goes into the code set: decompressed, with its .bss, patches
+//    applied. The process gets its own copy (Process::Run copies the code set into the
+//    process's memory in any case), so what is kept is never written to;
+//  - a hash of that image (CodeSet::hen_image_hash);
+//  - that no update title could be loaded for it, so the next start does not look again;
+//  - the icon, logo and banner sections as LoadSectionExeFS answered them.
+// Forgotten, all of it, when an install or a removal begins or an install ends
+// (HenLaunchCacheForget, from the title manager). NOT noticed: files changed by other means
+// during the run (a patch or a replacement file copied in over FTP).
+// Memory: images of at most HEN_IMAGE_MAX each and HEN_IMAGES_MAX in all, then it starts
+// again (the keyboard's image is a few MiB); the three sections are tens of KiB a title.
+namespace {
+constexpr std::size_t HEN_IMAGE_MAX = 48 * 1024 * 1024;
+constexpr std::size_t HEN_IMAGES_MAX = 96 * 1024 * 1024;
+struct HenLaunchImage {
+    std::string code_from;  ///< the file the code came from (the title's own or its update's)
+    std::vector<u8> code;   ///< empty: not kept
+    u64 hash = 0;
+    bool no_update = false; ///< looked for, and nothing loadable was there
+    std::map<std::string, std::pair<ResultStatus, std::vector<u8>>> sections;
+};
+std::mutex hen_launch_mutex;
+std::map<std::string, HenLaunchImage> hen_launch_images; // by the title's file
+std::size_t hen_launch_bytes = 0;
+unsigned hen_launch_hits = 0;
+} // namespace
+
+void HenLaunchCacheForget() {
+    std::scoped_lock lock{hen_launch_mutex};
+    hen_launch_images.clear();
+    hen_launch_bytes = 0;
+}
+
+void HenLaunchCacheStats(unsigned* hits, unsigned* images, unsigned long long* bytes) {
+    std::scoped_lock lock{hen_launch_mutex};
+    *hits = hen_launch_hits;
+    *images = static_cast<unsigned>(hen_launch_images.size());
+    *bytes = hen_launch_bytes;
+}
 
 FileType AppLoader_NCCH::IdentifyType(FileUtil::IOFileBase* in_file) {
     u32 magic{};
@@ -127,12 +202,32 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
 
     std::vector<u8> code;
     u64_le program_id;
-    if (ResultStatus::Success == ReadCode(code) &&
+    const unsigned long long hen_read_start = HEN_LAUNCH_NOW();
+    // (hen_launch_cache, above) The whole image from memory if this title's code was read
+    // before in this run from the same file: no read, no decompression, no patch look-up.
+    const bool hen_cache = hen_launch_cache && hen_relaunchable;
+    bool hen_cached = false;
+    u64 hen_hash = 0;
+    if (hen_cache) {
+        std::scoped_lock lock{hen_launch_mutex};
+        const auto found = hen_launch_images.find(filepath);
+        if (found != hen_launch_images.end() && !found->second.code.empty() &&
+            found->second.code_from == overlay_ncch->HenFilePath()) {
+            code = found->second.code;
+            hen_hash = found->second.hash;
+            hen_cached = true;
+            hen_launch_hits++;
+        }
+    }
+    if ((hen_cached || ResultStatus::Success == ReadCode(code)) &&
         ResultStatus::Success == ReadProgramId(program_id)) {
-        if (IsGbaVirtualConsole(code)) {
+        HEN_LAUNCH_ADD(0, hen_read_start);
+        if (!hen_cached && IsGbaVirtualConsole(code)) {
             LOG_ERROR(Loader, "Encountered unsupported GBA Virtual Console code section.");
             return ResultStatus::ErrorGbaTitle;
         }
+        const unsigned long long hen_make_start = HEN_LAUNCH_NOW();
+        unsigned long long hen_make_out = 0; // (patching, timed apart)
 
         std::string process_name = Common::StringFromFixedZeroTerminatedBuffer(
             (const char*)overlay_ncch->exheader_header.codeset_info.name, 8);
@@ -153,7 +248,9 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
         // TODO(yuriks): Not sure if the bss size is added to the page-aligned .data size or just
         //               to the regular size. Playing it safe for now.
         u32 bss_page_size = (overlay_ncch->exheader_header.codeset_info.bss_size + 0xFFF) & ~0xFFF;
-        code.resize(code.size() + bss_page_size, 0);
+        if (!hen_cached) { // (the kept image has its .bss)
+            code.resize(code.size() + bss_page_size, 0);
+        }
 
         codeset->DataSegment().offset =
             codeset->RODataSegment().offset + codeset->RODataSegment().size;
@@ -164,12 +261,38 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
             bss_page_size;
 
         // Apply patches now that the entire codeset (including .bss) has been allocated
-        const ResultStatus patch_result = overlay_ncch->ApplyCodePatch(code);
+        const unsigned long long hen_patch_start = HEN_LAUNCH_NOW();
+        // (the kept image is the patched one)
+        const ResultStatus patch_result =
+            hen_cached ? ResultStatus::ErrorNotUsed : overlay_ncch->ApplyCodePatch(code);
         if (patch_result != ResultStatus::Success && patch_result != ResultStatus::ErrorNotUsed)
             return patch_result;
+        if (!hen_cached && (hen_cache || (hen_jit_park && hen_relaunchable))) {
+            // The image's hash, once per image when it is kept, at every start otherwise.
+            hen_hash = Common::ComputeHash64(code.data(), code.size());
+            if (hen_hash == 0) {
+                hen_hash = 1; // (0 means "not known")
+            }
+            if (hen_cache && code.size() <= HEN_IMAGE_MAX) {
+                std::scoped_lock lock{hen_launch_mutex};
+                if (hen_launch_bytes + code.size() > HEN_IMAGES_MAX) {
+                    hen_launch_images.clear();
+                    hen_launch_bytes = 0;
+                }
+                HenLaunchImage& image = hen_launch_images[filepath];
+                hen_launch_bytes -= image.code.size();
+                image.code_from = overlay_ncch->HenFilePath();
+                image.code = code;
+                image.hash = hen_hash;
+                hen_launch_bytes += image.code.size();
+            }
+        }
+        HEN_LAUNCH_ADD(1, hen_patch_start);
+        hen_make_out = HEN_LAUNCH_NOW() - hen_patch_start;
 
         codeset->entrypoint = codeset->CodeSegment().addr;
         codeset->memory = std::move(code);
+        codeset->hen_image_hash = hen_relaunchable ? hen_hash : 0;
 
         process = system.Kernel().CreateProcess(std::move(codeset));
 
@@ -241,7 +364,15 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
         product_info.maker_code = overlay_ncch->ncch_header.maker_code;
         fs_user->RegisterProductInfo(process->process_id, product_info);
 
+        const unsigned long long hen_run_start = HEN_LAUNCH_NOW();
+#if defined(__SWITCH__) && HEN_DEV
+        Service::NS::hen_launch_ns[4] += hen_run_start - hen_make_start - hen_make_out;
+#else
+        (void)hen_make_start;
+        (void)hen_make_out;
+#endif
         process->Run(priority, stack_size);
+        HEN_LAUNCH_ADD(2, hen_run_start);
         return ResultStatus::Success;
     }
     return ResultStatus::Error;
@@ -301,15 +432,31 @@ ResultStatus AppLoader_NCCH::Load(std::shared_ptr<Kernel::Process>& process) {
 
     bool is_dlp_child = (ncch_program_id & 0xFFFFFFFF00000000) == DLP_CHILD_TID_HIGH;
 
-    if (!is_dlp_child) {
+    const unsigned long long hen_update_start = HEN_LAUNCH_NOW();
+    // (hen_launch_cache, above) A title that had no loadable update the last time it was
+    // started in this run is not looked up again; an install forgets that.
+    bool hen_no_update = false;
+    if (hen_launch_cache && hen_relaunchable) {
+        std::scoped_lock lock{hen_launch_mutex};
+        const auto found = hen_launch_images.find(filepath);
+        hen_no_update = found != hen_launch_images.end() && found->second.no_update;
+    }
+    if (!is_dlp_child && !hen_no_update) {
         u64 update_tid = (ncch_program_id & 0xFFFFFFFFULL) | UPDATE_TID_HIGH;
         update_ncch.OpenFile(
-            Service::AM::GetTitleContentPath(Service::FS::MediaType::SDMC, update_tid));
+            hen_relaunchable
+                ? Service::AM::GetTitleContentPathForLaunch(Service::FS::MediaType::SDMC,
+                                                            update_tid)
+                : Service::AM::GetTitleContentPath(Service::FS::MediaType::SDMC, update_tid));
         result = update_ncch.Load();
         if (result == ResultStatus::Success) {
             overlay_ncch = &update_ncch;
+        } else if (hen_launch_cache && hen_relaunchable) {
+            std::scoped_lock lock{hen_launch_mutex};
+            hen_launch_images[filepath].no_update = true;
         }
     }
+    HEN_LAUNCH_ADD(3, hen_update_start);
 
     if (auto room_member = Network::GetRoomMember().lock()) {
         Network::GameInfo game_info;
@@ -324,11 +471,41 @@ ResultStatus AppLoader_NCCH::Load(std::shared_ptr<Kernel::Process>& process) {
     if (ResultStatus::Success != result)
         return result;
 
+    const unsigned long long hen_self_start = HEN_LAUNCH_NOW();
     system.ArchiveManager().RegisterSelfNCCH(*this);
+    HEN_LAUNCH_ADD(5, hen_self_start);
 
+    const unsigned long long hen_region_start = HEN_LAUNCH_NOW();
     ParseRegionLockoutInfo(ncch_program_id);
+    HEN_LAUNCH_ADD(6, hen_region_start);
 
     return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_NCCH::HenReadSection(const char* name, std::vector<u8>& buffer) {
+    if (!(hen_launch_cache && hen_relaunchable)) {
+        return overlay_ncch->LoadSectionExeFS(name, buffer);
+    }
+    {
+        std::scoped_lock lock{hen_launch_mutex};
+        const auto image = hen_launch_images.find(filepath);
+        if (image != hen_launch_images.end() && image->second.code_from == overlay_ncch->HenFilePath()) {
+            const auto found = image->second.sections.find(name);
+            if (found != image->second.sections.end()) {
+                buffer = found->second.second;
+                return found->second.first;
+            }
+        }
+    }
+    const ResultStatus result = overlay_ncch->LoadSectionExeFS(name, buffer);
+    // (kept only beside a code image from the same file, and small: these are icons)
+    std::scoped_lock lock{hen_launch_mutex};
+    const auto image = hen_launch_images.find(filepath);
+    if (image != hen_launch_images.end() && image->second.code_from == overlay_ncch->HenFilePath() &&
+        buffer.size() <= 1024 * 1024) {
+        image->second.sections.insert_or_assign(name, std::make_pair(result, buffer));
+    }
+    return result;
 }
 
 ResultStatus AppLoader_NCCH::IsExecutable(bool& out_executable) {
@@ -345,15 +522,15 @@ ResultStatus AppLoader_NCCH::ReadCode(std::vector<u8>& buffer) {
 }
 
 ResultStatus AppLoader_NCCH::ReadIcon(std::vector<u8>& buffer) {
-    return overlay_ncch->LoadSectionExeFS("icon", buffer);
+    return HenReadSection("icon", buffer);
 }
 
 ResultStatus AppLoader_NCCH::ReadBanner(std::vector<u8>& buffer) {
-    return overlay_ncch->LoadSectionExeFS("banner", buffer);
+    return HenReadSection("banner", buffer);
 }
 
 ResultStatus AppLoader_NCCH::ReadLogo(std::vector<u8>& buffer) {
-    return overlay_ncch->LoadSectionExeFS("logo", buffer);
+    return HenReadSection("logo", buffer);
 }
 
 ResultStatus AppLoader_NCCH::ReadProgramId(u64& out_program_id) {

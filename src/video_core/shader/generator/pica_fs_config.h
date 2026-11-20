@@ -68,6 +68,12 @@ struct FramebufferConfig {
         BitField<6, 4, Pica::FramebufferRegs::LogicOp> logic_op;
         BitField<10, 1, u32> shadow_rendering;
         BitField<11, 1, u32> alphablend_enable;
+        // (hen, --early-depth) The viewport's depth range applies the depth scale and offset:
+        // gl_FragCoord.z is the final depth and the shader does not write gl_FragDepth. Set by
+        // the Vulkan rasterizer per draw, never from the registers. Not in StructHash on
+        // purpose: it took a bit that was always 0, so every entry of a cache written before
+        // it still means what it meant (a shader with the depth write) and no cache is reset.
+        BitField<12, 1, u32> hen_no_depth_write;
     };
     BlendConfig requested_rgb_blend{};
     BlendConfig requested_alpha_blend{};

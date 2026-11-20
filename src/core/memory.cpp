@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <boost/serialization/array.hpp>
@@ -48,6 +49,12 @@ constexpr u32 SIGSEGV = 11;
 extern "C" int hen_read_table; // hen/jit/hen_jit.c: --no-read-table
 #else
 static constexpr int hen_read_table = 0;
+#endif
+
+#ifdef __SWITCH__
+namespace Core {
+void HenForgetPageTable(const std::shared_ptr<Memory::PageTable>& table); // arm/dynarmic/arm_dynarmic.cpp
+}
 #endif
 
 namespace Memory {
@@ -672,14 +679,50 @@ void MemorySystem::RegisterPageTable(std::shared_ptr<PageTable> page_table) {
 
 void MemorySystem::UnregisterPageTable(std::shared_ptr<PageTable> page_table) {
     VideoCore::HenGpu::Drain(VideoCore::HenGpu::WaitMap);
+#ifdef __SWITCH__
+    // (the process is gone: the CPU cores drop the JITs they made for it)
+    Core::HenForgetPageTable(page_table);
+#endif
     auto it = std::find(impl->page_table_list.begin(), impl->page_table_list.end(), page_table);
     if (it != impl->page_table_list.end()) {
         impl->page_table_list.erase(it);
     }
 }
 
+void MemorySystem::HenSwapPageTable(const std::shared_ptr<PageTable>& unused,
+                                    std::shared_ptr<PageTable> adopted) {
+    VideoCore::HenGpu::Drain(VideoCore::HenGpu::WaitMap); // (it walks this list)
+    auto it = std::find(impl->page_table_list.begin(), impl->page_table_list.end(), unused);
+    if (it != impl->page_table_list.end()) {
+        *it = std::move(adopted);
+    } else {
+        impl->page_table_list.push_back(std::move(adopted));
+    }
+}
+
 template <typename T>
 void MemorySystem::UnmappedAccess(const VAddr vaddr, const T value, bool read) {
+#ifdef __SWITCH__
+    // (Kaizhar) A program that runs away over unmapped memory does this thousands
+    // of times, and every line is an error line: written to the card at once, about 3 ms each.
+    // The error applet can do 22,000 of them in a minute, 2.6 MB of log, and the
+    // emulated console stands still behind the writes. The first 64 of a title are logged in
+    // full, then every one whose count is a power of two, with the count.
+    static std::atomic<u64> hen_unmapped{0};
+    static std::atomic<const void*> hen_unmapped_system{nullptr};
+    const void* const hen_now = impl->system.Kernel().GetCurrentProcess().get();
+    if (hen_unmapped_system.exchange(hen_now) != hen_now) {
+        hen_unmapped = 0; // (another process: its first ones are said again)
+    }
+    const u64 hen_count = ++hen_unmapped;
+    if (hen_count > 64 && (hen_count & (hen_count - 1)) != 0) {
+        return;
+    }
+    if (hen_count > 64) {
+        LOG_ERROR(HW_Memory, "unmapped access number {} of this process (only powers of two are logged from here)",
+                  hen_count);
+    }
+#endif
     const std::string mode = (read ? "Read" : "Write");
     const std::string value_str = read ? std::string("") : fmt::format(" 0x{:08X}", value);
     const std::string message = fmt::format("unmapped {}{}{} @ 0x{:08X} at PC 0x{:08X}", mode,
@@ -1022,7 +1065,7 @@ MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address
     // written here without a lock, which is fine on one thread. With the GPU thread the
     // emulation thread and the GPU thread both come through here, and a reader could take one
     // region's memory with another's start address: an offset far outside the memory, and the
-    // MemoryRef assertion (memory_ref.h:85) that ended a Mario Kart 7 run on 2026-11-12, or,
+    // MemoryRef assertion (memory_ref.h) that can end a run, or,
     // unnoticed, a read from the wrong place. Four regions: looking them up costs nothing.
     PhysMemRegionInfo info{};
 

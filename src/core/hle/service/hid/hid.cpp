@@ -18,6 +18,7 @@
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/kernel/shared_page.h"
 #include "core/hle/service/hid/hid.h"
+#include "core/hle/service/hid/hid_test_input.h"
 #include "core/hle/service/hid/hid_spvr.h"
 #include "core/hle/service/hid/hid_user.h"
 #include "core/hle/service/ir/ir_rst.h"
@@ -216,6 +217,7 @@ void Module::UpdatePadCallback(std::uintptr_t user_data, s64 cycles_late) {
         state.select.Assign(buttons[Select - BUTTON_HID_BEGIN]->GetStatus());
         state.debug.Assign(buttons[Debug - BUTTON_HID_BEGIN]->GetStatus());
         state.gpio14.Assign(buttons[Gpio14 - BUTTON_HID_BEGIN]->GetStatus());
+        TestInput::Apply(system, state.hex); // (tests on a computer: hid_test_input.h)
 
         // Get current circle pad position and update circle pad direction
         float circle_pad_x_f, circle_pad_y_f;
@@ -422,6 +424,12 @@ void Module::Interface::GetIPCHandles(Kernel::HLERequestContext& ctx) {
     rb.Push(ResultSuccess);
     rb.PushCopyObjects(hid->shared_mem, hid->event_pad_or_touch_1, hid->event_pad_or_touch_2,
                        hid->event_accelerometer, hid->event_gyroscope, hid->event_debug_pad);
+#ifdef __SWITCH__
+    // (a fixed point of a title's start, for the playback of a recorded route: core/movie.h)
+    if (const auto process = ctx.ClientThread()->owner_process.lock(); process && process->codeset) {
+        hid->system.Movie().HenTitleAskedForPad(process->codeset->program_id);
+    }
+#endif
 }
 
 void Module::Interface::EnableAccelerometer(Kernel::HLERequestContext& ctx) {

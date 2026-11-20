@@ -317,10 +317,14 @@ else()
 endif()
 
 # OpenSSL
-if (NINTENDO_SWITCH)
-    # Switch 2: no TLS library (LibreSSL doesn't build for libnx, and the console stays offline).
-    # hen/compat has the one OpenSSL function the core needs without TLS (RAND_bytes); the 3DS
-    # HTTP service can't make HTTPS requests (http_c.cpp).
+if (NINTENDO_SWITCH AND KAIZHAR_TLS)
+    # Switch 2: LibreSSL with what the console's C library lacks added.
+    set(KAIZHAR_LIBRESSL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libressl)
+    include(${PROJECT_SOURCE_DIR}/src/citra_switch/tls/libressl_switch.cmake)
+elseif (NINTENDO_SWITCH)
+    # Switch 2 without KAIZHAR_TLS: no TLS library. hen/compat has the one OpenSSL function the
+    # core needs without TLS (RAND_bytes); the 3DS HTTP service can't make HTTPS requests
+    # (http_c.cpp).
     set(OPENSSL_LIBRARIES "")
 elseif (USE_SYSTEM_OPENSSL)
     find_package(OpenSSL 1.1)
@@ -363,7 +367,7 @@ else()
     target_include_directories(httplib INTERFACE ./httplib)
     target_disable_warnings(httplib)
 endif()
-if (NINTENDO_SWITCH)
+if (NINTENDO_SWITCH AND NOT KAIZHAR_TLS)
     target_include_directories(httplib INTERFACE ${PROJECT_SOURCE_DIR}/hen/compat)
 else()
     target_compile_options(httplib INTERFACE -DCPPHTTPLIB_OPENSSL_SUPPORT)

@@ -9,6 +9,7 @@
 #include "common/hash.h"
 #include <mutex>
 #include <unordered_set>
+#include "common/hen_gap.h"
 #include "common/hen_stats.h"
 #include "common/microprofile.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
@@ -31,23 +32,23 @@ extern "C" void hen_jit_profile_retarget(void);
 static constexpr int hen_pipe_log = 0;
 #endif
 extern "C" int hen_pipeline_libraries;
-extern "C" int hen_pipe_dedup; // --no-pipe-dedup
-extern "C" unsigned long long hen_pipe_parked;
 /// How often a pre-rasterization or fragment part is asked of the driver that is identical to
 /// one asked before (same shader modules, state, layout and render pass), and the time those
 /// requests take: what keeping the parts and sharing them between pipelines would save.
-static std::mutex hen_repeat_mutex;
-static std::unordered_set<u64> hen_part_seen[2];
+HEN_STAT(static std::mutex hen_repeat_mutex;)
+HEN_STAT(static std::unordered_set<u64> hen_part_seen[2];)
 // The generic fragment shader's part of a pipeline, kept for reuse. The driver keeps the
 // vertex side of a pipeline in its cache and gives a repeat back in microseconds, but a
 // repeat of a fragment shader part costs as much as the first. (Keeping every fragment
-// shader's part was tried on 2026-11-13: fewer requests to the driver, time and counts
+// shader's part as well gives fewer requests to the driver and leaves time and counts
 // unchanged.) Keyed by the fragment shader's id (not its module: a handle can come back for
-// another shader), layout, render pass and sample count, and by the depth state only where
+// another shader; the variant without the depth write has an id of its own, so its parts
+// are kept apart), layout, render pass and sample count, and by the depth state only where
 // that is not dynamic state. Emptied when the pipeline cache goes (HenDestroyPipelineParts).
 extern "C" unsigned long long hen_part_cache_hits;
 static std::mutex hen_part_cache_mutex;
 static std::unordered_map<u64, VkPipeline> hen_part_cache_map;
+#if HEN_DEV
 static std::array<std::atomic<u64>, 2> hen_part_requests{}, hen_part_repeats{}, hen_part_repeat_ns{};
 extern "C" void hen_gfx_part_repeat_stats(unsigned long long* out) {
     for (int i = 0; i < 2; i++) {
@@ -56,6 +57,7 @@ extern "C" void hen_gfx_part_repeat_stats(unsigned long long* out) {
         out[3 * i + 2] = hen_part_repeat_ns[i].exchange(0);
     }
 }
+#endif
 static u64 HenHashBytes(u64 h, const void* data, std::size_t size) {
     const u8* bytes = static_cast<const u8*>(data);
     for (std::size_t i = 0; i < size; i++) {
@@ -63,6 +65,7 @@ static u64 HenHashBytes(u64 h, const void* data, std::size_t size) {
     }
     return h;
 }
+#if HEN_DEV
 /// Time in each of the four parts of pipelines the driver had to compile (not its cache hits).
 static std::array<std::atomic<u64>, 4> hen_part_ns{}, hen_part_count{};
 extern "C" void hen_gfx_part_stats(unsigned long long* out) {
@@ -71,6 +74,7 @@ extern "C" void hen_gfx_part_stats(unsigned long long* out) {
         out[2 * i + 1] = hen_part_ns[i].exchange(0);
     }
 }
+#endif
 #endif
 
 #include <chrono>
@@ -160,23 +164,51 @@ void HenDestroyPipelineParts(vk::Device device) {
 namespace {
 std::atomic<unsigned long long> hen_count[HEN_GFX_KINDS], hen_ns[HEN_GFX_KINDS],
     hen_max[HEN_GFX_KINDS];
+/// Set around a Build that the caller of TryBuild waits for on its own thread.
+thread_local bool hen_build_here = false;
 }
-extern "C" void hen_gfx_note(int kind, unsigned long long ns) {
+// (hen/jit/hen_jit.c) those builds: count, ns, longest ns; the frontend's report empties them
+extern "C" unsigned long long hen_here_builds[3];
+extern "C" void hen_gfx_count(int kind, unsigned long long ns) {
     if (kind < 0 || kind >= HEN_GFX_KINDS) {
         return;
     }
+#if !HEN_DEV
+    // (a release build reads one kind: the pipelines compiled, for the session report)
+    if (kind != HEN_GFX_PIPELINE_COMPILE) {
+        return;
+    }
+#endif
     hen_count[kind]++;
     hen_ns[kind] += ns;
+    // (for the line about a gap between two frames: common/hen_gap.h)
+    switch (kind) {
+    // (a build on the renderer's own thread is that thread standing still for a pipeline:
+    // it goes with the waits, not with the workers' summed time)
+    case HEN_GFX_PIPELINE_COMPILE:
+        hen_gap_add(hen_build_here ? HEN_GAP_PIPELINE_WAIT : HEN_GAP_PIPELINES, ns);
+        break;
+    case HEN_GFX_SHADER_COMPILE: hen_gap_add(HEN_GAP_SHADERS, ns); break;
+    case HEN_GFX_PIPELINE_WAIT: hen_gap_add(HEN_GAP_PIPELINE_WAIT, ns); break;
+    case HEN_GFX_SOFTWARE_DRAW: hen_gap_add(HEN_GAP_CPU_DRAWS, ns); break;
+    case HEN_GFX_DOWNLOAD_FINISH: hen_gap_add(HEN_GAP_DOWNLOADS, ns); break;
+    case HEN_GFX_GPU_WAIT: hen_gap_add(HEN_GAP_DRIVER_WAIT, ns); break;
+    case HEN_GFX_MEM_FLUSH: hen_gap_add(HEN_GAP_CACHE_FLUSH, ns); break;
+    case HEN_GFX_FILE_SYNC: hen_gap_add(HEN_GAP_TITLE_READS, ns); break;
+    default: break;
+    }
     if (ns > hen_max[kind].load(std::memory_order_relaxed)) {
         hen_max[kind].store(ns, std::memory_order_relaxed);
     }
 }
+#if HEN_DEV
 /// Adds to a kind's count only (events counted elsewhere without atomics).
 extern "C" void hen_gfx_add(int kind, unsigned long long count) {
     if (kind >= 0 && kind < HEN_GFX_KINDS) {
         hen_count[kind] += count;
     }
 }
+#endif
 /// Per kind: count, total and longest time in nanoseconds since the last call.
 extern "C" void hen_gfx_stats(unsigned long long* out) {
     for (int k = 0; k < HEN_GFX_KINDS; k++) {
@@ -216,18 +248,18 @@ bool GraphicsPipeline::TryBuild(bool wait_built, bool fast_lane) {
     if (fast_lane && hen_fast_worker != nullptr) {
         if (!is_pending && !shaders_pending) {
             hen_fast_worker->QueueWork([this] {
-                const auto before = std::chrono::steady_clock::now();
+                HEN_STAT(const auto before = std::chrono::steady_clock::now();)
                 hen_standin_build = 1;
                 Build();
                 hen_standin_build = 0;
-                const unsigned long long took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                HEN_STAT(const unsigned long long took = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                     std::chrono::steady_clock::now() - before)
                                                     .count();
                 __atomic_fetch_add(&hen_standin_stats[3], 1, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&hen_standin_stats[4], took, __ATOMIC_RELAXED);
                 if (took > hen_standin_stats[5]) {
                     hen_standin_stats[5] = took;
-                }
+                })
             });
             is_pending = true;
         }
@@ -240,53 +272,31 @@ bool GraphicsPipeline::TryBuild(bool wait_built, bool fast_lane) {
     // The same when its shaders are still being compiled (by the shader workers, which are
     // not behind the pipelines): Build waits for them, a few tens of milliseconds at most.
     if (wait_built) {
+        // (counted apart: "hen: gfx: pipelines built on the GPU thread")
+        const auto here_start = std::chrono::steady_clock::now();
+        hen_build_here = true;
         Build();
+        hen_build_here = false;
+        const unsigned long long here_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 here_start)
+                .count();
+        __atomic_fetch_add(&hen_here_builds[0], 1ull, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&hen_here_builds[1], here_ns, __ATOMIC_RELAXED);
+        if (here_ns > hen_here_builds[2]) {
+            hen_here_builds[2] = here_ns;
+        }
         return true;
     }
 #endif
 
     // Fallback to (a)synchronous compilation
 #ifdef __SWITCH__
-    // (Switch 2 port) One compile of a vertex shader at a time. The driver takes 150 to 700 ms
-    // over the vertex side of a pipeline and keeps the result, but it does not notice that the
-    // same shader is already being compiled on another thread: every pipeline that asked for
-    // it in the meantime compiled it again. A first launch of Pokemon Omega Ruby compiled 89
-    // vertex sides for 11 vertex shaders, 8 s of work. So the first pipeline with a given
-    // vertex and geometry shader builds; the others wait in a list and are queued again when
-    // it is done, by which time the driver has their vertex side ready.
     worker->QueueWork([this] {
 #if HEN_DEV
         hen_jit_profile_retarget();
 #endif
-        struct InFlight {
-            std::mutex mutex;
-            std::map<std::pair<Shader*, Shader*>, std::vector<GraphicsPipeline*>> waiting;
-        };
-        static InFlight in_flight;
-        const std::pair<Shader*, Shader*> key{stages[0], stages[2]};
-        if (hen_pipe_dedup) {
-            std::scoped_lock lock{in_flight.mutex};
-            const auto it = in_flight.waiting.find(key);
-            if (it != in_flight.waiting.end()) {
-                it->second.push_back(this);
-                hen_pipe_parked++; // (under the lock; reported by main.cpp)
-                return;
-            }
-            in_flight.waiting.emplace(key, std::vector<GraphicsPipeline*>{});
-        }
         Build();
-        if (hen_pipe_dedup) {
-            std::vector<GraphicsPipeline*> others;
-            {
-                std::scoped_lock lock{in_flight.mutex};
-                const auto it = in_flight.waiting.find(key);
-                others = std::move(it->second);
-                in_flight.waiting.erase(it);
-            }
-            for (GraphicsPipeline* other : others) {
-                other->worker->QueueWork([other] { other->Build(); });
-            }
-        }
     });
 #else
     worker->QueueWork([this] { Build(); });
@@ -416,7 +426,7 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         .pScissors = &scissor,
     };
 
-    boost::container::static_vector<vk::DynamicState, 14> dynamic_states = {
+    boost::container::static_vector<vk::DynamicState, 15> dynamic_states = {
         vk::DynamicState::eViewport,           vk::DynamicState::eScissor,
         vk::DynamicState::eStencilCompareMask, vk::DynamicState::eStencilWriteMask,
         vk::DynamicState::eStencilReference,   vk::DynamicState::eBlendConstants,
@@ -431,6 +441,12 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         };
         dynamic_states.insert(dynamic_states.end(), extended.begin(), extended.end());
     }
+#ifdef __SWITCH__
+    // (the fragment size: 1x1 for every draw but the generic fragment shader's, PipelineCache::BindPipeline)
+    if (instance.HenCoarseShading() != 0) {
+        dynamic_states.push_back(vk::DynamicState::eFragmentShadingRateKHR);
+    }
+#endif
 
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
@@ -524,7 +540,7 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
             u64 cache_key = 0;
             // (the generic fragment shader: it is the one part worth keeping, tens of
             // milliseconds to compile and wanted again with every blend and depth state)
-            if (slot == 2 && info.state.shader_ids[1] == HEN_GENERIC_FS_ID) {
+            if (slot == 2 && HenIsGenericFs(info.state.shader_ids[1])) {
                 cache_key = 0xcbf29ce484222325ull;
                 cache_key = HenHashBytes(cache_key, &info.state.shader_ids[1],
                                          sizeof(info.state.shader_ids[1])); // (ProgramType::FS)
@@ -542,18 +558,19 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
                 if (const auto found = hen_part_cache_map.find(cache_key);
                     found != hen_part_cache_map.end()) {
                     borrowed[slot] = vk::Pipeline{found->second};
-                    hen_part_cache_hits++;
+                    HEN_STAT(hen_part_cache_hits++;)
                     return;
                 }
             }
             const vk::GraphicsPipelineLibraryCreateInfoEXT part{.flags = which};
             create.pNext = &part;
             create.flags = vk::PipelineCreateFlagBits::eLibraryKHR | fail_flag;
-            const auto part_start = std::chrono::steady_clock::now();
+            HEN_STAT(const auto part_start = std::chrono::steady_clock::now();)
             create.layout = pipeline_info.layout;
             create.renderPass = pipeline_info.renderPass;
             create.pDynamicState = &dynamic_info;
-            bool hen_repeat = false;
+            // (the development builds' figures: repeats of a part, and the time in each part)
+            HEN_STAT(bool hen_repeat = false;
             if (slot == 1 || slot == 2) {
                 u64 key = 0xcbf29ce484222325ull;
                 for (u32 i = 0; i < create.stageCount; i++) {
@@ -572,9 +589,9 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
                 std::scoped_lock lock{hen_repeat_mutex};
                 hen_repeat = !hen_part_seen[slot - 1].insert(key).second;
                 hen_part_requests[slot - 1]++;
-            }
+            })
             auto made = device.createGraphicsPipelineUnique(pipeline_cache, create);
-            if (hen_standin_build && !fail_on_compile_required) {
+            HEN_STAT(if (hen_standin_build && !fail_on_compile_required) {
                 __atomic_fetch_add(&hen_standin_part_ns[slot],
                                    static_cast<unsigned long long>(
                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -597,7 +614,7 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
                                          std::chrono::steady_clock::now() - part_start)
                                          .count();
                 hen_part_count[slot]++;
-            }
+            })
             if (made.result == vk::Result::eSuccess) {
                 owned[slot] = std::move(made.value);
                 if (cache_key != 0) {
@@ -654,16 +671,16 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
                 .flags = fail_flag,
                 .layout = pipeline_info.layout,
             };
-            const auto link_start = std::chrono::steady_clock::now();
+            HEN_STAT(const auto link_start = std::chrono::steady_clock::now();)
             auto linked = device.createGraphicsPipelineUnique(pipeline_cache, link);
-            if (hen_standin_build && !fail_on_compile_required) {
+            HEN_STAT(if (hen_standin_build && !fail_on_compile_required) {
                 __atomic_fetch_add(&hen_standin_part_ns[4],
                                    static_cast<unsigned long long>(
                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - link_start)
                                            .count()),
                                    __ATOMIC_RELAXED);
-            }
+            })
             if (linked.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
                 return false;
             }

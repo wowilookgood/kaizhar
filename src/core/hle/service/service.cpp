@@ -14,6 +14,7 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/server_port.h"
 #include "core/hle/kernel/server_session.h"
+#include "core/hle/kernel/thread.h"
 #include "core/hle/service/ac/ac.h"
 #include "core/hle/service/act/act.h"
 #include "core/hle/service/am/am.h"
@@ -152,6 +153,10 @@ void ServiceFrameworkBase::RegisterHandlersBase(const FunctionInfoBase* function
     }
 }
 
+/// (Kaizhar) " from process N NAME, thread N" while HandleSyncRequest reports a call nothing
+/// answers; empty otherwise. Only the thread that runs the emulated console uses it.
+static std::string unimplemented_caller;
+
 void ServiceFrameworkBase::ReportUnimplementedFunction(u32* cmd_buf, const FunctionInfoBase* info) {
     IPC::Header header{cmd_buf[0]};
     int num_params = header.normal_params_size + header.translate_params_size;
@@ -166,6 +171,9 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(u32* cmd_buf, const Funct
     }
 
     result.push_back('}');
+    // (Kaizhar) who asked: with system modules running as the console's own code, the title
+    // or one of them
+    result += unimplemented_caller;
 
     LOG_ERROR(Service, "unknown / unimplemented {}", result);
     // TODO(bunnei): Hack - ignore error
@@ -180,12 +188,41 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
     const FunctionInfoBase* info = itr == handlers.end() ? nullptr : &itr->second;
     if (info == nullptr || info->handler_callback == nullptr) {
         context.ReportUnimplemented();
-        return ReportUnimplementedFunction(context.CommandBuffer(), info);
+        const auto thread = context.ClientThread();
+        if (const auto process = thread ? thread->owner_process.lock() : nullptr) {
+            unimplemented_caller =
+                fmt::format(" from process {} {}, thread {}", process->process_id,
+                            process->codeset ? process->codeset->GetName() : "?", thread->thread_id);
+        }
+        ReportUnimplementedFunction(context.CommandBuffer(), info);
+        unimplemented_caller.clear();
+        return;
     }
 
     LOG_TRACE(Service, "{}",
               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+#ifndef __SWITCH__
+    // Tests on a computer (KAIZHAR_TEST_TRACE set): every local wireless and download play
+    // command with what it was given and what it answered.
+    static const bool trace = std::getenv("KAIZHAR_TEST_TRACE") != nullptr;
+    const bool traced = trace && (service_name.rfind("dlp:", 0) == 0 || service_name == "nwm::UDS");
+    std::string asked;
+    if (traced) {
+        asked = MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer());
+    }
+#endif
     handler_invoker(this, info->handler_callback, context);
+#ifndef __SWITCH__
+    if (traced) {
+        const u32* answer = context.CommandBuffer();
+        const int words = (answer[0] & 0x3F) + ((answer[0] >> 6) & 0x3F);
+        std::string answered;
+        for (int i = 1; i <= words && i < 8; ++i) {
+            answered += fmt::format(" {:#X}", answer[i]);
+        }
+        LOG_INFO(Service, "TRACE {} ->{}", asked, answered);
+    }
+#endif
 }
 
 std::string ServiceFrameworkBase::GetFunctionName(IPC::Header header) const {

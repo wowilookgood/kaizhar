@@ -26,6 +26,11 @@ public:
 
 private:
     std::unordered_map<u64, std::unique_ptr<JitShader>> cache;
+#ifdef __SWITCH__
+    /// (Switch 2 port, --vs-jit-async) Programs being compiled by a shader worker.
+    struct HenJob;
+    std::unordered_map<u64, std::shared_ptr<HenJob>> hen_jobs;
+#endif
 };
 
 } // namespace Pica::Shader

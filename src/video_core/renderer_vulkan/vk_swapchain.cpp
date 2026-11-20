@@ -90,16 +90,27 @@ void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool lo
     RefreshSemaphores();
 }
 
-bool Swapchain::AcquireNextImage() {
+bool Swapchain::AcquireNextImage(bool with_fence) {
     if (needs_recreation) {
         return false;
     }
 
     MICROPROFILE_SCOPE(Vulkan_Acquire);
     const vk::Device device = instance.GetDevice();
+    // (Kaizhar, --present-cpu-acquire) The driver hands out an image the display may still
+    // be showing, and puts the display's release of it into the semaphore or fence given here
+    // (this driver's window system layer does so). In a semaphore, the copy to
+    // the image waits for the release inside the GPU's queue, and whatever is submitted after
+    // it waits behind it: a surface download took 22 to 52 ms at 60 Hz for a millisecond of
+    // work. In a fence, the present thread waits for the release itself (WaitAcquired) and
+    // nothing in the queue waits for the display.
     const vk::Result result =
-        device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
-                                   image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+        with_fence
+            ? device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                         VK_NULL_HANDLE, acquire_fence, &image_index)
+            : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                         image_acquired[frame_index], VK_NULL_HANDLE,
+                                         &image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -116,6 +127,23 @@ bool Swapchain::AcquireNextImage() {
     }
 
     return !needs_recreation;
+}
+
+void Swapchain::WaitAcquired() {
+    const vk::Device device = instance.GetDevice();
+    for (;;) {
+        const vk::Result result =
+            device.waitForFences(acquire_fence, true, std::numeric_limits<u64>::max());
+        if (result == vk::Result::eSuccess) {
+            break;
+        }
+        if (result != vk::Result::eTimeout) {
+            LOG_CRITICAL(Render_Vulkan, "Waiting for the acquired image returned {}", result);
+            break; // (go on: as if the image were free, which is what a semaphore-less copy assumes)
+        }
+    }
+    // (unsignalled for the next acquire)
+    device.resetFences(acquire_fence);
 }
 
 void Swapchain::Present() {
@@ -270,6 +298,11 @@ void Swapchain::Destroy() {
     }
     image_acquired.clear();
     present_ready.clear();
+    // (a fence that an acquire of the old swapchain signalled, or was about to, goes with it)
+    if (acquire_fence) {
+        device.destroyFence(acquire_fence);
+        acquire_fence = VK_NULL_HANDLE;
+    }
 }
 
 void Swapchain::RefreshSemaphores() {
@@ -282,6 +315,9 @@ void Swapchain::RefreshSemaphores() {
     }
     for (vk::Semaphore& semaphore : present_ready) {
         semaphore = device.createSemaphore({});
+    }
+    if (!acquire_fence) {
+        acquire_fence = device.createFence({});
     }
 
     if (instance.HasDebuggingToolAttached()) {

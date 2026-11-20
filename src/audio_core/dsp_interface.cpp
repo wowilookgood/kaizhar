@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
+#include <array>
 #include <algorithm>
 #include <cstddef>
 #include <vector>
@@ -15,12 +17,14 @@
 
 #ifdef __SWITCH__
 #include <atomic>
-// Output statistics for the Switch 2 frontend's periodic report (citra_switch/main.cpp).
 namespace {
+// Output statistics for the development builds' periodic report (citra_switch/main.cpp).
+#if HEN_DEV
 std::atomic<u32> hen_calls, hen_short_calls, hen_short_frames, hen_stretched_calls, hen_skips;
 std::atomic<u32> hen_fifo_min{~0u}, hen_fifo_max, hen_ratio_min{~0u}, hen_ratio_max;
 std::atomic<u64> hen_fifo_sum;
 std::atomic<u32> hen_mode_switches;
+#endif
 std::atomic<float> hen_rate_adjust{0.0f};
 
 // Output modes. Stretched: through the time stretcher, for when emulation runs slow. Direct:
@@ -31,11 +35,31 @@ bool hen_draining = false; // direct, still playing what the stretcher had left
 u32 hen_good_calls = 0;
 double hen_level = 0.0;
 constexpr std::size_t hen_target_level = 1640; // frames: 50 ms
-// (A deeper queue while the program warms up, waiting for a refill instead of going to the
-// stretcher, and playing a surplus off were tried with the catch-up experiment and judged worse
-// on average across titles.) A 50 ms queue, the stretcher as soon as the queue
-// runs dry, 0.8% of rate adjustment, the queue cut back past 6000 frames, as on 2026-11-10.
+// A 50 ms queue, the stretcher as soon as the queue runs dry, 0.8% of rate adjustment, the
+// queue cut back past 6000 frames. (A deeper queue while the program warms up, waiting for a
+// refill instead of going to the stretcher, and playing a surplus off each sound worse.)
 constexpr u32 hen_calls_to_direct = 94;        // 1.5 s at full speed
+
+// What happened, for the log: kept by the audio thread, printed with the 5 s report (the audio
+// thread never prints). kind 2 the stretcher entered, 3 the stretcher left.
+struct HenEvent {
+    u32 ms, kind, amount, fifo;
+};
+std::array<HenEvent, 32> hen_events;
+std::atomic<u32> hen_event_count{0};
+std::atomic<u32> hen_entered_total{0};
+const auto hen_origin = std::chrono::steady_clock::now();
+void HenEventNote(u32 kind, u32 amount, u32 fifo) {
+    const u32 n = hen_event_count.load(std::memory_order_relaxed);
+    if (n < hen_events.size()) {
+        hen_events[n] = {static_cast<u32>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now() - hen_origin)
+                                              .count()),
+                         kind, amount, fifo};
+        hen_event_count.store(n + 1, std::memory_order_release);
+    }
+}
+#if HEN_DEV
 void HenMin(std::atomic<u32>& a, u32 v) {
     if (v < a.load(std::memory_order_relaxed))
         a.store(v, std::memory_order_relaxed);
@@ -44,12 +68,28 @@ void HenMax(std::atomic<u32>& a, u32 v) {
     if (v > a.load(std::memory_order_relaxed))
         a.store(v, std::memory_order_relaxed);
 }
+#endif
 } // namespace
 /// For the sink's resampler (switch_sink.cpp): how much faster (+) or slower (-) than nominal
 /// to take samples, as a fraction, to keep the queue at its target level.
 extern "C" float hen_audio_rate_adjust() {
     return hen_rate_adjust.load(std::memory_order_relaxed);
 }
+/// The events since the last call (at most 32): four numbers each: ms since the sound started,
+/// kind (2 stretcher entered, 3 stretcher left), ms of output the fill was short of, queue level
+/// in frames. Returns how many. *entered: times the stretcher was entered in the run.
+extern "C" unsigned hen_audio_events(unsigned* out, unsigned* entered) {
+    const u32 n = hen_event_count.exchange(0, std::memory_order_acquire);
+    for (u32 i = 0; i < n; i++) {
+        out[4 * i] = hen_events[i].ms;
+        out[4 * i + 1] = hen_events[i].kind;
+        out[4 * i + 2] = hen_events[i].amount;
+        out[4 * i + 3] = hen_events[i].fifo;
+    }
+    *entered = hen_entered_total.load();
+    return n;
+}
+#if HEN_DEV
 extern "C" void hen_audio_dsp_stats(unsigned* out) {
     out[0] = hen_calls.exchange(0);
     out[1] = hen_short_calls.exchange(0);
@@ -63,6 +103,7 @@ extern "C" void hen_audio_dsp_stats(unsigned* out) {
     out[9] = hen_skips.exchange(0);
     out[10] = hen_mode_switches.exchange(0);
 }
+#endif
 #endif
 
 namespace AudioCore {
@@ -136,10 +177,12 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
 
 #ifdef __SWITCH__
     const u32 hen_fifo = static_cast<u32>(fifo.Size());
+#if HEN_DEV
     hen_calls++;
     hen_fifo_sum += hen_fifo;
     HenMin(hen_fifo_min, hen_fifo);
     HenMax(hen_fifo_max, hen_fifo);
+#endif
 #endif
 
     std::size_t frames_written = 0;
@@ -156,7 +199,9 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
             // Far too much queued (emulation ran fast for a moment): skip down to the target.
             std::vector<s16> skipped((fifo.Size() - hen_target_level) * 2);
             fifo.Pop(skipped.data(), skipped.size() / 2);
+#if HEN_DEV
             hen_skips++;
+#endif
         }
         if (hen_direct) {
             frames_written += fifo.Pop(buffer + 2 * frames_written, num_frames - frames_written);
@@ -167,12 +212,17 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
         hen_rate_adjust = static_cast<float>(
             std::clamp((hen_level - hen_target) / hen_target_level * 0.01, -hen_rate_limit,
                        hen_rate_limit));
-        if (frames_written < num_frames && hen_direct && !hen_draining) {
+        const u32 hen_missing = hen_direct && !hen_draining ? static_cast<u16>(num_frames - frames_written) : 0;
+        if (hen_missing != 0) {
             // Ran dry: emulation is slow. Back to stretching.
             hen_direct = false;
             hen_good_calls = 0;
             hen_rate_adjust = 0.0f;
+#if HEN_DEV
             hen_mode_switches++;
+#endif
+            hen_entered_total++;
+            HenEventNote(2, hen_missing * 1000 / 32728, hen_fifo);
         }
     } else
 #endif
@@ -181,11 +231,13 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
         const std::size_t num_in{in.size() / 2};
         frames_written = time_stretcher.Process(in.data(), num_in, buffer, num_frames);
 #ifdef __SWITCH__
+        const u32 ratio = static_cast<u32>(time_stretcher.GetStretchRatio() * 10000.0);
+#if HEN_DEV
         hen_stretched_calls++;
         hen_skips += time_stretcher.TakeSkips();
-        const u32 ratio = static_cast<u32>(time_stretcher.GetStretchRatio() * 10000.0);
         HenMin(hen_ratio_min, ratio);
         HenMax(hen_ratio_max, ratio);
+#endif
         hen_good_calls = ratio >= 9800 && frames_written == num_frames ? hen_good_calls + 1 : 0;
         if (hen_good_calls >= hen_calls_to_direct) {
             // Full speed again: play out what the stretcher holds, then straight from the queue
@@ -193,6 +245,7 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
             hen_direct = true;
             hen_draining = true;
             hen_level = hen_target_level;
+            HenEventNote(3, 0, hen_fifo);
         }
 #endif
     } else {
@@ -208,7 +261,7 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
         frames_written += fifo.Pop(buffer, num_frames - frames_written);
     }
 
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && HEN_DEV
     if (frames_written < num_frames) {
         hen_short_calls++;
         hen_short_frames += static_cast<u32>(num_frames - frames_written);

@@ -1,5 +1,5 @@
 // POSIX file semantics for the SD card. libnx's fsdev differs from POSIX in
-// ways that code ported from desktops relies on (measured 2026-11-09):
+// ways that code ported from desktops relies on (measured):
 //   - read() at or past the end of a file fails with EIO instead of returning 0
 //     (SQLite reports EIO as a corrupt database; read-to-end loops see an error);
 //   - write() past the end leaves the gap with junk instead of zeros;

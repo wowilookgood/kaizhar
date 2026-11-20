@@ -15,6 +15,7 @@
 #include <boost/icl/interval_map.hpp>
 #include <tsl/robin_map.h>
 
+#include "common/hen_frame_work.h"
 #include "video_core/rasterizer_cache/framebuffer_base.h"
 #include "video_core/rasterizer_cache/sampler_params.h"
 #include "video_core/rasterizer_cache/surface_params.h"
@@ -282,6 +283,43 @@ private:
         }
         return false;
     }
+    /// (Switch 2 port) Who asks for the surface CreateSurface makes next, for the report's
+    /// count by caller (common/hen_frame_work.h).
+    int hen_surface_caller = HEN_SURFACE_OTHER;
+    struct HenSurfaceCaller {
+        HenSurfaceCaller(int& slot_, int caller) : slot{slot_}, saved{slot_} {
+            slot = caller;
+        }
+        ~HenSurfaceCaller() {
+            slot = saved;
+        }
+        int& slot;
+        int saved;
+    };
+#ifdef __SWITCH__
+    /// (Switch 2 port, --recycle-surfaces) Unregistered surfaces kept with their images, the
+    /// oldest first. tick: the last submission that may use the surface (as in sentenced);
+    /// frame: the frame tick it came in at.
+    struct HenPooled {
+        SurfaceId id;
+        u64 tick;
+        u64 frame;
+        u64 bytes;
+    };
+    std::list<HenPooled> hen_pool;
+    u64 hen_pool_bytes = 0;
+    u64 hen_frame = 0;
+    /// At the frame tick: destroys what stayed too long, takes in what was unregistered.
+    void HenPoolCollect();
+    /// A surface from the pool made over for params, or no id.
+    SurfaceId HenPoolTake(const SurfaceParams& params, const SurfaceFlagBits& initial_flags);
+    /// Destroys one pooled surface (the GPU must be done with it).
+    typename std::list<HenPooled>::iterator HenPoolDestroy(
+        typename std::list<HenPooled>::iterator it, int why);
+    /// Hands everything in the pool to the deletion queue.
+    void HenPoolDrain();
+    void HenPoolNote();
+#endif
     PageMap cached_pages;
     u32 resolution_scale_factor;
     FramebufferParams fb_params;

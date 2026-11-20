@@ -31,8 +31,8 @@
 //     (hen_dirty_pages) is read without a lock for that. A bit the GPU thread sets a moment
 //     later belongs to work whose interrupt the program has not seen yet, which on the console
 //     is a race too; work whose interrupt was delivered has all its bits set. If a bit is set:
-//     Drain, then flush as before. A write must invalidate the cached surface. With the GPU
-//     thread idle that is done at once, as before. With it busy the bytes are written and the
+//     Drain, then flush as upstream. A write must invalidate the cached surface. With the GPU
+//     thread idle that is done at once, as upstream. With it busy the bytes are written and the
 //     invalidation is queued behind the work already there (in order with later lists),
 //     unless the page has drawn data waiting (then Drain: a download queued earlier must not
 //     land on top of the program's bytes).
@@ -53,6 +53,7 @@
 #include <vector>
 #include <pthread.h>
 
+#include "common/hen_gap.h"
 #include "common/thread.h"
 #include "core/hle/service/gsp/gsp_command.h"
 #include "video_core/hen_gpu_thread.h"
@@ -67,6 +68,14 @@ static int hen_gpu_defer_writes = 1;
 
 #if HEN_DEV
 extern "C" void hen_blackbox_watch(void);
+#endif
+
+// ("hen: emu:": hen/jit/hen_jit.c) 3 = commands handed to the GPU thread by the emulation
+// thread and the time that takes (lock, queue, wake-up), without a wait for room in the queue.
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" int hen_emu_stats_on;
+extern "C" unsigned long long hen_emu_ns[12], hen_emu_count[12];
+extern "C" unsigned long long hen_jit_now_ns(void);
 #endif
 
 namespace VideoCore {
@@ -113,7 +122,6 @@ std::exception_ptr failure;
 bool stop = false;
 
 std::atomic<u32> pending{0}; ///< items queued and not finished
-std::atomic<u32> waiting{0}; ///< the emulation thread is waiting for this thread (Drain, Poll)
 std::atomic<bool> have_finished{false};
 std::atomic<bool> running{false};
 std::atomic<bool> failed{false};
@@ -138,6 +146,11 @@ void NoteWait(Wait reason, Clock::time_point start) {
     const u64 ns = Since(start);
     stat_waits[reason].fetch_add(1, std::memory_order_relaxed);
     stat_wait_ns[reason].fetch_add(ns, std::memory_order_relaxed);
+#if defined(__SWITCH__) && HEN_DEV
+    hen_emu_ns[8] += ns; // ("hen: emu:": every wait of the emulation thread for this thread)
+    hen_emu_count[8]++;
+#endif
+    hen_gap_add(HEN_GAP_GPU_THREAD, ns);
     if (ns > stat_longest_wait_ns.load(std::memory_order_relaxed)) {
         stat_longest_wait_ns.store(ns, std::memory_order_relaxed);
     }
@@ -164,6 +177,10 @@ bool DirtyAny(PAddr addr, u32 size) {
     return false;
 }
 
+#if HEN_DEV
+extern "C" void hen_core_sample(int kind); // hen/platform/hen_thread.c (1 = this thread)
+#endif
+
 void* Main(void*) {
     Common::SetCurrentThreadName("GpuThread");
 #if HEN_DEV
@@ -183,6 +200,9 @@ void* Main(void*) {
                 queued_commands--;
             }
         }
+#if HEN_DEV
+        hen_core_sample(1);
+#endif
         const auto start = Clock::now();
         // (Vulkan-Hpp throws on errors. After one, the rest of the queue is dropped and the
         // emulation thread gets the exception at its next Drain or Poll, where the frontend
@@ -330,15 +350,14 @@ bool Active() {
     return running.load(std::memory_order_relaxed);
 }
 
-bool Behind() {
-    return waiting.load(std::memory_order_relaxed) != 0 || pending.load(std::memory_order_relaxed) > 1;
-}
-
 bool OnThread() {
     return running.load(std::memory_order_relaxed) && pthread_equal(pthread_self(), thread);
 }
 
 void Queue(const Service::GSP::Command& command) {
+#if defined(__SWITCH__) && HEN_DEV
+    unsigned long long hen_queue_start = hen_emu_stats_on ? hen_jit_now_ns() : 0;
+#endif
     PublishLocal();
     std::size_t depth;
     {
@@ -347,6 +366,9 @@ void Queue(const Service::GSP::Command& command) {
             const auto start = Clock::now();
             done_cv.wait(lock, [] { return queued_commands < MaxQueuedCommands; });
             NoteWait(WaitFull, start);
+#if defined(__SWITCH__) && HEN_DEV
+            hen_queue_start += hen_queue_start != 0 ? Since(start) : 0; // (the wait is not queueing)
+#endif
         }
         queue.push_back(Item{true, false, 0, 0, command});
         queued_commands++;
@@ -354,6 +376,12 @@ void Queue(const Service::GSP::Command& command) {
         depth = queue.size();
     }
     work_cv.notify_one();
+#if defined(__SWITCH__) && HEN_DEV
+    hen_emu_count[3]++;
+    if (hen_queue_start != 0) {
+        hen_emu_ns[3] += hen_jit_now_ns() - hen_queue_start;
+    }
+#endif
     stat_queued.fetch_add(1, std::memory_order_relaxed);
     if (depth > stat_longest_queue.load(std::memory_order_relaxed)) {
         stat_longest_queue.store(depth, std::memory_order_relaxed);
@@ -368,9 +396,7 @@ void Drain(Wait reason) {
     if (pending.load() != 0) {
         const auto start = Clock::now();
         std::unique_lock lock{mutex};
-        waiting.fetch_add(1);
         done_cv.wait(lock, [] { return pending.load() == 0; });
-        waiting.fetch_sub(1);
         lock.unlock();
         NoteWait(reason, start);
     }
@@ -386,9 +412,7 @@ void Poll(bool all_idle) {
     if (all_idle && pending.load() != 0 && !have_finished.load()) {
         const auto start = Clock::now();
         std::unique_lock lock{mutex};
-        waiting.fetch_add(1);
         done_cv.wait(lock, [] { return pending.load() == 0 || have_finished.load(); });
-        waiting.fetch_sub(1);
         lock.unlock();
         NoteWait(WaitIdle, start);
     }

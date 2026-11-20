@@ -611,7 +611,10 @@ void FS_USER::OpenDirectory(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_FS, "type={} size={} data={}", dirname_type, dirname_size,
               dir_path.DebugStr());
 
-    if (!archives.ArchiveIsSlow(archive_handle) && Settings::values.async_fs_operations) {
+    // (Switch port: upstream tests the setting the other way round here, alone among this file's
+    // calls, so with asynchronous file operations ON a directory was opened on the emulation
+    // thread: tens of milliseconds for a directory on the card, with nothing else emulated meanwhile)
+    if (!archives.ArchiveIsSlow(archive_handle) && !Settings::values.async_fs_operations) {
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
         ResultVal<std::shared_ptr<Directory>> dir_res =
             archives.OpenDirectoryFromArchive(archive_handle, dir_path);

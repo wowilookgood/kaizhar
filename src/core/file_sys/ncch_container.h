@@ -359,6 +359,11 @@ public:
     ExeFs_Header exefs_header;
     ExHeader_Header exheader_header;
 
+    /// (Kaizhar) The file this container was opened from.
+    const std::string& HenFilePath() const {
+        return filepath;
+    }
+
 private:
     bool has_header = false;
     bool has_exheader = false;

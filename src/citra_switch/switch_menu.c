@@ -16,6 +16,7 @@
 
 #include "menu_font.h"
 #include "switch_menu.h"
+#include "switch_platform.h"
 
 #define MENU_W 1280
 #define MENU_H 720
@@ -88,9 +89,29 @@ static bool check(VkResult result, const char* what) {
     return true;
 }
 
-void sw_menu_close(void) {
+// The menu's own graphics life. The instance, the surface, the device and its objects are made
+// once and kept for the session; a close only destroys the swapchain (the window can carry one
+// swapchain, and the title's renderer needs it). The driver shuts the GPU down, and closes
+// the process's graphics root with the display layer, when the LAST Vulkan instance is
+// destroyed: with the menu's instance alive that never happens between a visit and a title.
+// (Closing the root after the list's frames ended the process about six seconds later.)
+// An instance and a device of the menu are alive outside a visit: the driver has not shut the
+// GPU down, so the display layer is the driver's and is not released from here.
+static bool s_gpuKept;
+
+// final: the program's end, or a failed open: everything goes, whatever is kept otherwise.
+static void menu_close(bool final) {
     if (s_vk.device != VK_NULL_HANDLE) {
         vk_DeviceWaitIdle(s_vk.device);
+        if (!final) {
+            // (the swapchain goes, the rest stays for the next visit)
+            if (s_vk.swapchain) vk_DestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
+            s_vk.swapchain = VK_NULL_HANDLE;
+            s_vk.imageCount = 0;
+            s_gpuKept = true;
+            s_open = false;
+            return;
+        }
         if (s_vk.rendered) vk_DestroySemaphore(s_vk.device, s_vk.rendered, NULL);
         if (s_vk.acquired) vk_DestroySemaphore(s_vk.device, s_vk.acquired, NULL);
         if (s_vk.fence) vk_DestroyFence(s_vk.device, s_vk.fence, NULL);
@@ -107,24 +128,47 @@ void sw_menu_close(void) {
     memset(&s_vk, 0, sizeof(s_vk));
     s_pixels = NULL;
     s_open = false;
+    if (final) {
+        s_gpuKept = false; // (the kept instance is gone)
+    }
     // The window's display layer holds the process's one grant of a GPU session
     // (native_window.h, nwindowReleaseVi2Layer): once a Vulkan driver has shut down, the
     // layer must be released before the GPU can be opened again (by the title's renderer).
-    nwindowReleaseVi2Layer(nwindowGetDefault());
+    // (The driver releases it itself when its last instance goes; this is the second call.)
+    if (!s_gpuKept) {
+        nwindowReleaseVi2Layer(nwindowGetDefault());
+    }
+}
+
+void sw_menu_close(void) {
+    menu_close(false);
+}
+
+// At the program's end: the instance and the device the list kept for the session go too.
+void sw_menu_shutdown(void) {
+    if (s_vk.instance != VK_NULL_HANDLE) {
+        menu_close(true);
+    }
 }
 
 // The menu draws with Vulkan as the titles' renderer does (one image per frame, copied from
 // memory): the display then only ever has Vulkan swapchains on it. (A libnx framebuffer
-// before a title works, but can't be created again after one: 0x2559.)
+// before a title works, but can't be created again after one.)
 bool sw_menu_open(void) {
     if (s_open) {
         return true;
     }
-    memset(&s_vk, 0, sizeof(s_vk));
-    // (As in sw_menu_close, after a title's renderer has shut down.)
-    const Result released = nwindowReleaseVi2Layer(nwindowGetDefault());
-    if (R_FAILED(released)) {
-        printf("hen: menu: releasing the display layer: 0x%x\n", released);
+    // (the instance, the device and its objects of the first visit are here)
+    const bool kept = s_vk.instance != VK_NULL_HANDLE && s_vk.device != VK_NULL_HANDLE;
+    if (!kept) {
+        memset(&s_vk, 0, sizeof(s_vk));
+    }
+    if (!kept && !s_gpuKept) {
+        // (As in sw_menu_close, after a title's renderer has shut down.)
+        const Result released = nwindowReleaseVi2Layer(nwindowGetDefault());
+        if (R_FAILED(released)) {
+            printf("hen: menu: releasing the display layer: 0x%x\n", released);
+        }
     }
 #define X(name) vk_##name = (PFN_vk##name)vkGetInstanceProcAddr(s_vk.instance, "vk" #name);
     vk_CreateInstance = (PFN_vkCreateInstance)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
@@ -136,10 +180,12 @@ bool sw_menu_open(void) {
                                                .pApplicationInfo = &app,
                                                .enabledExtensionCount = 2,
                                                .ppEnabledExtensionNames = instanceExtensions};
-    if (vk_CreateInstance == NULL || !check(vk_CreateInstance(&instanceInfo, NULL, &s_vk.instance), "instance")) {
-        return false;
+    if (!kept) {
+        if (vk_CreateInstance == NULL || !check(vk_CreateInstance(&instanceInfo, NULL, &s_vk.instance), "instance")) {
+            return false;
+        }
+        VK_FUNCTIONS(X)
     }
-    VK_FUNCTIONS(X)
 #undef X
     NWindow* win = nwindowGetDefault();
     nwindowSetDimensions(win, MENU_W, MENU_H);
@@ -149,7 +195,7 @@ bool sw_menu_open(void) {
     VkResult result = vk_EnumeratePhysicalDevices(s_vk.instance, &count, &gpu);
     if ((result != VK_SUCCESS && result != VK_INCOMPLETE) || count == 0) {
         check(result != VK_SUCCESS ? result : VK_ERROR_INITIALIZATION_FAILED, "physical device");
-        sw_menu_close();
+        menu_close(true);
         return false;
     }
     const float priority = 1.0f;
@@ -187,10 +233,12 @@ bool sw_menu_open(void) {
                                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     const VkFenceCreateInfo fenceInfo = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     const VkSemaphoreCreateInfo semaphoreInfo = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    bool ok = check(vk_CreateViSurfaceNN(s_vk.instance, &surfaceInfo, NULL, &s_vk.surface), "surface") &&
-              check(vk_CreateDevice(gpu, &deviceInfo, NULL, &s_vk.device), "device");
+    bool ok = kept || (check(vk_CreateViSurfaceNN(s_vk.instance, &surfaceInfo, NULL, &s_vk.surface), "surface") &&
+                       check(vk_CreateDevice(gpu, &deviceInfo, NULL, &s_vk.device), "device"));
     if (ok) {
-        vk_GetDeviceQueue(s_vk.device, 0, 0, &s_vk.queue);
+        if (!kept) {
+            vk_GetDeviceQueue(s_vk.device, 0, 0, &s_vk.queue);
+        }
         swapchain.surface = s_vk.surface;
         s_vk.imageCount = 8;
         ok = check(vk_CreateSwapchainKHR(s_vk.device, &swapchain, NULL, &s_vk.swapchain), "swapchain");
@@ -202,8 +250,8 @@ bool sw_menu_open(void) {
             check(VK_ERROR_INITIALIZATION_FAILED, "swapchain images");
         }
     }
-    ok = ok && check(vk_CreateCommandPool(s_vk.device, &poolInfo, NULL, &s_vk.pool), "command pool");
-    if (ok) {
+    ok = ok && (kept || check(vk_CreateCommandPool(s_vk.device, &poolInfo, NULL, &s_vk.pool), "command pool"));
+    if (ok && !kept) {
         const VkCommandBufferAllocateInfo allocate = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                                       .commandPool = s_vk.pool,
                                                       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
@@ -211,7 +259,7 @@ bool sw_menu_open(void) {
         ok = check(vk_AllocateCommandBuffers(s_vk.device, &allocate, &s_vk.cmd), "command buffer") &&
              check(vk_CreateBuffer(s_vk.device, &bufferInfo, NULL, &s_vk.buffer), "buffer");
     }
-    if (ok) {
+    if (ok && !kept) {
         VkMemoryRequirements need;
         vk_GetBufferMemoryRequirements(s_vk.device, s_vk.buffer, &need);
         VkPhysicalDeviceMemoryProperties memory;
@@ -234,11 +282,11 @@ bool sw_menu_open(void) {
         s_pixels = mapped;
         s_stride = MENU_W;
     }
-    ok = ok && check(vk_CreateFence(s_vk.device, &fenceInfo, NULL, &s_vk.fence), "fence") &&
-         check(vk_CreateSemaphore(s_vk.device, &semaphoreInfo, NULL, &s_vk.acquired), "semaphore") &&
-         check(vk_CreateSemaphore(s_vk.device, &semaphoreInfo, NULL, &s_vk.rendered), "semaphore");
+    ok = ok && (kept || (check(vk_CreateFence(s_vk.device, &fenceInfo, NULL, &s_vk.fence), "fence") &&
+                         check(vk_CreateSemaphore(s_vk.device, &semaphoreInfo, NULL, &s_vk.acquired), "semaphore") &&
+                         check(vk_CreateSemaphore(s_vk.device, &semaphoreInfo, NULL, &s_vk.rendered), "semaphore")));
     if (!ok) {
-        sw_menu_close();
+        menu_close(true);
         return false;
     }
     if (!s_padReady) {
@@ -414,8 +462,46 @@ static void heading(const char* text) {
     fill(56, 104, s_dw - 112, 2, COLOR_PANEL);
 }
 
-int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count, int* selected,
-                  const char* option_line, const char* hint_line) {
+// Copies text, starting a new line where a line would be wider than width (at a space).
+static void wrap_text(const struct menu_font* font, const char* text, int width, char* out, size_t out_size) {
+    size_t n = 0, line_start = 0, last_space = 0;
+    int line_width = 0, width_at_space = 0;
+    bool have_space = false;
+    while (*text != 0 && n + 1 < out_size) {
+        const char* next = text;
+        const unsigned c = next_char(&next);
+        if (*text == '\n') {
+            out[n++] = '\n';
+            text++;
+            line_start = n;
+            line_width = 0;
+            have_space = false;
+            continue;
+        }
+        const int advance = font->glyphs[c - 32].advance;
+        if (line_width + advance > width && have_space && last_space > line_start) {
+            out[last_space] = '\n';
+            line_start = last_space + 1;
+            line_width -= width_at_space;
+            have_space = false;
+        }
+        if (*text == ' ') {
+            last_space = n;
+            width_at_space = line_width + advance;
+            have_space = true;
+        }
+        while (text < next && n + 1 < out_size) {
+            out[n++] = *text++;
+        }
+        text = next;
+        line_width += advance;
+    }
+    out[n] = 0;
+}
+
+static int list_frame(const char* title, const struct sw_menu_item* items, int count, int* selected,
+                      const char* option_label, const char* option_line, const char* hint_line,
+                      const char* empty_text, const char* corner_text) {
     if (!appletMainLoop()) {
         return SW_MENU_EXIT;
     }
@@ -428,7 +514,7 @@ int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count
     const u64 now = armGetSystemTick();
     // In portrait the display's left edge is up: with the controllers on the console, the
     // way to the next entry is the pad's right. The buttons marked up and down move too
-    // (before 2026-11-13 they did nothing in portrait): the list has one
+    // (they must not do nothing in portrait): the list has one
     // axis, so both readings can hold, and with the controllers off the console and held
     // the usual way they are the natural ones. Flipped (the right edge up), left and right
     // change places.
@@ -454,13 +540,29 @@ int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count
         action = SW_MENU_REFRESH;
     } else if (down & HidNpadButton_Plus) {
         action = SW_MENU_EXIT;
+    } else if (down & HidNpadButton_B) {
+        action = SW_MENU_BACK;
+    } else if (down & HidNpadButton_Minus) {
+        action = SW_MENU_EXTRA;
+    } else if (down & HidNpadButton_L) {
+        action = SW_MENU_SETTINGS;
     }
 
     if (!begin()) {
         return action;
     }
     heading(title);
+    if (corner_text != NULL) {
+        // (small, at the right end of the heading's line, on its baseline)
+        draw_text(&menu_font_small, s_dw - 56 - text_width(&menu_font_small, corner_text), 58, s_dw - 56,
+                  COLOR_DIM, corner_text);
+    }
     // Below the list: a rule, the screens line, then the hint lines.
+    char wrapped[768];
+    if (hint_line != NULL) {
+        wrap_text(&menu_font_small, hint_line, s_dw - 112, wrapped, sizeof(wrapped));
+        hint_line = wrapped;
+    }
     int hint_lines = 0;
     for (const char* c = hint_line; c != NULL && *c != 0; c++) {
         hint_lines += *c == '\n';
@@ -492,10 +594,10 @@ int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count
             draw_text(&menu_font_small, right, y + 16, s_dw - 56, on ? COLOR_TEXT : COLOR_DIM, items[i].detail);
             right -= 24;
         }
-        draw_text(&menu_font_text, 64, y + 9, right, COLOR_TEXT, items[i].title);
+        draw_text(&menu_font_text, 64, y + 9, right, items[i].dim && !on ? COLOR_DIM : COLOR_TEXT, items[i].title);
     }
     if (count == 0) {
-        draw_text(&menu_font_text, 64, TOP + 9, s_dw - 64, COLOR_DIM, "No titles found.");
+        draw_text(&menu_font_text, 64, TOP + 9, s_dw - 64, COLOR_DIM, empty_text);
     }
     if (count > ROWS) {
         // A scroll bar.
@@ -507,10 +609,13 @@ int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count
     fill(56, option_top - 16, s_dw - 112, 2, COLOR_PANEL);
     if (option_line != NULL) {
         int x = 56;
-        if (!s_portrait) {
-            x = draw_text(&menu_font_text, x, option_top, s_dw - 56, COLOR_DIM, "Screens:  ");
+        if (!s_portrait && option_label != NULL) {
+            x = draw_text(&menu_font_text, x, option_top, s_dw - 56, COLOR_DIM, option_label);
         }
-        draw_text(&menu_font_text, x, option_top, s_dw - 56, COLOR_ACCENT, option_line);
+        // (the smaller font for a line the larger one has no room for)
+        const bool fits = x + text_width(&menu_font_text, option_line) <= s_dw - 56;
+        draw_text(fits ? &menu_font_text : &menu_font_small, x, option_top + (fits ? 0 : 8), s_dw - 56,
+                  COLOR_ACCENT, option_line);
     }
     for (int line = 0; line < hint_lines; line++) {
         char text[160];
@@ -526,6 +631,134 @@ int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count
     }
     present();
     return action;
+}
+
+int sw_menu_frame(const char* title, const struct sw_menu_item* items, int count, int* selected,
+                  const char* option_line, const char* hint_line) {
+    // (the title list: the version in its corner)
+    return list_frame(title, items, count, selected, "Screens:  ", option_line, hint_line, "No titles found.",
+                      SW_VERSION_TEXT + sizeof("Kaizhar"));
+}
+
+int sw_menu_list(const char* title, const struct sw_menu_item* items, int count, int* selected,
+                 const char* info_line, const char* hint_line, const char* empty_text) {
+    return list_frame(title, items, count, selected, NULL, info_line, hint_line, empty_text != NULL ? empty_text : "",
+                      NULL);
+}
+
+int sw_menu_text(const char* title, const char* prompt, const char* initial, unsigned max_length,
+                 const char* allowed, char* out, unsigned out_size) {
+    enum { COLS = 10 };
+    // Letters and digits, then the other characters asked for, ten to a row.
+    char keys[2][96];
+    int count = 0;
+    static const char base[] = "1234567890qwertyuiopasdfghjklzxcvbnm";
+    for (const char* c = base; *c != 0; c++, count++) {
+        keys[0][count] = *c;
+        keys[1][count] = *c >= 'a' && *c <= 'z' ? (char)(*c - 32) : *c;
+    }
+    for (const char* c = allowed; c != NULL && *c != 0 && count < 90; c++, count++) {
+        keys[0][count] = keys[1][count] = *c;
+    }
+    const int rows = (count + COLS - 1) / COLS;
+    char text[128];
+    unsigned length = 0;
+    if (max_length == 0 || max_length > sizeof(text) - 1) {
+        max_length = sizeof(text) - 1;
+    }
+    if (max_length > out_size - 1) {
+        max_length = out_size - 1;
+    }
+    for (; initial != NULL && initial[length] != 0 && length < max_length; length++) {
+        text[length] = initial[length];
+    }
+    int at = 10, upper = 0;
+    u64 repeat_at = 0;
+    for (;;) {
+        if (!appletMainLoop()) {
+            return -1;
+        }
+        padUpdate(&s_pad);
+        const u64 down = padGetButtonsDown(&s_pad);
+        const u64 held = padGetButtons(&s_pad);
+        // In portrait the canvas is turned: its right is the pad's up (flipped: down), its
+        // down the pad's right (flipped: left), as in the list.
+        u64 right = HidNpadButton_AnyRight, left = HidNpadButton_AnyLeft;
+        u64 up = HidNpadButton_AnyUp, dn = HidNpadButton_AnyDown;
+        if (s_portrait) {
+            right = s_flipped ? HidNpadButton_AnyDown : HidNpadButton_AnyUp;
+            left = s_flipped ? HidNpadButton_AnyUp : HidNpadButton_AnyDown;
+            up = s_flipped ? HidNpadButton_AnyRight : HidNpadButton_AnyLeft;
+            dn = s_flipped ? HidNpadButton_AnyLeft : HidNpadButton_AnyRight;
+        }
+        const u64 now = armGetSystemTick();
+        u64 move = down & (right | left | up | dn);
+        if (move != 0) {
+            repeat_at = now + armNsToTicks(350000000ull);
+        } else if ((held & (right | left | up | dn)) && now >= repeat_at) {
+            move = held & (right | left | up | dn);
+            repeat_at = now + armNsToTicks(110000000ull);
+        }
+        int row = at / COLS, col = at % COLS;
+        if (move & right) {
+            col = (col + 1) % COLS;
+        } else if (move & left) {
+            col = (col + COLS - 1) % COLS;
+        } else if (move & dn) {
+            row = (row + 1) % rows;
+        } else if (move & up) {
+            row = (row + rows - 1) % rows;
+        }
+        at = row * COLS + col;
+        if (at >= count) {
+            at = move & (up | left) ? count - 1 : (move & dn ? col : (rows - 1) * COLS);
+        }
+        if ((down & HidNpadButton_A) && length < max_length) {
+            text[length++] = keys[upper][at];
+        } else if ((down & HidNpadButton_X) && length < max_length) {
+            text[length++] = ' ';
+        } else if (down & HidNpadButton_B) {
+            if (length == 0) {
+                return 0;
+            }
+            length--;
+        } else if (down & HidNpadButton_Y) {
+            upper = !upper;
+        } else if (down & HidNpadButton_Minus) {
+            return 0;
+        } else if (down & HidNpadButton_Plus) {
+            memcpy(out, text, length);
+            out[length] = 0;
+            return 1;
+        }
+
+        if (!begin()) {
+            svcSleepThread(16000000);
+            continue;
+        }
+        heading(title);
+        if (prompt != NULL) {
+            draw_text(&menu_font_small, 64, 124, s_dw - 64, COLOR_DIM, prompt);
+        }
+        fill(56, 164, s_dw - 112, 60, COLOR_PANEL);
+        text[length] = 0;
+        const int end = draw_text(&menu_font_text, 72, 172, s_dw - 80, COLOR_TEXT, text);
+        fill(end + 4, 172, 3, 42, COLOR_ACCENT);
+        const int cell = (s_dw - 112) / COLS;
+        for (int i = 0; i < count; i++) {
+            const int x = 56 + (i % COLS) * cell, y = 250 + (i / COLS) * 64;
+            if (i == at) {
+                fill(x, y, cell - 6, 58, COLOR_SELECTED);
+            }
+            const char one[2] = {keys[upper][i], 0};
+            draw_text(&menu_font_text, x + (cell - 6 - text_width(&menu_font_text, one)) / 2, y + 7, s_dw, COLOR_TEXT, one);
+        }
+        const int hint_top = s_dh - 32 - 2 * 32;
+        draw_text(&menu_font_small, 56, hint_top, s_dw - 56, COLOR_DIM,
+                  "A  Type      B  Erase      X  Space      Y  Capitals");
+        draw_text(&menu_font_small, 56, hint_top + 32, s_dw - 56, COLOR_DIM, "+  Done      -  Cancel");
+        present();
+    }
 }
 
 bool sw_menu_message(const char* title, const char* line1, const char* line2, float progress) {
@@ -546,6 +779,65 @@ bool sw_menu_message(const char* title, const char* line1, const char* line2, fl
     }
     present();
     return appletMainLoop();
+}
+
+int sw_menu_page(const char* title, const char* text, const char* hint_line) {
+    for (;;) {
+        if (!appletMainLoop()) {
+            return SW_MENU_EXIT;
+        }
+        padUpdate(&s_pad);
+        const u64 down = padGetButtonsDown(&s_pad);
+        if (down & HidNpadButton_A) {
+            return SW_MENU_SELECT;
+        } else if (down & HidNpadButton_B) {
+            return SW_MENU_BACK;
+        } else if (down & HidNpadButton_Plus) {
+            return SW_MENU_EXIT;
+        }
+        if (!begin()) {
+            svcSleepThread(16000000);
+            continue;
+        }
+        heading(title);
+        // The larger font while the text has room in it, else the smaller one.
+        const int bottom = s_dh - 32 - 32 - 24;
+        char wrapped[2048];
+        const struct menu_font* font = &menu_font_text;
+        int step = 46;
+        for (int pass = 0; pass < 2; pass++) {
+            wrap_text(font, text, s_dw - 128, wrapped, sizeof(wrapped));
+            int lines = 1;
+            for (const char* c = wrapped; *c != 0; c++) {
+                lines += *c == '\n';
+            }
+            if (pass == 1 || 128 + lines * step <= bottom) {
+                break;
+            }
+            font = &menu_font_small;
+            step = 34;
+        }
+        int y = 128;
+        for (const char* line = wrapped; *line != 0 && y + step <= bottom + 8;) {
+            char one[200];
+            size_t length = strcspn(line, "\n");
+            const size_t whole = length;
+            if (length >= sizeof(one)) {
+                length = sizeof(one) - 1;
+            }
+            memcpy(one, line, length);
+            one[length] = 0;
+            draw_text(font, 64, y, s_dw - 64, COLOR_TEXT, one);
+            // (an empty line is half a line's space)
+            y += length == 0 ? step / 2 : step;
+            line += whole;
+            line += *line == '\n';
+        }
+        if (hint_line != NULL) {
+            draw_text(&menu_font_small, 56, s_dh - 32 - 32, s_dw - 56, COLOR_DIM, hint_line);
+        }
+        present();
+    }
 }
 
 bool sw_menu_wait_button(void) {

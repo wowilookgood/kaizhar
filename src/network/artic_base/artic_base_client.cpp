@@ -233,6 +233,13 @@ Client::~Client() {
     SocketManager::DisableSockets();
 }
 
+// (Kaizhar) A frontend's already connected socket to the server at that address, to use in
+// place of a new connection (the Switch 2 port's search for the setup tool holds one:
+// citra_switch/tool_scan.h). Null, or -1 from it: connect as usual.
+extern "C" {
+int (*hen_artic_socket)(const char* address, unsigned port) = nullptr;
+}
+
 bool Client::Connect() {
     if (connected)
         return true;
@@ -258,7 +265,14 @@ bool Client::Connect() {
         return false;
     }
 
-    main_socket = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int given = hen_artic_socket != nullptr ? hen_artic_socket(address.c_str(), port) : -1;
+    const bool adopted = given != -1;
+    if (adopted) {
+        LOG_INFO(Network, "Using the connection the frontend already holds");
+        main_socket = static_cast<SocketHolder>(given);
+    } else {
+        main_socket = ::socket(AF_INET, SOCK_STREAM, 0);
+    }
     if (main_socket == static_cast<SocketHolder>(-1)) {
         LOG_ERROR(Network, "Failed to create socket");
         SignalCommunicationError();
@@ -280,7 +294,7 @@ bool Client::Connect() {
     freeaddrinfo(addrinfo);
     memcpy(last_sockaddr_in.data(), &servaddr, last_sockaddr_in.size());
 
-    if (!ConnectWithTimeout(main_socket, &servaddr, sizeof(servaddr), 10)) {
+    if (!adopted && !ConnectWithTimeout(main_socket, &servaddr, sizeof(servaddr), 10)) {
         closesocket(main_socket);
         LOG_ERROR(Network, "Failed to connect");
         SignalCommunicationError();
@@ -534,6 +548,32 @@ bool Client::ConnectWithTimeout(SocketHolder sockFD, void* server_addr, size_t s
                                 int timeout_seconds) {
 
     int res = ::connect(sockFD, (struct sockaddr*)server_addr, static_cast<int>(server_addr_len));
+#ifdef __SWITCH__
+    // (Kaizhar) select() takes socket numbers below 64 only on this platform and fails for
+    // any other, which a program with many files open soon has: the socket is asked directly.
+    if (res == -1 && (GET_ERRNO == EINPROGRESS || GET_ERRNO == EWOULDBLOCK || GET_ERRNO == EALREADY ||
+                      GET_ERRNO == EINTR)) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+        for (;;) {
+            struct sockaddr_in peer {};
+            socklen_t peer_len = sizeof(peer);
+            if (::getpeername(sockFD, (struct sockaddr*)&peer, &peer_len) == 0) {
+                return true;
+            }
+            int so_error = 0;
+            socklen_t len = sizeof(so_error);
+            if (::getsockopt(sockFD, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 && so_error != 0 &&
+                so_error != EINPROGRESS && so_error != EALREADY) {
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= until) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    return res != -1;
+#endif
     if (res == -1 && ((GET_ERRNO == ERRNO(EINPROGRESS) || GET_ERRNO == ERRNO(EWOULDBLOCK)))) {
         struct timeval tv;
         fd_set fdset;

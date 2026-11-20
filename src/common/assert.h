@@ -9,6 +9,25 @@
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
 
+// (Kaizhar) On the Switch 2 a program that dies where it stands can keep the next one from
+// starting, so the port's frontend gets a say first: on the thread that runs the emulated
+// console it leaves the run loop and ends the title in order (citra_switch/main.cpp) and does
+// not come back here; on any other thread, or with no frontend listening, it returns and the
+// assertion ends the program as everywhere else.
+#ifdef __SWITCH__
+namespace Common {
+inline void (*hen_assert_hook)() = nullptr;
+}
+#define HEN_ASSERT_HOOK()                                                                          \
+    do {                                                                                           \
+        if (Common::hen_assert_hook != nullptr) {                                                  \
+            Common::hen_assert_hook();                                                             \
+        }                                                                                          \
+    } while (0)
+#else
+#define HEN_ASSERT_HOOK()
+#endif
+
 // For asserts we'd like to keep all the junk executed when an assert happens away from the
 // important code in the function. One way of doing this is to put all the relevant code inside a
 // lambda and force the compiler to not inline it.
@@ -18,6 +37,7 @@
         if (!(_a_)) [[unlikely]] {                                                                 \
             []() CITRA_NO_INLINE CITRA_NO_RETURN {                                                 \
                 LOG_CRITICAL(Debug, "Assertion Failed!");                                          \
+                HEN_ASSERT_HOOK();                                                                 \
                 Common::Log::Stop();                                                               \
                 Crash();                                                                           \
                 exit(1);                                                                           \
@@ -30,6 +50,7 @@
         if (!(_a_)) [[unlikely]] {                                                                 \
             [&]() CITRA_NO_INLINE CITRA_NO_RETURN {                                                \
                 LOG_CRITICAL(Debug, "Assertion Failed!\n" __VA_ARGS__);                            \
+                HEN_ASSERT_HOOK();                                                                 \
                 Common::Log::Stop();                                                               \
                 Crash();                                                                           \
                 exit(1);                                                                           \
@@ -40,6 +61,7 @@
 #define UNREACHABLE()                                                                              \
     ([]() CITRA_NO_INLINE CITRA_NO_RETURN {                                                        \
         LOG_CRITICAL(Debug, "Unreachable code!");                                                  \
+        HEN_ASSERT_HOOK();                                                                         \
         Common::Log::Stop();                                                                       \
         Crash();                                                                                   \
         exit(1);                                                                                   \
@@ -48,6 +70,7 @@
 #define UNREACHABLE_MSG(...)                                                                       \
     ([&]() CITRA_NO_INLINE CITRA_NO_RETURN {                                                       \
         LOG_CRITICAL(Debug, "Unreachable code!\n" __VA_ARGS__);                                    \
+        HEN_ASSERT_HOOK();                                                                         \
         Common::Log::Stop();                                                                       \
         Crash();                                                                                   \
         exit(1);                                                                                   \

@@ -20,7 +20,10 @@ public:
     /// The input state PollEvents last read (for the input devices in input_switch.cpp).
     static sw_input Input();
 
-    /// The Joy-Con mouse's crosshair on the bottom screen.
+    /// The screens are laid out again from Settings (a change of arrangement while a title runs).
+    void Relayout();
+
+    /// The crosshair of the Joy-Con mouse or of the right stick's pointer on the bottom screen.
     CursorInfo GetCursorInfo() const override;
 
 private:

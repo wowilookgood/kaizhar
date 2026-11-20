@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/assert.h"
+#include "common/hen_frame_work.h"
 #include "video_core/rasterizer_cache/pixel_format.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
@@ -23,6 +24,16 @@ RenderManager::~RenderManager() = default;
 
 void RenderManager::BeginRendering(const Framebuffer* framebuffer,
                                    Common::Rectangle<u32> draw_rect) {
+#ifdef __SWITCH__
+    // (Switch port) The pass covers the whole target, whatever the draw's rectangle. A pass is
+    // told apart by its area, so with the draw's rectangle as the area a title that moves its
+    // viewport between draws began a pass at each move (Xenoblade Chronicles 3D in a battle: 440
+    // passes for 1000 draws a frame, each with its end, its barrier and its begin). The scissor,
+    // set per draw, already keeps a draw inside its rectangle, and with load and store on every
+    // attachment a larger area costs this GPU nothing (it does not render in tiles).
+    static_cast<void>(draw_rect);
+    const vk::Rect2D render_area = {.offset{.x = 0, .y = 0}, .extent = framebuffer->Extent()};
+#else
     const vk::Rect2D render_area = {
         .offset{
             .x = static_cast<s32>(draw_rect.left),
@@ -33,6 +44,7 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer,
             .height = draw_rect.GetHeight(),
         },
     };
+#endif
     const RenderPass new_pass = {
         .framebuffer = framebuffer->Handle(),
         .render_pass = framebuffer->RenderPass(),
@@ -40,6 +52,26 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer,
         .clear = {},
         .do_clear = false,
     };
+#if defined(__SWITCH__) && HEN_DEV
+    HEN_WORK_COUNT(HEN_WORK_DRAWS, 1);
+    if (!(pass == new_pass)) {
+        const auto now = framebuffer->Images();
+        const auto& last = hen_last_draw_pass;
+        if (new_pass.framebuffer == last.framebuffer) {
+            HEN_WORK_COUNT(new_pass.render_area == last.render_area ? HEN_WORK_PASS_RESUMED
+                                                                    : HEN_WORK_PASS_AREA,
+                           1);
+        } else if (now[0] && now[0] == hen_last_draw_images[0]) {
+            HEN_WORK_COUNT(HEN_WORK_PASS_DEPTH, 1);
+        } else if (now[1] && now[1] == hen_last_draw_images[1]) {
+            HEN_WORK_COUNT(HEN_WORK_PASS_COLOUR, 1);
+        } else {
+            HEN_WORK_COUNT(HEN_WORK_PASS_TARGET, 1);
+        }
+        hen_last_draw_pass = new_pass;
+        hen_last_draw_images = now;
+    }
+#endif
     images = framebuffer->Images();
     aspects = framebuffer->Aspects();
     shadow_rendering = framebuffer->shadow_rendering;
@@ -53,6 +85,7 @@ void RenderManager::BeginRendering(const RenderPass& new_pass) {
     }
 
     EndRendering();
+    HEN_WORK_COUNT(HEN_WORK_PASSES, 1);
     scheduler.Record([info = new_pass](vk::CommandBuffer cmdbuf) {
         const vk::RenderPassBeginInfo renderpass_begin_info = {
             .renderPass = info.render_pass,

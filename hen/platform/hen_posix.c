@@ -87,7 +87,7 @@ int execv(const char* path, char* const argv[]) {
 		errno = ENOSYS;
 		return -1;
 	}
-	// The loader splits the argument string on spaces, honouring double quotes.
+	// The argument string is split on spaces at the next start, honouring double quotes.
 	char args[1024];
 	size_t len = 0;
 	const char* self = __system_argv[0];

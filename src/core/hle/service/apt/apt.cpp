@@ -846,6 +846,21 @@ void Module::APTInterface::StartLibraryApplet(Kernel::HLERequestContext& ctx) {
     const auto buffer = rp.PopStaticBuffer();
 
     LOG_DEBUG(Service_APT, "called, applet_id={:08X}, size={:08X}", applet_id, buffer_size);
+#if defined(__SWITCH__) && HEN_DEV
+    // (what an application hands a library applet at its start. The error applet
+    // started by Mario Kart 7 read from a null pointer; started by System Settings it did not.)
+    {
+        std::string words;
+        for (std::size_t i = 0; i + 4 <= buffer.size() && i < 64; i += 4) {
+            u32 word;
+            std::memcpy(&word, buffer.data() + i, 4);
+            words += fmt::format(" {:08x}", word);
+        }
+        std::printf("hen: apt: StartLibraryApplet %03x: parameter %u bytes (said %u), object %s; first words:%s\n",
+                    static_cast<unsigned>(applet_id), static_cast<unsigned>(buffer.size()), buffer_size,
+                    object ? object->GetTypeName().c_str() : "none", words.c_str());
+    }
+#endif
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(apt->applet_manager->StartLibraryApplet(applet_id, object, buffer));
@@ -1094,6 +1109,18 @@ void Module::APTInterface::SendCaptureBufferInfo(Kernel::HLERequestContext& ctx)
     const auto buffer = rp.PopStaticBuffer();
 
     LOG_DEBUG(Service_APT, "called");
+#if defined(__SWITCH__) && HEN_DEV
+    {
+        std::string words;
+        for (std::size_t i = 0; i + 4 <= buffer.size() && i < 32; i += 4) {
+            u32 word;
+            std::memcpy(&word, buffer.data() + i, 4);
+            words += fmt::format(" {:08x}", word);
+        }
+        std::printf("hen: apt: SendCaptureBufferInfo: %u bytes (said %u):%s\n",
+                    static_cast<unsigned>(buffer.size()), size, words.c_str());
+    }
+#endif
 
     apt->applet_manager->SendCaptureBufferInfo(buffer);
 
@@ -1109,6 +1136,18 @@ void Module::APTInterface::ReceiveCaptureBufferInfo(Kernel::HLERequestContext& c
 
     auto screen_capture_buffer = apt->applet_manager->ReceiveCaptureBufferInfo();
     auto real_size = std::min(static_cast<u32>(screen_capture_buffer.size()), size);
+#if defined(__SWITCH__) && HEN_DEV
+    {
+        std::string words;
+        for (std::size_t i = 0; i + 4 <= screen_capture_buffer.size() && i < 32; i += 4) {
+            u32 word;
+            std::memcpy(&word, screen_capture_buffer.data() + i, 4);
+            words += fmt::format(" {:08x}", word);
+        }
+        std::printf("hen: apt: ReceiveCaptureBufferInfo: asked for %u bytes, %u there%s:%s\n", size, real_size,
+                    real_size == 0 ? " (NONE was sent: the applet gets zeroes)" : "", words.c_str());
+    }
+#endif
     screen_capture_buffer.resize(size);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);

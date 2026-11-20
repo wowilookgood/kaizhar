@@ -242,6 +242,10 @@ public:
         virtual bool SupportsSerialization() {
             return true;
         }
+        /// (Kaizhar) See Kernel::WakeupCallback::HostWorkEnded (thread.h).
+        virtual bool HostWorkEnded(std::chrono::milliseconds wait) {
+            return true;
+        }
 
     private:
         template <class Archive>
@@ -282,6 +286,11 @@ private:
 
         bool SupportsSerialization() override {
             return false;
+        }
+
+        /// (Kaizhar) The host thread's part uses the request's context: ended, or none.
+        bool HostWorkEnded(std::chrono::milliseconds wait) override {
+            return !future.valid() || future.wait_for(wait) != std::future_status::timeout;
         }
 
     private:

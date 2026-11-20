@@ -722,6 +722,13 @@ public:
     /// Unregisters page table for rasterizer cache marking
     void UnregisterPageTable(std::shared_ptr<PageTable> page_table);
 
+    /// (Kaizhar, Switch 2 port) A process that has just been made, with nothing mapped yet,
+    /// gets another page table in place of the one it was made with: `adopted` takes
+    /// `unused`'s place in the list of page tables. The unused one was never a core's and is
+    /// simply let go (not reported as an ended process's).
+    void HenSwapPageTable(const std::shared_ptr<PageTable>& unused,
+                          std::shared_ptr<PageTable> adopted);
+
     /// Gets pointer to DSP shared memory with given offset
     u8* GetDspMemory(std::size_t offset) const;
 

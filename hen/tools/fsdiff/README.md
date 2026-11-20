@@ -16,7 +16,7 @@ check that on the computer, before a build goes to the console.
   random pixels with random uniforms and compares. `MUTATE='old=>new'` plants a fault in
   the generic shader to see that the test notices.
 
-2026-11-13: 2000 configurations, 288671 compared colours, no difference; of twelve planted
+Result: 2000 configurations, 288671 compared colours, no difference; of twelve planted
 faults eleven were reported and the twelfth (fresnel taken from every light and not only the
 last) is no fault: the last light's value wins either way.
 
@@ -26,10 +26,17 @@ driver does with the shader, and texture and table contents (hashes here).
 A new shader is compiled and tested here before it is sent to the console.
 
 `CANON=1 difftest.py ...` compares, instead, the generated shader for a configuration made
-canonical (`FSConfig::Canonicalize`, default on since 2026-11-13) with the one for the
-configuration as it is: 600 configurations, 87478 compared colours, no difference
-(2026-11-13). The random configurations vary the texture stages, lighting, alpha test, fog,
+canonical (`FSConfig::Canonicalize`, default on) with the one for the
+configuration as it is: 600 configurations, 87478 compared colours, no difference.
+The random configurations vary the texture stages, lighting, alpha test, fog,
 scissor and depth; the blend, logic-op and wrap fields that Canonicalize also clears are
 left at zero here (nothing reads them on the console's profile).
+
+`ND=1 difftest.py ...` checks the generic shader's variant without the depth write (`gen
+generic 0 nd`, early depth) against the generated shader with the depth write, Z-buffer
+mode only: the first is given the depth the rasteriser makes under the range depth_offset ..
+depth_offset - depth_scale, and colours and depth must agree. Result: 600 configurations,
+87478 compared colours, no difference; a planted fault (`1.0 - gl_FragCoord.z`) is reported.
+The variant with the depth write is byte for byte the shader's text from before the variant existed.
 
 `build.sh` leaves `gen`, object files and `work/` next to the sources: delete them after use.

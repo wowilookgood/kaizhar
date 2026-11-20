@@ -161,6 +161,12 @@ public:
         return image_format_list;
     }
 
+    /// (Switch 2 port) The largest square fragment size of VK_KHR_fragment_shading_rate the
+    /// device offers as pipeline state for one sample (2 or 4), or 0 without the extension.
+    u32 HenCoarseShading() const {
+        return hen_coarse_shading;
+    }
+
     /// Returns true when VK_EXT_graphics_pipeline_library is enabled
     bool IsGraphicsPipelineLibrarySupported() const {
         return graphics_pipeline_library;
@@ -337,6 +343,7 @@ protected:
     bool image_format_list{};
     bool pipeline_creation_cache_control{};
     bool graphics_pipeline_library{};
+    u32 hen_coarse_shading{}; ///< largest square fragment size the device shades at (0: none; 2 or 4)
     bool fragment_shader_barycentric{};
     bool shader_stencil_export{};
     bool external_memory_host{};

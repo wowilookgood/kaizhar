@@ -117,6 +117,31 @@ constexpr Result ErrorIncompatibleSendPostData = // 0xD8A0A036
     Result(ErrCodes::IncompatibleSendPostData, ErrorModule::HTTP, ErrorSummary::InvalidState,
            ErrorLevel::Permanent);
 
+// (Kaizhar) soc_u.cpp: a frontend's own answer to a name the emulated console looks up.
+extern "C" int (*hen_guest_lookup)(const char* name, unsigned* ipv4);
+
+/// Connects to the frontend's address for the host, if it has one: the name stays what the
+/// request and the TLS handshake carry.
+template <typename ClientType>
+static void UseGuestLookup(ClientType& client, const std::string& host) {
+    unsigned ipv4 = 0;
+    if (hen_guest_lookup == nullptr || hen_guest_lookup(host.c_str(), &ipv4) != 1) {
+        return;
+    }
+    const u8* b = reinterpret_cast<const u8*>(&ipv4);
+    client.set_hostname_addr_map({{host, fmt::format("{}.{}.{}.{}", b[0], b[1], b[2], b[3])}});
+}
+
+/// (Kaizhar) The request's thread is waited for when the emulated system shuts down, and the
+/// library gives a server that doesn't answer five minutes to connect. On the Switch 2 a
+/// program that doesn't end keeps the next one from starting: half a minute there.
+template <typename ClientType>
+static void LimitConnectTime([[maybe_unused]] ClientType& client) {
+#ifdef __SWITCH__
+    client.set_connection_timeout(30, 0);
+#endif
+}
+
 static std::size_t WriteHeaders(httplib::Stream& stream,
                                 std::span<const Context::RequestHeader> headers) {
     std::size_t write_len = 0;
@@ -395,6 +420,14 @@ void Context::MakeRequest() {
     request.method = request_method_strings.at(method);
     request.path = url_info.path;
 
+#if defined(__SWITCH__) && defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+    // (Kaizhar) hen/idbe/README.md: the one request let through to Nintendo in normal play.
+    if (const auto icon = Idbe::Classify(url_info.is_https, url_info.host, url_info.port,
+                                         url_info.path, method == RequestMethod::Get)) {
+        MakeIconServerRequest(*icon);
+        return;
+    }
+#endif
     // Apply URL replacements if any
     url_info.host = url_replacer->Apply(url_info.host);
 
@@ -481,13 +514,28 @@ void Context::MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo
     httplib::Error error{-1};
     std::unique_ptr<httplib::Client> client =
         std::make_unique<httplib::Client>(url_info.host, url_info.port);
+    UseGuestLookup(*client, url_info.host);
+    LimitConnectTime(*client);
 
     client->set_header_writer(
         [this, &pending_headers](httplib::Stream& strm, httplib::Headers& httplib_headers) {
             return HandleHeaderWrite(pending_headers, strm, httplib_headers);
         });
 
-    if (!client->send(request, response, error)) {
+    // (Kaizhar) For the online record in the log file: the server's name after the rules, the
+    // outcome and the time. Nothing of the request or the answer themselves.
+    const auto hen_send_start = std::chrono::steady_clock::now();
+    const bool hen_sent = client->send(request, response, error);
+    const auto hen_send_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hen_send_start).count();
+    if (hen_sent) {
+        LOG_INFO(Service_HTTP, "online: request to {}:{}: status {} after {} ms", url_info.host, url_info.port,
+                 response.status, static_cast<long long>(hen_send_ms));
+    } else {
+        LOG_INFO(Service_HTTP, "online: request to {}:{}: FAILED after {} ms: {}", url_info.host, url_info.port,
+                 static_cast<long long>(hen_send_ms), httplib::to_string(error));
+    }
+    if (!hen_sent) {
         LOG_ERROR(Service_HTTP, "Request failed: {}: {}", error, httplib::to_string(error));
         state = RequestState::Completed;
     } else {
@@ -498,8 +546,8 @@ void Context::MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo
     FinishTransfer();
 }
 
-#ifdef __SWITCH__
-// The Switch 2 build has no TLS library: HTTPS requests fail.
+#if defined(__SWITCH__) && !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+// A Switch 2 build without a TLS library (KAIZHAR_TLS off): HTTPS requests fail.
 void Context::MakeRequestSSL(httplib::Request&, const Common::URLInfo& url_info,
                              std::vector<Context::RequestHeader>&) {
     LOG_ERROR(Service_HTTP, "HTTPS request to {} failed: no TLS support in this build",
@@ -538,6 +586,23 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
         key_size = static_cast<long>(client_cert->private_key.size());
     }
 
+#if defined(__SWITCH__) && HEN_DEV
+    // The complete request as it is about to go out, for anything a console might
+    // send somewhere it should not: nothing is left out but the body's bytes.
+    {
+        std::printf("hen: http: %s https://%s:%d%s (the program asked for %s); client certificate: %s; body %llu bytes%s\n",
+                    request.method.c_str(), url_info.host.c_str(), url_info.port, request.path.c_str(),
+                    url.c_str(),
+                    uses_default_client_cert ? "the 3DS family's default (ClCertA)"
+                                             : (cert_data ? "one the program set" : "none"),
+                    static_cast<unsigned long long>(post_data_raw.size()),
+                    chunked_request ? " (chunked)" : "");
+        for (const auto& header : pending_headers) {
+            std::printf("hen: http:   header %s: %s\n", header.name.c_str(), header.value.c_str());
+        }
+        std::printf("hen: http:   (and Host, plus Content-Length for a POST or PUT, written by the library)\n");
+    }
+#endif
     std::unique_ptr<httplib::SSLClient> client;
     if (cert_data && key_data) {
         cert = d2i_X509(nullptr, &cert_data, cert_size);
@@ -551,13 +616,28 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
     // https://www.3dbrew.org/wiki/SSL_Services#SSLOpt
     // Hack: Since for now RootCerts are not implemented we set the VerifyMode to None.
     client->enable_server_certificate_verification(false);
+    UseGuestLookup(*client, url_info.host);
+    LimitConnectTime(*client);
 
     client->set_header_writer(
         [this, &pending_headers](httplib::Stream& strm, httplib::Headers& httplib_headers) {
             return HandleHeaderWrite(pending_headers, strm, httplib_headers);
         });
 
-    if (!client->send(request, response, error)) {
+    // (Kaizhar) For the online record in the log file: the server's name after the rules, the
+    // outcome and the time. Nothing of the request or the answer themselves.
+    const auto hen_send_start = std::chrono::steady_clock::now();
+    const bool hen_sent = client->send(request, response, error);
+    const auto hen_send_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - hen_send_start).count();
+    if (hen_sent) {
+        LOG_INFO(Service_HTTP, "online: request to {}:{}: status {} after {} ms", url_info.host, url_info.port,
+                 response.status, static_cast<long long>(hen_send_ms));
+    } else {
+        LOG_INFO(Service_HTTP, "online: request to {}:{}: FAILED after {} ms: {}", url_info.host, url_info.port,
+                 static_cast<long long>(hen_send_ms), httplib::to_string(error));
+    }
+    if (!hen_sent) {
         LOG_ERROR(Service_HTTP, "Request failed: {}: {}", error, httplib::to_string(error));
         state = RequestState::Completed;
     } else {
@@ -567,6 +647,133 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
 
     FinishTransfer();
 }
+
+#ifdef __SWITCH__
+void Context::MakeIconServerRequest(const Idbe::IconRequest& icon) {
+    Idbe::LogEntry entry;
+    entry.request = icon;
+    entry.asked_url = url;
+    for (const auto& header : headers) {
+        entry.applet_headers.emplace_back(header.name, header.value);
+    }
+#if HEN_DEV
+    entry.applet_header_values = true;
+#endif
+    entry.certificate_withheld =
+        uses_default_client_cert ? "the 3DS family's default (ClCertA)"
+                                 : (ssl_config.client_cert_ctx.lock() ? "one the program set"
+                                                                      : "none");
+
+    std::vector<u8> body;
+    int status = 0;
+    auto decision = Idbe::RunSession().Begin(icon);
+    entry.sent = decision.sent;
+    switch (decision.action) {
+    case Idbe::Session::Action::Cached:
+        body = std::move(decision.body);
+        status = 200;
+        entry.outcome = "cache";
+        break;
+    case Idbe::Session::Action::KnownAbsent:
+        entry.outcome = "known absent";
+        break;
+    case Idbe::Session::Action::OverBudget:
+        entry.outcome = "over budget";
+        break;
+    case Idbe::Session::Action::Send: {
+        const std::string host{Idbe::Host};
+        // No certificate and no key, whatever the context holds.
+        httplib::SSLClient client(host, Idbe::Port);
+        if (hen_idbe_lookup != nullptr) {
+            unsigned ipv4 = 0;
+            if (hen_idbe_lookup(host.c_str(), &ipv4) != 1) {
+                entry.outcome = "failed: no address";
+                Idbe::RunSession().Failed(icon);
+                break;
+            }
+            const u8* b = reinterpret_cast<const u8*>(&ipv4);
+            entry.address = fmt::format("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+            client.set_hostname_addr_map({{host, entry.address}});
+        } else {
+            entry.address = "the system's lookup";
+        }
+        client.enable_server_certificate_verification(false); // as MakeRequestSSL: no root certs
+        client.set_follow_location(false);
+        client.set_keep_alive(false);
+        client.set_connection_timeout(Idbe::ConnectTimeoutSeconds, 0);
+        client.set_read_timeout(Idbe::ReadTimeoutSeconds, 0);
+        client.set_write_timeout(Idbe::ReadTimeoutSeconds, 0);
+        client.set_header_writer([](httplib::Stream& strm, httplib::Headers&) {
+            std::vector<Context::RequestHeader> fixed;
+            for (const auto& [name, value] : Idbe::RequestHeaders()) {
+                fixed.emplace_back(name, value);
+            }
+            return static_cast<ssize_t>(WriteHeaders(strm, fixed));
+        });
+
+        httplib::Request request;
+        request.method = "GET";
+        request.path = icon.Path();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        const char* dropped = nullptr;
+        request.content_receiver = [&](const char* data, std::size_t size, u64, u64) {
+            if (body.size() + size > Idbe::MaxBodySize) {
+                dropped = "failed: more than 64 KiB";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() > deadline) {
+                dropped = "failed: took more than 10 s";
+                return false;
+            }
+            body.insert(body.end(), data, data + size);
+            return true;
+        };
+        httplib::Response icon_response;
+        httplib::Error error{};
+        if (!client.send(request, icon_response, error)) {
+            entry.outcome = dropped != nullptr ? dropped
+                                               : "failed: " + httplib::to_string(error);
+            entry.bytes = body.size();
+            body.clear();
+            Idbe::RunSession().Failed(icon);
+            break;
+        }
+        status = icon_response.status;
+        entry.outcome = "sent";
+        Idbe::RunSession().Answered(icon, status, body);
+        break;
+    }
+    }
+
+    entry.status = status;
+    if (entry.bytes == 0) {
+        entry.bytes = body.size();
+    }
+    const std::string line = Idbe::LogLine(entry);
+    LOG_INFO(Service_HTTP, "{}", line);
+#if HEN_DEV
+    std::printf("%s\n", line.c_str());
+#endif
+
+    if (Idbe::ResponseAccepted(status, body.size())) {
+        // As a real response: status and headers first, then the body, then the end.
+        response.version = "HTTP/1.1";
+        response.status = 200;
+        response.reason = "OK";
+        response.headers.clear();
+        response.set_header("Content-Type", "application/octet-stream");
+        response.set_header("Content-Length", std::to_string(body.size()));
+        total_download_size_bytes = body.size();
+        OnResponseHeaders();
+        OnBodyData(reinterpret_cast<const char*>(body.data()), body.size());
+        state = RequestState::ReceivingBody;
+    } else {
+        // As a request that could not connect (MakeRequestSSL's failure branch): today's result.
+        state = RequestState::Completed;
+    }
+    FinishTransfer();
+}
+#endif
 #endif
 
 bool Context::ContentProvider(size_t offset, size_t length, httplib::DataSink& sink) {
@@ -2448,6 +2655,13 @@ bool URLReplacer::Save() {
     return true;
 }
 
+// (Kaizhar) The URL replacement rules of the running console, for the socket
+// service's name lookups (soc_u.cpp, hen_soc_rules): the host as the rules make it, or as it is.
+static const URLReplacer* hen_live_rules = nullptr;
+std::string HenApplyUrlRules(const std::string& host) {
+    return hen_live_rules != nullptr ? hen_live_rules->Apply(host) : host;
+}
+
 HTTP_C::HTTP_C() : ServiceFramework("http:C", 32) {
     static const FunctionInfo functions[] = {
         // clang-format off
@@ -2516,9 +2730,11 @@ HTTP_C::HTTP_C() : ServiceFramework("http:C", 32) {
     RegisterHandlers(functions);
 
     DecryptClCertA();
+    hen_live_rules = &url_replacer;
 }
 
 HTTP_C::~HTTP_C() {
+    hen_live_rules = nullptr;
     for (auto& [_, context] : contexts) {
         context->Cancel();
     }

@@ -25,7 +25,7 @@ namespace {
 
 /// Whether the cartridge in the slot is this title. Its save data is kept with the SD card's
 /// (where the title itself reads and writes it when it runs), so another application may open
-/// it there. With no such cartridge, the archives answer as before: not inserted.
+/// it there. With no such cartridge, the archives answer as upstream: not inserted.
 bool CartridgeHolds(u64 program_id) {
     const std::string& cartridge = Core::System::GetInstance().GetCartridge();
     if (cartridge.empty()) {

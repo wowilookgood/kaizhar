@@ -12,8 +12,10 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/handle_table.h"
+#include "core/hle/kernel/hen_ipc_trace.h"
 #include "core/hle/kernel/hle_ipc.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
@@ -57,10 +59,19 @@ public:
         // Copy the translated command buffer back into the thread's command buffer area.
         memory.WriteBlock(*process, thread->GetCommandBufferAddress(), cmd_buff.data(),
                           cmd_buff.size() * sizeof(u32));
+#if HEN_DEV
+        // (Kaizhar: hen_ipc_trace.h)
+        HenIpc::Answer(thread->thread_id, reinterpret_cast<const u32*>(cmd_buff.data()),
+                       static_cast<u64>(context->kernel.timing.GetGlobalTimeUs().count()));
+#endif
     }
 
     bool SupportsSerialization() {
         return !callback.get() || callback->SupportsSerialization();
+    }
+
+    bool HostWorkEnded(std::chrono::milliseconds wait) override {
+        return !callback.get() || callback->HostWorkEnded(wait);
     }
 
 private:

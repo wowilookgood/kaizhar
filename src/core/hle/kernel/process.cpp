@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/base_object.hpp>
@@ -102,8 +103,45 @@ void CodeSet::Segment::serialize(Archive& ar, const unsigned int) {
 }
 SERIALIZE_IMPL(CodeSet::Segment)
 
+#ifdef __SWITCH__
+} // namespace Kernel
+namespace Core {
+// core/arm/dynarmic/arm_dynarmic.cpp, "Parked JITs"
+std::shared_ptr<Memory::PageTable> HenParkTake(u64 program_id, u64 image_hash,
+                                               const std::array<u32, 7>& layout);
+void HenParkRegister(const std::shared_ptr<Memory::PageTable>& table, u64 program_id,
+                     u64 image_hash, const std::array<u32, 7>& layout);
+} // namespace Core
+namespace Kernel {
+#endif
+
+void Process::HenParkedJits([[maybe_unused]] const CodeSet& code_set) {
+#ifdef __SWITCH__
+    if (code_set.hen_image_hash == 0) {
+        return;
+    }
+    const std::array<u32, 7> layout{
+        code_set.CodeSegment().addr,   code_set.CodeSegment().size,
+        code_set.RODataSegment().addr, code_set.RODataSegment().size,
+        code_set.DataSegment().addr,   code_set.DataSegment().size,
+        code_set.entrypoint,
+    };
+    if (std::shared_ptr<Memory::PageTable> parked =
+            Core::HenParkTake(code_set.program_id, code_set.hen_image_hash, layout)) {
+        // Nothing is mapped yet and no core has seen this process: the page table it was
+        // made with is dropped for the parked one, and Reset() empties that.
+        kernel.memory.HenSwapPageTable(vm_manager.page_table, parked);
+        vm_manager.page_table = std::move(parked);
+        vm_manager.Reset();
+    }
+    Core::HenParkRegister(vm_manager.page_table, code_set.program_id, code_set.hen_image_hash,
+                          layout);
+#endif
+}
+
 std::shared_ptr<Process> KernelSystem::CreateProcess(std::shared_ptr<CodeSet> code_set) {
     auto process{std::make_shared<Process>(*this)};
+    process->HenParkedJits(*code_set);
 
     process->codeset = std::move(code_set);
     process->flags.raw = 0;

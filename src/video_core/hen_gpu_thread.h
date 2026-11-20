@@ -52,9 +52,6 @@ void Stop();
 bool Active();
 /// Whether the caller is the GPU thread.
 bool OnThread();
-/// True while the emulation thread waits for the GPU thread, or more work is queued behind what
-/// it is doing: nothing optional should be done on it now.
-bool Behind();
 
 /// Emulation thread: hands a command to the GPU thread.
 void Queue(const Service::GSP::Command& command);

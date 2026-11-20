@@ -20,9 +20,16 @@
 SERIALIZE_EXPORT_IMPL(Kernel::AddressArbiter)
 SERIALIZE_EXPORT_IMPL(Kernel::AddressArbiter::Callback)
 
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" unsigned long long hen_wait_count[16]; // ("hen: emu svc:": hen/jit/hen_jit.c)
+#endif
+
 namespace Kernel {
 
 void AddressArbiter::WaitThread(std::shared_ptr<Thread> thread, VAddr wait_address) {
+#if defined(__SWITCH__) && HEN_DEV
+    hen_wait_count[4]++;
+#endif
     thread->wait_address = wait_address;
     thread->status = ThreadStatus::WaitArb;
     waiting_threads.emplace_back(std::move(thread));
@@ -137,6 +144,12 @@ Result AddressArbiter::ArbitrateAddress(std::shared_ptr<Thread> thread, Arbitrat
         // The tick count is taken directly from official HOS kernel. The priority value is one less
         // than official kernel as the affected FMV threads dont meet the priority threshold of 50.
         // TODO: Revisit this when scheduler is rewritten and adjust if there isn't a problem there.
+#if defined(__SWITCH__) && HEN_DEV
+        hen_wait_count[6]++;
+        if (num_threads == 0) {
+            hen_wait_count[7]++;
+        }
+#endif
         if (num_threads == 0 && thread->current_priority >= 49) {
             kernel.current_cpu->GetTimer().AddKernelTicks(1614u);
         }

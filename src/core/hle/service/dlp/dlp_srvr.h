@@ -26,6 +26,12 @@ enum class DLP_Srvr_State : u8 {
 
 class DLP_SRVR final : public ServiceFramework<DLP_SRVR>, public DLP_Base {
 public:
+    /// Ends the hosting thread and the title broadcast, and waits for the thread. Before the
+    /// emulated system is taken apart: the thread looks services up while it runs.
+    void StopWorker() {
+        EnsureEndBroadcaster();
+        EndConnectionManager();
+    }
     DLP_SRVR();
     ~DLP_SRVR();
 

@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/hen_frame_work.h"
+#include "common/hen_gap.h"
 #include "common/hen_stats.h"
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
@@ -45,6 +47,46 @@ static constexpr int hen_depth_scale_blit = 1;
 extern "C" void hen_backtrace(const char* what); // hen/jit/hen_jit.c
 extern "C" int hen_depth_lag;                     // --sync-depth-reads turns it off
 #endif
+
+#ifdef __SWITCH__
+namespace Vulkan {
+void HenNoteImageMemory(VmaAllocator allocator, VmaAllocation allocation); // vk_instance.cpp
+}
+#endif
+
+#if defined(__SWITCH__) && HEN_DEV
+#include <atomic>
+extern "C" unsigned long long hen_jit_now_ns(void);
+extern std::atomic<unsigned long long> hen_last_submit_ns; // vk_master_semaphore.cpp
+#endif
+namespace {
+/// A surface download's wait: everything queued is recorded and submitted by the scheduler's
+/// worker, then the GPU finishes it. Development builds say how a slow one divides between
+/// the two and print the three threads' samples (first ones take 24 to 60 ms on cold routes
+/// where later ones take 0.4 to 13).
+void HenDownloadFinish(Vulkan::Scheduler& scheduler) {
+#if defined(__SWITCH__) && HEN_DEV
+    const unsigned long long start = hen_jit_now_ns();
+    scheduler.Finish();
+    const unsigned long long end = hen_jit_now_ns();
+    if (end - start >= 20'000'000ull) {
+        const unsigned long long submitted = hen_last_submit_ns.load(std::memory_order_relaxed);
+        if (submitted >= start && submitted <= end) {
+            std::printf("hen: slow: %llu ms in a surface download's wait: %llu until the scheduler's "
+                        "worker had submitted, %llu for the GPU after that\n",
+                        (end - start) / 1'000'000, (submitted - start) / 1'000'000,
+                        (end - submitted) / 1'000'000);
+        } else {
+            std::printf("hen: slow: %llu ms in a surface download's wait (nothing was submitted in it)\n",
+                        (end - start) / 1'000'000);
+        }
+        hen_blackbox_dump(static_cast<unsigned>((end - start) / 1'000'000));
+    }
+#else
+    scheduler.Finish();
+#endif
+}
+} // namespace
 
 namespace Vulkan {
 
@@ -231,6 +273,9 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
         LOG_CRITICAL(Render_Vulkan, "Failed allocating image with error {}", result);
         UNREACHABLE();
     }
+#ifdef __SWITCH__
+    HenNoteImageMemory(instance.GetAllocator(), allocation); // (vk_instance.cpp: the report)
+#endif
 
     image = vk::Image{unsafe_image};
 
@@ -371,6 +416,7 @@ bool TextureRuntime::ClearTexture(Surface& surface, const VideoCore::TextureClea
     };
 
     if (clear.texture_rect == surface.GetScaledRect()) {
+        HEN_WORK_COUNT(HEN_WORK_CLEARS_WHOLE, 1);
         scheduler.Record([params, clear](vk::CommandBuffer cmdbuf) {
             const vk::ImageSubresourceRange range = {
                 .aspectMask = params.aspect,
@@ -422,6 +468,7 @@ bool TextureRuntime::ClearTexture(Surface& surface, const VideoCore::TextureClea
         return true;
     }
 
+    HEN_WORK_COUNT(HEN_WORK_CLEARS_PART, 1);
     ClearTextureWithRenderpass(surface, clear);
     return true;
 }
@@ -511,6 +558,7 @@ void TextureRuntime::ClearTextureWithRenderpass(Surface& surface,
 
 bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
                                   std::span<const VideoCore::TextureCopy> copies) {
+    HEN_WORK_COUNT(HEN_WORK_COPIES, 1);
     renderpass_cache.EndRendering();
 
     const RecordParams params = {
@@ -613,6 +661,7 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
 
 bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
                                   const VideoCore::TextureBlit& blit) {
+    HEN_WORK_COUNT(HEN_WORK_BLITS, 1);
     const bool is_depth_stencil = source.type == VideoCore::SurfaceType::DepthStencil;
     const auto& depth_traits = instance.GetTraits(source.pixel_format);
     if (is_depth_stencil && !depth_traits.blit_support) {
@@ -882,6 +931,18 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
 
 void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
                      const VideoCore::StagingData& staging) {
+#if defined(__SWITCH__) && HEN_DEV
+    // (for the line about a gap between two frames: common/hen_gap.h)
+    struct UploadTime {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~UploadTime() {
+            hen_gap_add(HEN_GAP_UPLOADS, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - start)
+                                             .count());
+        }
+    } upload_time;
+#endif
+    HEN_WORK_COUNT(HEN_WORK_UPLOADS, 1);
     runtime.renderpass_cache.EndRendering();
 
     // (Switch 2 port) Depth and stencil the program wrote, for a surface drawn at a multiple
@@ -1180,13 +1241,14 @@ void Surface::UploadCustom(const VideoCore::Material* material, u32 level) {
 
 void Surface::Download(const VideoCore::BufferTextureCopy& download,
                        const VideoCore::StagingData& staging) {
+    HEN_WORK_COUNT(HEN_WORK_DOWNLOADS, 1);
     bool hen_finished = false; // (the depth path below has done its own waiting)
     SCOPE_EXIT({
         if (!hen_finished) {
             HenGfxTimer hen_timer{HEN_GFX_DOWNLOAD_FINISH};
             HenGfxTimer hen_depth_timer{pixel_format == PixelFormat::D24S8 ? HEN_GFX_DOWNLOAD_DEPTH
                                                                            : HEN_GFX_KINDS};
-            scheduler.Finish();
+            HenDownloadFinish(scheduler);
         }
         runtime.download_buffer.Commit(staging.size);
     });
@@ -1255,7 +1317,7 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
             hen_lag = {data, addr, staging.size, download.texture_level, rect.left, rect.top, rect.right,
                        rect.bottom, scheduler.CurrentTick(), now};
             if (!recent) {
-                scheduler.Finish();
+                HenDownloadFinish(scheduler);
                 std::memcpy(staging.mapped.data(), data, staging.size);
             }
             hen_finished = true;
@@ -1358,6 +1420,8 @@ void Surface::ScaleUp(u32 new_scale) {
     handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
                                  traits.native, traits.usage, flags, traits.aspect, false,
                                  DebugName(true));
+    HEN_SURFACE_COUNT(HEN_IMAGE_SCALE_UP, 1);
+    hen_scaled_up = true; // (other usage flags than the constructor's: not for the pool)
     current = Type::Scaled;
 
     handles[Type::Copy].Destroy();
@@ -1380,6 +1444,66 @@ void Surface::ScaleUp(u32 new_scale) {
             .dst_rect = GetScaledRect(level),
         };
         BlitScale(blit, true);
+    }
+}
+
+bool Surface::HenPoolable() const noexcept {
+    return texture_type == VideoCore::TextureType::Texture2D && material == nullptr &&
+           custom_format == VideoCore::CustomPixelFormat::Invalid && !hen_scaled_up &&
+           handles[Type::Base] && !handles[Type::Custom] &&
+           static_cast<bool>(handles[Type::Scaled]) == (res_scale != 1);
+}
+
+u64 Surface::HenImageBytes() const {
+    u64 bytes = 0;
+    for (const Handle& handle : handles) {
+        if (handle) {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(instance.GetAllocator(), handle.allocation, &info);
+            bytes += info.size;
+        }
+    }
+    return bytes;
+}
+
+bool Surface::HenFits(const VideoCore::SurfaceParams& params,
+                      const VideoCore::SurfaceFlagBits& initial_flags) const {
+    if (params.width != width || params.height != height || params.levels != levels ||
+        params.res_scale != res_scale || params.pixel_format != pixel_format ||
+        params.texture_type != texture_type ||
+        params.custom_format != VideoCore::CustomPixelFormat::Invalid) {
+        return false;
+    }
+    // The format, usage and aspect the constructor would choose (the flags the surface has
+    // now do not say what it chose: the rasterizer sets ShadowSource on live surfaces).
+    FormatTraits wanted = instance.GetTraits(params.pixel_format);
+    if (True(initial_flags & VideoCore::SurfaceFlagBits::ShadowSource) &&
+        wanted.native != vk::Format::eR8G8B8A8Unorm) {
+        wanted = instance.GetTraits(VideoCore::PixelFormat::RGBA8);
+        wanted.needs_conversion = true;
+    }
+    return wanted == traits;
+}
+
+void Surface::HenRecycle(const VideoCore::SurfaceParams& params,
+                         const VideoCore::SurfaceFlagBits& initial_flags) {
+    // SurfaceBase, as its constructor leaves it. The modification tick goes on counting: a
+    // tick someone remembers for this id must not come round again.
+    static_cast<VideoCore::SurfaceParams&>(*this) = params;
+    flags = initial_flags;
+    material = nullptr;
+    invalid_regions.clear();
+    fill_size = 0;
+    fill_data = {};
+    modification_tick++;
+    // The images, their views and framebuffers stay, the copy image too if there is one
+    // (CopyImageView writes it before a draw reads it). is_framebuffer and is_storage stay
+    // set: they only widen the access masks of barriers, and the images were used that way.
+    if (instance.HasDebuggingToolAttached()) {
+        SetObjectName(instance.GetDevice(), handles[Type::Base].image, DebugName(false));
+        if (handles[Type::Scaled]) {
+            SetObjectName(instance.GetDevice(), handles[Type::Scaled].image, DebugName(true));
+        }
     }
 }
 
@@ -1431,6 +1555,17 @@ vk::ImageView Surface::CopyImageView() noexcept {
         copy_handle.Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
                            traits.usage, flags, traits.aspect, false);
         copy_layout = vk::ImageLayout::eUndefined;
+        HEN_SURFACE_COUNT(HEN_IMAGE_COPY, 1);
+    }
+    {
+        unsigned long long hen_bytes = 0;
+        for (u32 level = 0; level < levels; level++) {
+            hen_bytes += static_cast<unsigned long long>(GetScaledWidth() >> level) *
+                         (GetScaledHeight() >> level) * vk::blockSize(traits.native);
+        }
+        HEN_WORK_COUNT(HEN_WORK_FEEDBACK_COPIES, 1);
+        HEN_WORK_COUNT(HEN_WORK_FEEDBACK_BYTES, hen_bytes);
+        (void)hen_bytes;
     }
 
     runtime.renderpass_cache.EndRendering();
@@ -1585,6 +1720,7 @@ vk::Framebuffer Surface::Framebuffer(Type type) noexcept {
 }
 
 void Surface::BlitScale(const VideoCore::TextureBlit& blit, bool up_scale) {
+    HEN_WORK_COUNT(up_scale ? HEN_WORK_SCALE_UP : HEN_WORK_SCALE_DOWN, 1);
     const bool is_depth_stencil = pixel_format == PixelFormat::D24S8;
     if (is_depth_stencil && !traits.blit_support) {
         // (Switch 2 port) The device can't blit this format (NVK here: D24S8), so a depth

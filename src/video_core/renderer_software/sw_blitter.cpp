@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdio>
 #include "common/alignment.h"
 #include "common/color.h"
 #include "common/vector_math.h"
@@ -80,6 +81,16 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
 
     const std::size_t contiguous_input_size =
         config.texture_copy.size / input_width * (input_width + input_gap);
+#if defined(__SWITCH__) && HEN_DEV
+    // (a copy the renderer could not do: what it drew to the source is read back first)
+    static u32 hen_copies;
+    if (++hen_copies <= 3 || hen_copies % 600 == 0) {
+        std::printf("hen: gfx: texture copy on the CPU (%u so far): %08x to %08x, %u bytes, "
+                    "input width %u gap %u, output width %u gap %u\n",
+                    hen_copies, src_addr, dst_addr, remaining_size, input_width, input_gap,
+                    output_width, output_gap);
+    }
+#endif
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(),
                             static_cast<u32>(contiguous_input_size));
 
@@ -185,6 +196,20 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
         config.input_width * config.input_height * BytesPerPixel(config.input_format);
     const u32 output_size = output_width * output_height * BytesPerPixel(config.output_format);
 
+#if defined(__SWITCH__) && HEN_DEV
+    static u32 hen_transfers;
+    if (++hen_transfers <= 3 || hen_transfers % 600 == 0) {
+        std::printf("hen: gfx: display transfer on the CPU (%u so far): %08x %ux%u format %u "
+                    "to %08x %ux%u format %u, flags %08x\n",
+                    hen_transfers, config.GetPhysicalInputAddress(),
+                    static_cast<unsigned>(config.input_width),
+                    static_cast<unsigned>(config.input_height),
+                    static_cast<unsigned>(config.input_format.Value()),
+                    config.GetPhysicalOutputAddress(), output_width, output_height,
+                    static_cast<unsigned>(config.output_format.Value()),
+                    static_cast<unsigned>(config.flags));
+    }
+#endif
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(), input_size);
     rasterizer->InvalidateRegion(config.GetPhysicalOutputAddress(), output_size);
 

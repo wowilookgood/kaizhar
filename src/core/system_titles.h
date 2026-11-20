@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -28,7 +29,9 @@ std::string GetHomeMenuNcchPath(u32 region);
 std::optional<u32> GetSystemTitleRegion(u64 title_id);
 
 /// Determines if all system titles are installed for o3ds and n3ds.
-std::pair<bool, bool> AreSystemTitlesInstalled();
+/// has_metadata (Kaizhar): asked whether a title's metadata is there instead of the card,
+/// if given (Service::AM::HenNandTitles: the same answers without a file operation a title).
+std::pair<bool, bool> AreSystemTitlesInstalled(const std::function<bool(u64)>& has_metadata = {});
 
 void UninstallSystemFiles(SystemTitleSet set);
 

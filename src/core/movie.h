@@ -49,6 +49,20 @@ public:
 
     void SetPlaybackCompletionCallback(std::function<void()> completion_callback);
     void StartPlayback(const std::string& movie_file);
+
+    /// (Switch port) A recording is read by the number of the pad's poll since the console
+    /// started, and what runs before the title (the system's own modules, when they are run)
+    /// moves the title's start among those polls: its first inputs then come before it listens.
+    /// The moment a title asks the pad service for its handles is a fixed point of its own
+    /// start. After this call (once StartPlayback has run) playback gives no input until
+    /// `program_id` asks, and then goes on from the recording's pad poll `resume_input`: the
+    /// number that same moment had when the recording was made, as HenTitleAskedForPad printed
+    /// it in a playback of the same conditions as the recording.
+    void HenSyncAtTitleStart(u64 program_id, u64 resume_input);
+    /// The title playback or recording is for (so that the line below names its moment only).
+    void HenSetTitle(u64 program_id);
+    /// The pad service, as a program asks for its handles.
+    void HenTitleAskedForPad(u64 program_id);
     void StartRecording(const std::string& movie_file, const std::string& author);
 
     /**
@@ -177,6 +191,11 @@ private:
     std::vector<u8> recorded_input;
     std::size_t current_byte = 0;
     u64 current_input = 0;
+    // (Switch port, not saved in a state: HenSyncAtTitleStart)
+    u64 hen_title = 0;
+    u64 hen_resume_input = 0;
+    bool hen_hold = false;
+    bool hen_title_asked = false;
     // Total input count of the current movie being played. Not used for recording.
     u64 total_input = 0;
 

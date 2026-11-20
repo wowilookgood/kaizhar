@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,7 +36,8 @@ public:
     std::optional<std::pair<u64, Shader* const>> UseProgrammableVertexShader(
         const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout);
     std::optional<std::pair<u64, Shader* const>> UseFragmentShader(
-        const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user);
+        const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
+        bool no_depth_write = false);
     std::optional<std::pair<u64, Shader* const>> UseFixedGeometryShader(
         const Pica::RegsInternal& regs);
 

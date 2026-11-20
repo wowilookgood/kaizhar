@@ -196,18 +196,22 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
 extern "C" int hen_fs_canon;
 extern "C" unsigned long long hen_fs_configs_raw, hen_fs_configs_built;
 namespace {
-std::unordered_set<u64> hen_fs_seen; // (raw hashes, for the count only; one renderer thread)
+HEN_STAT(std::unordered_set<u64> hen_fs_seen;) // (raw hashes, for the count only; one renderer thread)
 }
 
 std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
-    const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user) {
+    const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user, bool no_depth_write) {
 
     FSConfig fs_config{regs};
+    // (hen, --early-depth) Part of the configuration, so of its hash: the id of the shader in
+    // memory, in fs.vkch, in the pipeline entries that name it. The entry on the card carries
+    // the bit and a later start generates the same variant from it, whatever the flag is then.
+    fs_config.framebuffer.hen_no_depth_write.Assign(no_depth_write ? 1 : 0);
     // (hen) --no-fs-canon: the configuration as the registers give it, as upstream.
     if (hen_fs_canon) {
-        if (hen_fs_seen.insert(fs_config.Hash()).second) {
+        HEN_STAT(if (hen_fs_seen.insert(fs_config.Hash()).second) {
             hen_fs_configs_raw++;
-        }
+        })
         fs_config.Canonicalize(parent.profile);
     }
     const auto fs_config_hash = fs_config.Hash();
@@ -2215,7 +2219,7 @@ void ShaderDiskCache::HenRegenPoll() {
         return;
     }
     // One pipeline started every 2 ms at most: TryBuild first asks the driver for the pipeline
-    // from its cache on this thread. (Not measured on the console.)
+    // from its cache on this thread.
     const auto now = std::chrono::steady_clock::now();
     if (now - hen_deferred_last < std::chrono::milliseconds(2)) {
         return;

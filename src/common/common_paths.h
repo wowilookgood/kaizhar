@@ -71,7 +71,11 @@
 
 // Filenames
 // Files in the directory returned by GetUserPath(UserPath::LogDir)
+#ifdef __SWITCH__
+#define LOG_FILE "kaizhar_log.txt" // (Kaizhar; the one before it becomes kaizhar_log.old.txt)
+#else
 #define LOG_FILE "azahar_log.txt"
+#endif
 
 // Files in the directory returned by GetUserPath(UserPath::ConfigDir)
 #define EMU_CONFIG "emu.ini"

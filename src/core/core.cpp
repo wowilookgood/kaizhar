@@ -2,6 +2,8 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <chrono>
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 #include <boost/serialization/array.hpp>
@@ -37,6 +39,7 @@
 #include "core/global.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/thread.h"
 #include "core/hle/service/apt/applet_manager.h"
@@ -49,6 +52,7 @@
 #include "core/hle/service/mic/mic_u.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/hle/service/service.h"
+#include "core/hle/service/dlp/dlp.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hw/aes/key.h"
 #include "core/loader/loader.h"
@@ -61,6 +65,13 @@
 #include "video_core/custom_textures/custom_tex_manager.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+
+#if HEN_DEV
+#include <cstdio>
+/// (Kaizhar, development builds) --no-shutdown-fix: System::Shutdown leaves requests in flight
+/// as upstream does. A test switch: the launch that uses it leaves a thread behind on purpose.
+int hen_no_shutdown_fix = 0;
+#endif
 
 namespace Core {
 
@@ -94,9 +105,208 @@ System::~System() = default;
  * Executes the thread currently scheduled on the given core. Runs a full slice when tight_loop is
  * set, a single instruction otherwise, or a single instruction if a debugger asked to step it.
  */
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && HEN_DEV
 extern "C" unsigned long long hen_jit_now_ns(void);
 extern "C" unsigned long long hen_core_ns[4], hen_core_ticks[4], hen_core_runs[4]; // hen_jit.c
+// ("hen: emu:") Passes of the run loop and the time inside it; the clock is read only
+// with hen_emu_stats_on (development builds).
+extern "C" int hen_emu_stats_on;
+extern "C" unsigned long long hen_emu_ns[12], hen_emu_count[12];
+namespace {
+struct HenLoopPass {
+    HenLoopPass() : start{hen_emu_stats_on ? hen_jit_now_ns() : 0} {}
+    ~HenLoopPass() {
+        hen_emu_count[0]++;
+        if (start != 0) {
+            hen_emu_ns[0] += hen_jit_now_ns() - start;
+        }
+    }
+    unsigned long long start;
+};
+
+// ("hen: emu cores:" and "hen: emu threads:") Per emulated core and per emulated thread,
+// since the last report: slices, ticks of program code (what "hen: code:" counts: generated
+// code only, before the 804 MHz clock factor), ticks the core's timer was charged in them (code
+// after the factor, plus the system calls' charges), host time, and how each slice ended. The
+// cores' figures are plain adds; the threads' table is only kept with
+// hen_emu_stats_on. Development builds. Emulation thread only.
+struct HenEmuCore {
+    u64 slices, code, charged, ns; // slices with a thread
+    u64 idle, idle_slices;         // no thread to run: the slice's ticks passed at no host cost
+};
+HenEmuCore hen_emu_cores[4];
+struct HenEmuThread {
+    u32 id, process_id;
+    char process_name[12];
+    u32 core, priority;
+    u64 slices, code, charged, ns;
+    // How its slices ended: 0 the slice was used up (thread still running, no ticks left),
+    // 1 stopped early still running (a reschedule was asked for: another thread became ready,
+    // a system call), 2 waiting (objects, arbiter, a service's reply), 3 sleeping (SleepThread),
+    // 4 ended.
+    u64 ends[5];
+    u32 last_pc;
+    u32 pc[4], pc_count[4]; // (the most frequent PCs at a slice's end: four counters, approximate)
+};
+constexpr int HEN_EMU_THREADS = 96;
+u32 hen_emu_thread_ids[HEN_EMU_THREADS];
+HenEmuThread hen_emu_threads[HEN_EMU_THREADS + 1]; // (the last: threads past the table's size)
+int hen_emu_thread_count;
+
+void HenNoteThreadSlice(ARM_Interface& core, Kernel::Thread* thread, u32 thread_id, u64 ns,
+                        u64 code, u64 charged) {
+    int at = 0;
+    while (at < hen_emu_thread_count && hen_emu_thread_ids[at] != thread_id) {
+        at++;
+    }
+    HenEmuThread& t = hen_emu_threads[at];
+    if (at == hen_emu_thread_count) {
+        if (at < HEN_EMU_THREADS) {
+            hen_emu_thread_ids[at] = thread_id;
+            hen_emu_thread_count++;
+        }
+        if (at < HEN_EMU_THREADS || t.slices == 0) {
+            t = {};
+            t.id = at < HEN_EMU_THREADS ? thread_id : 0;
+            if (const auto process = thread->owner_process.lock()) {
+                t.process_id = process->process_id;
+                if (process->codeset) {
+                    std::snprintf(t.process_name, sizeof(t.process_name), "%s",
+                                  process->codeset->name.c_str());
+                }
+            }
+        }
+    }
+    t.core = static_cast<u32>(core.GetID());
+    t.priority = thread->current_priority;
+    t.slices++;
+    t.code += code;
+    t.charged += charged;
+    t.ns += ns;
+    int end;
+    switch (thread->status) {
+    case Kernel::ThreadStatus::Running:
+    case Kernel::ThreadStatus::Ready:
+        end = core.GetTimer().GetDowncount() <= 0 ? 0 : 1;
+        break;
+    case Kernel::ThreadStatus::WaitSleep:
+        end = 3;
+        break;
+    case Kernel::ThreadStatus::Dead:
+    case Kernel::ThreadStatus::Dormant:
+        end = 4;
+        break;
+    default:
+        end = 2;
+        break;
+    }
+    t.ends[end]++;
+    const u32 pc = core.GetPC();
+    t.last_pc = pc;
+    int slot = -1, empty = -1;
+    for (int i = 0; i < 4; i++) {
+        if (t.pc_count[i] != 0 && t.pc[i] == pc) {
+            slot = i;
+        } else if (t.pc_count[i] == 0) {
+            empty = i;
+        }
+    }
+    if (slot >= 0) {
+        t.pc_count[slot]++;
+    } else if (empty >= 0) {
+        t.pc[empty] = pc;
+        t.pc_count[empty] = 1;
+    } else {
+        for (int i = 0; i < 4; i++) {
+            t.pc_count[i]--;
+        }
+    }
+}
+} // namespace
+extern "C" unsigned long long hen_jit_code_ticks_total(void); // arm_dynarmic.cpp
+#endif
+
+#if defined(__SWITCH__) && HEN_DEV
+// Prints "hen: emu cores: #N" and "hen: emu threads: #N" and empties both tables;
+// print false only empties them (a title starts).
+void HenEmuCoresReport(unsigned seq, bool print, u32 num_cores) {
+    if (print) {
+        char line[1024];
+        int at = 0;
+        line[0] = 0;
+        for (u32 c = 0; c < num_cores && c < 4 && at < static_cast<int>(sizeof(line)); c++) {
+            const HenEmuCore& e = hen_emu_cores[c];
+            at += std::snprintf(line + at, sizeof(line) - at,
+                                " core %u: %llu slices, %.2f M code ticks, %.2f M charged, idle %.2f M in "
+                                "%llu slices, %.1f ms, %.3f ms per M;",
+                                c, static_cast<unsigned long long>(e.slices), e.code / 1e6, e.charged / 1e6,
+                                e.idle / 1e6, static_cast<unsigned long long>(e.idle_slices), e.ns / 1e6,
+                                e.code != 0 ? e.ns / static_cast<double>(e.code) : 0.0);
+        }
+        std::printf("hen: emu cores: #%u %u cores;%s\n", seq, num_cores, line);
+
+        // The threads by host time, most first.
+        const int total = hen_emu_thread_count + (hen_emu_threads[HEN_EMU_THREADS].slices != 0 ? 1 : 0);
+        bool shown[HEN_EMU_THREADS + 1]{};
+        static char threads[4096];
+        at = 0;
+        threads[0] = 0;
+        u64 rest_ns = 0, rest_code = 0, rest_slices = 0;
+        int listed = 0;
+        for (int n = 0; n < 10; n++) {
+            int best = -1;
+            for (int i = 0; i <= HEN_EMU_THREADS; i++) {
+                const bool used = i < hen_emu_thread_count ||
+                                  (i == HEN_EMU_THREADS && hen_emu_threads[i].slices != 0);
+                if (used && !shown[i] && (best < 0 || hen_emu_threads[i].ns > hen_emu_threads[best].ns)) {
+                    best = i;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            shown[best] = true;
+            listed++;
+            const HenEmuThread& t = hen_emu_threads[best];
+            int most = 0;
+            for (int i = 1; i < 4; i++) {
+                if (t.pc_count[i] > t.pc_count[most]) {
+                    most = i;
+                }
+            }
+            if (at < static_cast<int>(sizeof(threads))) {
+                at += std::snprintf(
+                    threads + at, sizeof(threads) - at,
+                    " id %u proc %u \"%s\" core %u prio %u: %llu slices, %.2f M ticks, %.2f M charged, %.1f ms, "
+                    "%.3f ms per M, ends %llu used up %llu rescheduled %llu waiting %llu sleeping %llu ended, "
+                    "last pc %08x, most %08x x%u;",
+                    t.id, t.process_id, best == HEN_EMU_THREADS ? "(others)" : t.process_name, t.core,
+                    t.priority, static_cast<unsigned long long>(t.slices), t.code / 1e6, t.charged / 1e6,
+                    t.ns / 1e6, t.code != 0 ? t.ns / static_cast<double>(t.code) : 0.0,
+                    static_cast<unsigned long long>(t.ends[0]), static_cast<unsigned long long>(t.ends[1]),
+                    static_cast<unsigned long long>(t.ends[2]), static_cast<unsigned long long>(t.ends[3]),
+                    static_cast<unsigned long long>(t.ends[4]), t.last_pc, t.pc[most], t.pc_count[most]);
+            }
+        }
+        for (int i = 0; i <= HEN_EMU_THREADS; i++) {
+            const bool used = i < hen_emu_thread_count || (i == HEN_EMU_THREADS && hen_emu_threads[i].slices != 0);
+            if (used && !shown[i]) {
+                rest_ns += hen_emu_threads[i].ns;
+                rest_code += hen_emu_threads[i].code;
+                rest_slices += hen_emu_threads[i].slices;
+            }
+        }
+        std::printf("hen: emu threads: #%u %d threads ran, %d listed by host ms;%s rest: %d threads, %llu slices, "
+                    "%.2f M ticks, %.1f ms\n",
+                    seq, total, listed, threads, total - listed, static_cast<unsigned long long>(rest_slices),
+                    rest_code / 1e6, rest_ns / 1e6);
+    }
+    for (HenEmuCore& e : hen_emu_cores) {
+        e = {};
+    }
+    hen_emu_thread_count = 0;
+    hen_emu_threads[HEN_EMU_THREADS] = {};
+}
 #endif
 
 static void ExecuteCore(ARM_Interface& core, Kernel::Thread* thread, bool tight_loop) {
@@ -109,22 +319,37 @@ static void ExecuteCore(ARM_Interface& core, Kernel::Thread* thread, bool tight_
         return;
     }
 #endif
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && HEN_DEV
     // (per emulated core: time on the host thread and emulated ticks, for the "hen: cores"
     // line: which of the console's cores a title keeps busy)
     const unsigned long long hen_start = hen_jit_now_ns();
     const u64 hen_ticks = core.GetTimer().GetTicks();
+    const unsigned long long hen_code = hen_jit_code_ticks_total();
+    const u32 hen_thread_id = thread->thread_id;
 #endif
     if (tight_loop) {
         core.Run();
     } else {
         core.Step();
     }
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && HEN_DEV
+    // (the thread object is still there if it just ended: the core's thread manager holds it
+    // as its current thread until the reschedule that follows)
     const std::size_t hen_id = core.GetID() & 3;
-    hen_core_ns[hen_id] += hen_jit_now_ns() - hen_start;
-    hen_core_ticks[hen_id] += core.GetTimer().GetTicks() - hen_ticks;
+    const unsigned long long hen_took = hen_jit_now_ns() - hen_start;
+    const u64 hen_charged = core.GetTimer().GetTicks() - hen_ticks;
+    const u64 hen_code_run = hen_jit_code_ticks_total() - hen_code;
+    hen_core_ns[hen_id] += hen_took;
+    hen_core_ticks[hen_id] += hen_charged;
     hen_core_runs[hen_id]++;
+    HenEmuCore& hen_emu_core = hen_emu_cores[hen_id];
+    hen_emu_core.slices++;
+    hen_emu_core.code += hen_code_run;
+    hen_emu_core.charged += hen_charged;
+    hen_emu_core.ns += hen_took;
+    if (hen_emu_stats_on) {
+        HenNoteThreadSlice(core, thread, hen_thread_id, hen_took, hen_code_run, hen_charged);
+    }
 #endif
 }
 
@@ -143,6 +368,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     // (Switch 2 port, --gpu-thread) The interrupts of what the GPU thread has finished are
     // signalled here, before the cores' timers advance and their threads are rescheduled
     // below, like an event that came due. Nothing without the thread.
+#if defined(__SWITCH__) && HEN_DEV
+    const HenLoopPass hen_pass;
+#endif
     VideoCore::HenGpu::Poll(hen_all_idle);
     hen_all_idle = false;
 
@@ -296,6 +524,11 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         Kernel::Thread* thread = kernel->GetCurrentThreadManager().GetCurrentThread();
         if (thread == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
+#if defined(__SWITCH__) && HEN_DEV
+            hen_emu_cores[current_core_to_execute->GetID() & 3].idle +=
+                std::max<s64>(current_core_to_execute->GetTimer().GetDowncount(), 0);
+            hen_emu_cores[current_core_to_execute->GetID() & 3].idle_slices++;
+#endif
             current_core_to_execute->GetTimer().Idle();
             PrepareReschedule();
         } else {
@@ -328,6 +561,11 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             Kernel::Thread* thread = kernel->GetCurrentThreadManager().GetCurrentThread();
             if (thread == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
+#if defined(__SWITCH__) && HEN_DEV
+                hen_emu_cores[cpu_core->GetID() & 3].idle +=
+                    std::max<s64>(cpu_core->GetTimer().GetDowncount(), 0);
+                hen_emu_cores[cpu_core->GetID() & 3].idle_slices++;
+#endif
                 cpu_core->GetTimer().Idle();
                 PrepareReschedule();
             } else {
@@ -711,7 +949,10 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
 
     LOG_DEBUG(Core, "Initialized OK");
 
-    is_powered_on = true;
+    {
+        std::scoped_lock hen_lock{hen_kick_mutex};
+        is_powered_on = true;
+    }
 
 #ifdef ENABLE_SCRIPTING
     // Started last and stopped first in Shutdown, so requests never see a partially built system
@@ -818,8 +1059,63 @@ void System::Shutdown(bool is_deserializing) {
     rpc_server.reset();
 #endif
 
+    // The download play services' threads look services up for as long as they run (a title
+    // left while it hosts or joins a local game has one): they end before anything goes.
+    if (service_manager) {
+        Service::DLP::StopWorkers(*this);
+    }
+
+    // (Kaizhar) Emulated threads asleep inside a service call (a file read's delay, a request
+    // a host thread works on). Such a thread and its request hold each other (the thread its
+    // wake-up callback, the callback the request, the request the thread), and only the wake-up
+    // parts them. Left as they are, the request keeps its process alive, the process its
+    // sessions, and the sessions their services: nothing of that is destroyed, and a service's
+    // worker thread (the file service has one) is never stopped. So here the requests are let
+    // go: first the host thread's part of each is waited for (it uses the request; two seconds
+    // for all of them, and one that takes longer is left as it was), then the callback goes.
+#if HEN_DEV
+    if (kernel && hen_no_shutdown_fix) {
+        // (--no-shutdown-fix, a test: as upstream, to show what is left behind)
+        std::printf("hen: shutdown: --no-shutdown-fix: requests in flight are left as they are\n");
+    }
+    if (kernel && !hen_no_shutdown_fix) {
+#else
+    if (kernel) {
+#endif
+        using namespace std::chrono;
+        const auto deadline = steady_clock::now() + seconds(2);
+        unsigned dropped = 0, kept = 0;
+        for (u32 core = 0; core < static_cast<u32>(cpu_cores.size()); core++) {
+            for (const auto& thread : kernel->GetThreadManager(core).GetThreadList()) {
+                if (!thread || thread->status != Kernel::ThreadStatus::WaitHleEvent ||
+                    !thread->wakeup_callback) {
+                    continue;
+                }
+                const auto left = duration_cast<milliseconds>(deadline - steady_clock::now());
+                if (thread->wakeup_callback->HostWorkEnded(std::max(left, milliseconds(0)))) {
+                    thread->wakeup_callback = nullptr;
+                    dropped++;
+                } else {
+                    kept++;
+                }
+            }
+        }
+        if (dropped != 0 || kept != 0) {
+            LOG_INFO(Core,
+                     "Shutdown: {} thread(s) were inside a service call, their requests dropped; {} "
+                     "left as they were (a host thread did not finish in time)",
+                     dropped, kept);
+        }
+    }
+
+#ifdef __SWITCH__
+    Kernel::HenPlayingGameReset(); // (holds threads and sessions of this kernel: svc.cpp)
+#endif
     // Shutdown emulation session
-    is_powered_on = false;
+    {
+        std::scoped_lock hen_lock{hen_kick_mutex}; // (HenKick: no core is asked from here on)
+        is_powered_on = false;
+    }
 
     gpu.reset();
     if (!is_deserializing) {
@@ -853,6 +1149,16 @@ void System::Shutdown(bool is_deserializing) {
     SetInfoLEDColor({});
 
     LOG_DEBUG(Core, "Shutdown OK");
+}
+
+void System::HenKick() {
+    std::scoped_lock lock{hen_kick_mutex};
+    if (!is_powered_on) {
+        return;
+    }
+    for (auto& cpu_core : cpu_cores) {
+        cpu_core->PrepareReschedule();
+    }
 }
 
 void System::Reset() {

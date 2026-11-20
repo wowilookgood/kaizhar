@@ -8,10 +8,12 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <array>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
 #include "common/hen_stats.h"
+#include "common/hen_gap.h"
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -25,6 +27,11 @@
 #include "video_core/rasterizer_cache/surface_base.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture/texture_decode.h"
+
+#ifdef __SWITCH__
+extern "C" int hen_recycle_surfaces; // hen/jit/hen_jit.c: --recycle-surfaces
+extern "C" unsigned hen_recycle_cap_mib, hen_recycle_age_frames;
+#endif
 
 namespace VideoCore {
 
@@ -114,6 +121,11 @@ RasterizerCache<T>::~RasterizerCache() {
 template <class T>
 void RasterizerCache<T>::TickFrame() {
     custom_tex_manager.TickFrame();
+#ifdef __SWITCH__
+    if (hen_recycle_surfaces) {
+        HenPoolCollect(); // (first: what it takes, the collector below no longer sees)
+    }
+#endif
     RunGarbageCollector();
 
     const auto new_filter = Settings::values.texture_filter.GetValue();
@@ -133,7 +145,18 @@ void RasterizerCache<T>::TickFrame() {
         if (use_custom_textures) {
             custom_tex_manager.FindCustomTextures();
         }
+#ifdef __SWITCH__
+        // (Kaizhar) What a change of the internal resolution costs: every surface is
+        // written back to the emulated memory and dropped, and made again at the new size as
+        // the title draws. One line each time, in every build.
+        const auto hen_drop_start = std::chrono::steady_clock::now();
         UnregisterAll();
+        std::printf("hen: resolution: the renderer's surfaces were written back and dropped in %.0f ms; internal resolution %ux now\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hen_drop_start).count(),
+                    scale_factor);
+#else
+        UnregisterAll();
+#endif
     }
 }
 
@@ -155,6 +178,132 @@ void RasterizerCache<T>::RunGarbageCollector() {
         it = sentenced.erase(it);
     }
 }
+
+#ifdef __SWITCH__
+// (Switch 2 port, --recycle-surfaces) The surface pool.
+//
+// Without it a surface the title has overwritten is unregistered, waits in `sentenced` until the
+// GPU is done with the submission it was last used in, and is destroyed: two images (1x and
+// scaled) and their views; the next surface of that shape makes them again. With it such a
+// surface moves from `sentenced` to the pool at the frame tick and CreateSurface takes it back
+// for the next surface with the same images (Surface::HenFits), made over by
+// Surface::HenRecycle. CreateSurface then marks it invalid from end to end, as it does a new
+// one, so nothing of the old contents is read before it has been written.
+//
+// Reuse does not wait for the GPU, destruction does:
+// - A pooled surface is unregistered: out of page_table and the cube cache
+//   (UnregisterSurface), and what it owned of dirty_regions was flushed or given to another
+//   owner by the InvalidateRegion that removed it. Its id is used again, but so is the id of a
+//   destroyed surface (SlotVector hands out freed slots). It enters the pool at the frame tick,
+//   when no draw is being put together and the scheduler's worker has recorded everything
+//   (RasterizerVulkan::TickFrame), so every command that reads or writes its images for the
+//   old surface has been recorded.
+// - Commands run in the order they are recorded, over one queue. What the new surface records
+//   comes after all of that: the same order of use as a surface that lives on and is drawn to
+//   again next frame. The images stay in the layout every command here leaves them in.
+// - Destroying an image, a view or a framebuffer that a pending command buffer names is what
+//   needs the wait, so eviction keeps the collector's rule: only once the GPU has passed the
+//   tick of the surface's last use (nothing uses it while it is pooled).
+// Framebuffers made with the surface stay in the cache: they are keyed by surface id and hold
+// the same image views, which are still those of the surface with that id. They go when the
+// surface is destroyed, as without the pool.
+template <class T>
+void RasterizerCache<T>::HenPoolNote() {
+#if HEN_DEV
+    hen_surface_stats[HEN_POOL_BYTES] = hen_pool_bytes;
+    hen_surface_stats[HEN_POOL_SURFACES] = hen_pool.size();
+    if (hen_pool_bytes > hen_surface_stats[HEN_POOL_BYTES_PEAK]) {
+        hen_surface_stats[HEN_POOL_BYTES_PEAK] = hen_pool_bytes;
+    }
+#endif
+}
+
+template <class T>
+typename std::list<typename RasterizerCache<T>::HenPooled>::iterator
+RasterizerCache<T>::HenPoolDestroy(typename std::list<HenPooled>::iterator it, int why) {
+    RemoveFramebuffers(it->id);
+    slot_surfaces.erase(it->id);
+    hen_pool_bytes -= it->bytes;
+    HEN_SURFACE_COUNT(why, 1);
+    return hen_pool.erase(it);
+}
+
+template <class T>
+void RasterizerCache<T>::HenPoolCollect() {
+    hen_frame++;
+    const u64 resource_free_tick = runtime.GetResourceFreeTick();
+    const u64 cap = static_cast<u64>(hen_recycle_cap_mib) << 20;
+
+    // Not asked for in time: destroyed, once the GPU is done with it.
+    for (auto it = hen_pool.begin(); it != hen_pool.end();) {
+        if (hen_frame - it->frame > hen_recycle_age_frames && resource_free_tick > it->tick) {
+            it = HenPoolDestroy(it, HEN_POOL_EVICTED_AGE);
+        } else {
+            it++;
+        }
+    }
+
+    // What was unregistered since the last tick comes in. What does not (a cube map, a custom
+    // texture, a surface over the cap, no room) stays in the deletion queue for the collector.
+    for (auto it = sentenced.begin(); it != sentenced.end();) {
+        const auto [surface_id, tick] = *it;
+        const Surface& surface = slot_surfaces[surface_id];
+        const u64 bytes = surface.HenPoolable() ? surface.HenImageBytes() : 0;
+        if (bytes == 0 || bytes > cap) {
+            it++;
+            continue;
+        }
+        // Room: the oldest go first, of those the GPU is done with.
+        for (auto old = hen_pool.begin();
+             hen_pool_bytes + bytes > cap && old != hen_pool.end();) {
+            if (resource_free_tick > old->tick) {
+                old = HenPoolDestroy(old, HEN_POOL_EVICTED_SIZE);
+            } else {
+                old++;
+            }
+        }
+        if (hen_pool_bytes + bytes > cap) {
+            it++;
+            continue;
+        }
+        hen_pool.push_back(HenPooled{surface_id, tick, hen_frame, bytes});
+        hen_pool_bytes += bytes;
+        HEN_SURFACE_COUNT(HEN_POOL_KEPT, 1);
+        it = sentenced.erase(it);
+    }
+    HenPoolNote();
+}
+
+template <class T>
+SurfaceId RasterizerCache<T>::HenPoolTake(const SurfaceParams& params,
+                                          const SurfaceFlagBits& initial_flags) {
+    // The newest first: the oldest are the ones to let go.
+    for (auto it = hen_pool.end(); it != hen_pool.begin();) {
+        it--;
+        Surface& surface = slot_surfaces[it->id];
+        if (!surface.HenFits(params, initial_flags)) {
+            continue;
+        }
+        const SurfaceId surface_id = it->id;
+        hen_pool_bytes -= it->bytes;
+        hen_pool.erase(it);
+        surface.HenRecycle(params, initial_flags);
+        HenPoolNote();
+        return surface_id;
+    }
+    return {};
+}
+
+template <class T>
+void RasterizerCache<T>::HenPoolDrain() {
+    for (const HenPooled& pooled : hen_pool) {
+        sentenced.emplace_back(pooled.id, pooled.tick);
+    }
+    hen_pool.clear();
+    hen_pool_bytes = 0;
+    HenPoolNote();
+}
+#endif
 
 template <class T>
 void RasterizerCache<T>::RemoveFramebuffers(SurfaceId surface_id) {
@@ -196,6 +345,7 @@ template <class T>
 bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateTextureCopy ({})", config.DebugName()};
+    const HenSurfaceCaller hen_caller{hen_surface_caller, HEN_SURFACE_TRANSFER};
 
     // Texture copy size is aligned to 16 byte units
     const u32 copy_size = Common::AlignDown(config.texture_copy.size, 16);
@@ -239,7 +389,93 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
 
     const auto [src_surface_id, src_rect] = GetTexCopySurface(src_params);
     if (!src_surface_id) {
-        return false;
+        // A copy without gaps out of one surface that was drawn to, of whole rows' worth of
+        // bytes, that does not begin at the start of a row: Mario Kart 7 fills the big screen
+        // of N64 Luigi Raceway this way, every frame, from the middle of its colour buffer.
+        // In a destination as wide as the source that is two rectangles: the rows from where
+        // the copy begins to their right edge, and the left part of the rows after them.
+        // Left to the copy on the CPU, the source is read back from the GPU first, which waits
+        // for everything drawn so far.
+        if (input_gap != 0 || output_gap != 0) {
+            return false;
+        }
+        const SurfaceInterval copy_interval{src_params.addr, src_params.addr + copy_size};
+        const auto owner = dirty_regions.find(copy_interval);
+        if (owner == dirty_regions.end() || !owner->second ||
+            !boost::icl::contains(owner->first, copy_interval)) {
+            return false;
+        }
+        const SurfaceId wrap_src_id = owner->second;
+        const SurfaceParams wrap_info = slot_surfaces[wrap_src_id];
+        if ((wrap_info.type != SurfaceType::Color && wrap_info.type != SurfaceType::Depth &&
+             wrap_info.type != SurfaceType::DepthStencil) ||
+            wrap_info.pixel_format == PixelFormat::Invalid || wrap_info.levels != 1 ||
+            wrap_info.stride != wrap_info.width || src_params.addr < wrap_info.addr ||
+            src_params.addr + copy_size > wrap_info.end) {
+            return false;
+        }
+        const u32 tile = wrap_info.is_tiled ? 8 : 1;
+        const u32 row_bytes = wrap_info.BytesInPixels(wrap_info.stride * tile);
+        const u32 head_bytes = (src_params.addr - wrap_info.addr) % row_bytes;
+        if (row_bytes == 0 || copy_size % row_bytes != 0 ||
+            head_bytes % wrap_info.BytesInPixels(tile * tile) != 0) {
+            return false;
+        }
+        const u32 head_width = wrap_info.PixelsInBytes(head_bytes) / tile;
+
+        SurfaceParams wrap_dst_params = wrap_info;
+        wrap_dst_params.addr = config.GetPhysicalOutputAddress();
+        wrap_dst_params.height = copy_size / row_bytes * tile;
+        wrap_dst_params.UpdateParams();
+        const auto [wrap_dst_id, wrap_dst_rect] =
+            GetSurfaceSubRect(wrap_dst_params, ScaleMatch::Upscale, false);
+        if (!wrap_dst_id || wrap_dst_id == wrap_src_id) {
+            return false;
+        }
+        Surface& wrap_src = slot_surfaces[wrap_src_id];
+        Surface& wrap_dst = slot_surfaces[wrap_dst_id];
+        if (wrap_dst.type == SurfaceType::Texture || wrap_dst.res_scale != wrap_src.res_scale ||
+            !CheckFormatsBlittable(wrap_src.pixel_format, wrap_dst.pixel_format)) {
+            return false;
+        }
+        // (first: the bytes up to the end of the row the copy begins in, and the same part of
+        // the rows below; then what is left of each row, from the start of the next one)
+        const std::array<std::pair<u32, u32>, 2> pieces{{
+            {0, wrap_info.stride - head_width},
+            {row_bytes - head_bytes, head_width},
+        }};
+        for (const auto& [offset, width] : pieces) {
+            if (width == 0) {
+                continue;
+            }
+            SurfaceParams part = wrap_info;
+            part.width = width;
+            part.height = wrap_dst_params.height;
+            part.addr = src_params.addr + offset;
+            const auto from = wrap_src.GetScaledSubRect(part);
+            part.addr = wrap_dst_params.addr + offset;
+            const auto to = wrap_dst.GetScaledSubRect(part);
+            const TextureCopy texture_copy = {
+                .src_level = 0,
+                .dst_level = wrap_dst.LevelOf(wrap_dst_params.addr),
+                .src_offset = {from.left, from.bottom},
+                .dst_offset = {to.left, to.bottom},
+                .extent = {from.GetWidth(), from.GetHeight()},
+            };
+            runtime.CopyTextures(wrap_src, wrap_dst, texture_copy);
+        }
+        InvalidateRegion(wrap_dst_params.addr, wrap_dst_params.size, wrap_dst_id);
+#if defined(__SWITCH__) && HEN_DEV
+        static u32 hen_wrapped;
+        if (++hen_wrapped == 1 || hen_wrapped % 3600 == 0) {
+            std::printf("hen: gfx: texture copy from the middle of a row done on the GPU (%u so "
+                        "far): %08x to %08x, %u bytes of a %ux%u surface at %08x, %u px into "
+                        "its row\n",
+                        hen_wrapped, src_params.addr, wrap_dst_params.addr, copy_size,
+                        wrap_info.width, wrap_info.height, wrap_info.addr, head_width);
+        }
+#endif
+        return true;
     }
 
     const SurfaceParams src_info = slot_surfaces[src_surface_id];
@@ -300,6 +536,7 @@ template <class T>
 bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     const DebugScope scope{runtime, Common::Vec4f{0.f, 0.f, 1.f, 1.f},
                            "RasterizerCache::AccelerateDisplayTransfer ({})", config.DebugName()};
+    const HenSurfaceCaller hen_caller{hen_surface_caller, HEN_SURFACE_TRANSFER};
 
     SurfaceParams src_params;
     src_params.addr = config.GetPhysicalInputAddress();
@@ -360,6 +597,7 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
         .src_rect = src_rect,
         .dst_rect = dst_rect,
     };
+    HEN_WORK_COUNT(HEN_WORK_DISPLAY_TRANSFERS, 1);
     runtime.BlitTextures(src_surface, dst_surface, texture_blit);
 
     InvalidateRegion(dst_params.addr, dst_params.size, dst_surface_id);
@@ -584,6 +822,7 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
         // on the male character's face, which in the OpenGL default appear black.
         return NULL_SURFACE_ID;
     }
+    const HenSurfaceCaller hen_caller{hen_surface_caller, HEN_SURFACE_TEXTURE};
 
     SurfaceParams params;
     params.addr = info.physical_address;
@@ -612,6 +851,7 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
         Surface& src_surface = slot_surfaces[src_surface_id];
 
         params.res_scale = src_surface.res_scale;
+        hen_surface_caller = HEN_SURFACE_MIP; // (hen_caller above puts the old value back)
         SurfaceId tmp_surface_id = CreateSurface(params, initial_flags);
         Surface& tmp_surface = slot_surfaces[tmp_surface_id];
         sentenced.emplace_back(tmp_surface_id, runtime.GetResourceTick());
@@ -723,6 +963,7 @@ template <class T>
 FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color_fb,
                                                                 bool using_depth_fb) {
     const auto& config = regs.framebuffer.framebuffer;
+    const HenSurfaceCaller hen_caller{hen_surface_caller, HEN_SURFACE_FRAMEBUFFER};
 
     const s32 framebuffer_width = config.GetWidth();
     const s32 framebuffer_height = config.GetHeight();
@@ -1063,8 +1304,18 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     }
 
     const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+#if defined(__SWITCH__) && HEN_DEV
+    // (the line about a gap between two frames: the decode is most of an upload's time and
+    // was not in its figure, which timed Surface::Upload alone)
+    const auto hen_decode_start = std::chrono::steady_clock::now();
+#endif
     DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
                   runtime.NeedsConversion(surface));
+#if defined(__SWITCH__) && HEN_DEV
+    hen_gap_add(HEN_GAP_UPLOADS, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - hen_decode_start)
+                                     .count());
+#endif
 
     const bool should_dump = False(surface.flags & SurfaceFlagBits::Custom) &&
                              False(surface.flags & SurfaceFlagBits::RenderTarget);
@@ -1399,6 +1650,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
 template <class T>
 SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
                                             const SurfaceFlagBits& initial_flags) {
+    HEN_SURFACE_COUNT(hen_surface_caller, 1);
     const SurfaceId surface_id = [&] {
         const u64 resource_free_tick = runtime.GetResourceFreeTick();
         // Try to find a matching texture in the deletion queue
@@ -1414,8 +1666,18 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
         if (it != sentenced.end()) {
             const SurfaceId surface_id = it->first;
             sentenced.erase(it);
+            HEN_SURFACE_COUNT(HEN_SURFACE_RECYCLED_SAME, 1);
             return surface_id;
         }
+#ifdef __SWITCH__
+        if (hen_recycle_surfaces) {
+            if (const SurfaceId pooled_id = HenPoolTake(params, initial_flags)) {
+                HEN_SURFACE_COUNT(HEN_SURFACE_RECYCLED, 1);
+                return pooled_id;
+            }
+        }
+#endif
+        HEN_SURFACE_COUNT(HEN_SURFACE_NEW, 1);
         return slot_surfaces.insert(runtime, params, initial_flags);
     }();
     Surface& surface = slot_surfaces[surface_id];
@@ -1481,6 +1743,9 @@ void RasterizerCache<T>::UnregisterAll() {
             UnregisterSurface(surfaces.back());
         }
     }
+#ifdef __SWITCH__
+    HenPoolDrain(); // (a change of resolution or filter: nothing kept would fit again)
+#endif
     runtime.Finish();
     RunGarbageCollector();
 }

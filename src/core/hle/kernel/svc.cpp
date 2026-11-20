@@ -25,6 +25,7 @@
 #include "core/hle/kernel/errors.h"
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/handle_table.h"
+#include "core/hle/kernel/hen_ipc_trace.h"
 #include "core/hle/kernel/ipc.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/memory.h"
@@ -45,6 +46,13 @@
 #include "core/hle/kernel/wait_object.h"
 #include "core/hle/result.h"
 #include "core/hle/service/plgldr/plgldr.h"
+#ifdef __SWITCH__
+#include <set>
+#include "core/file_sys/title_metadata.h"
+#include "core/hle/service/am/am.h"
+#include "core/hle/service/sm/sm.h"
+#include "core/loader/loader.h"
+#endif
 
 namespace Kernel {
 
@@ -404,8 +412,24 @@ enum class MapMemoryExFlag {
     MAPEXFLAGS_PRIVATE = (1 << 0),
 };
 
+#if defined(__SWITCH__) && HEN_DEV
+// ("hen: emu svc:": hen/jit/hen_jit.c) System calls by number (arm_dynarmic.cpp, CallSVC)
+// and what the waiting calls did: 0 WaitSynchronization1/N found its object(s) free, 1 not free
+// with a timeout of 0 (a poll: returned at once), 2 not free: the thread waits, 3 such a wait
+// ended by its timeout (thread.cpp); ArbitrateAddress: 4 the thread waits, 5 such a wait ended
+// by its timeout, 6 signal calls, 7 of them that woke no thread (address_arbiter.cpp);
+// SleepThread: 8 the thread sleeps, 9 of them with 0 ns (a yield), 10 with 0 ns and nothing
+// else ready (returned at once). Plain adds, development builds; emulation thread only.
+extern "C" unsigned long long hen_svc_seen[256], hen_svc_seen_ns[256];
+extern "C" unsigned long long hen_wait_count[16];
+void HenSvcReport(unsigned seq, bool print); // (below the table)
+#endif
+
 class SVC : public SVCWrapper<SVC> {
 public:
+#if defined(__SWITCH__) && HEN_DEV
+    friend void HenSvcReport(unsigned seq, bool print);
+#endif
     SVC(Core::System& system);
     void CallSVC(u32 immediate);
 
@@ -658,6 +682,46 @@ Result SVC::ConnectToPort(Handle* out_handle, VAddr port_name_address) {
     return kernel.GetCurrentProcess()->handle_table.Create(out_handle, client_session);
 }
 
+#ifdef __SWITCH__
+// (Kaizhar) "Playing: <title>" in a friend's list.
+// On a console the HOME Menu tells the friends module which application runs, with the admin
+// call frd:a UpdatePlayingGame (0x040A0100: a GameKey, title ID and version; 3dbrew, Friend
+// Services). Applications cannot: they only have frd:u. Here applications are started by the
+// frontend, no HOME Menu is in between, and nobody makes that call: a friend sees the console
+// online and playing nothing. So, when the friends module runs as the console's own code and
+// an application (title ID 00040000 or 00040002) sends its first request to frd:u, that
+// thread first asks frd:a UpdatePlayingGame for its own title, and when the module has
+// answered, its own request is sent, unchanged. The application sees one request and one
+// answer; it waits a little longer for it. (--no-playing-game: not done.)
+extern "C" {
+int hen_playing_game = 1;
+}
+namespace {
+struct HenPlaying {
+    std::shared_ptr<Thread> thread;          ///< waits for the answer to UpdatePlayingGame
+    std::shared_ptr<ClientSession> admin;    ///< our session with frd:a, for that one request
+    std::shared_ptr<ClientSession> original; ///< the session its own request is for
+    std::array<u32, IPC::COMMAND_BUFFER_LENGTH> saved{}; ///< its own request
+    std::set<u32> told;                      ///< processes this was done for
+};
+HenPlaying hen_playing;
+
+u16 HenTitleVersion(u64 program_id) {
+    for (const auto media : {Service::FS::MediaType::SDMC, Service::FS::MediaType::NAND}) {
+        FileSys::TitleMetadata tmd;
+        if (tmd.Load(Service::AM::GetTitleMetadataPath(media, program_id)) ==
+            Loader::ResultStatus::Success) {
+            return tmd.GetTitleVersion();
+        }
+    }
+    return 0; // (a cartridge image, or a title that is not installed)
+}
+} // namespace
+void HenPlayingGameReset() {
+    hen_playing = {};
+}
+#endif
+
 /// Makes a blocking IPC call to an OS service.
 Result SVC::SendSyncRequest(Handle handle) {
     std::shared_ptr<ClientSession> session =
@@ -677,6 +741,47 @@ Result SVC::SendSyncRequest(Handle handle) {
     const bool is_hle =
         session->parent->server != nullptr && session->parent->server->hle_handler != nullptr;
 
+#ifdef __SWITCH__
+    if (hen_playing_game && !is_hle && session->parent->server != nullptr &&
+        hen_playing.thread == nullptr && session->parent->server->GetName().starts_with("frd:u")) {
+        const auto process = kernel.GetCurrentProcess();
+        const u64 program_id = process->codeset ? process->codeset->program_id : 0;
+        const u32 kind = static_cast<u32>(program_id >> 32);
+        if ((kind == 0x00040000 || kind == 0x00040002) &&
+            hen_playing.told.insert(process->process_id).second) {
+            std::shared_ptr<ClientSession> admin;
+            const Result connected = system.ServiceManager().ConnectToService(&admin, "frd:a");
+            if (connected.IsSuccess() && admin) {
+                const VAddr buffer = thread->GetCommandBufferAddress();
+                const std::size_t bytes = hen_playing.saved.size() * sizeof(u32);
+                memory.ReadBlock(*process, buffer, hen_playing.saved.data(), bytes);
+                const u32 request[5] = {0x040A0100, static_cast<u32>(program_id), kind,
+                                        HenTitleVersion(program_id), 0};
+                memory.WriteBlock(*process, buffer, request, sizeof(request));
+                const Result sent = admin->SendSyncRequest(thread);
+                if (sent.IsSuccess() && thread->status == ThreadStatus::WaitIPC) {
+                    LOG_INFO(Kernel_SVC,
+                             "playing game: process {} asks the friends module frd:a UpdatePlayingGame "
+                             "{:016X} version {} before its first frd:u request {:08X}",
+                             process->process_id, program_id, request[3], hen_playing.saved[0]);
+                    hen_playing.thread = thread;
+                    hen_playing.admin = std::move(admin);
+                    hen_playing.original = session;
+                    return ResultSuccess;
+                }
+                // (not sent: its own request back in place, and on as without the call)
+                LOG_ERROR(Kernel_SVC, "playing game: frd:a UpdatePlayingGame could not be sent ({:08X})",
+                          sent.raw);
+                memory.WriteBlock(*process, buffer, hen_playing.saved.data(), bytes);
+                if (thread->status != ThreadStatus::Running) {
+                    return sent;
+                }
+            } else {
+                LOG_ERROR(Kernel_SVC, "playing game: no session with frd:a ({:08X})", connected.raw);
+            }
+        }
+    }
+#endif
     if (is_hle) {
         system.perf_stats->BeginIPCProcessing();
     }
@@ -808,6 +913,9 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
               object->GetTypeName(), object->GetName(), nano_seconds);
 
     if (object->ShouldWait(thread)) {
+#if defined(__SWITCH__) && HEN_DEV
+        hen_wait_count[nano_seconds != 0 ? 2 : 1]++;
+#endif
         R_UNLESS(nano_seconds != 0, ResultTimeout);
 
         thread->wait_objects = {object};
@@ -827,6 +935,9 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
         return ResultTimeout;
     }
 
+#if defined(__SWITCH__) && HEN_DEV
+    hen_wait_count[0]++;
+#endif
     object->Acquire(thread);
     return ResultSuccess;
 }
@@ -860,6 +971,9 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
             std::all_of(objects.begin(), objects.end(),
                         [thread](const ObjectPtr& object) { return !object->ShouldWait(thread); });
         if (all_available) {
+#if defined(__SWITCH__) && HEN_DEV
+            hen_wait_count[0]++;
+#endif
             // We can acquire all objects right now, do so.
             for (auto& object : objects)
                 object->Acquire(thread);
@@ -872,6 +986,9 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
 
         // If a timeout value of 0 was provided, just return the Timeout error code instead of
         // suspending the thread.
+#if defined(__SWITCH__) && HEN_DEV
+        hen_wait_count[nano_seconds != 0 ? 2 : 1]++;
+#endif
         R_UNLESS(nano_seconds != 0, ResultTimeout);
 
         // Put the thread to sleep
@@ -903,6 +1020,9 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
         });
 
         if (itr != objects.end()) {
+#if defined(__SWITCH__) && HEN_DEV
+            hen_wait_count[0]++;
+#endif
             // We found a ready object, acquire it and set the result value
             WaitObject* object = itr->get();
             object->Acquire(thread);
@@ -914,6 +1034,9 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
 
         // If a timeout value of 0 was provided, just return the Timeout error code instead of
         // suspending the thread.
+#if defined(__SWITCH__) && HEN_DEV
+        hen_wait_count[nano_seconds != 0 ? 2 : 1]++;
+#endif
         R_UNLESS(nano_seconds != 0, ResultTimeout);
 
         // Put the thread to sleep
@@ -1025,8 +1148,64 @@ Result SVC::ReplyAndReceive(s32* index, VAddr handles_address, s32 handle_count,
         // fails for whatever reason.
         ASSERT(translation_result.IsSuccess());
 
+#ifdef __SWITCH__
+        // (hen_playing, above) The answer to UpdatePlayingGame: now the thread's own request.
+        bool hen_sent_on = false;
+        if (hen_playing.thread != nullptr && hen_playing.thread == request_thread) {
+            const auto asking = request_thread->owner_process.lock();
+            const auto original = std::move(hen_playing.original);
+            hen_playing.thread = nullptr;
+            if (asking && original) {
+                u32 answer[2] = {};
+                memory.ReadBlock(*asking, target_address, answer, sizeof(answer));
+                // (bit 31 clear is success on a 3DS: the module answers 0000C4E1, and a friend's
+                // list then shows the title)
+                if ((answer[1] & 0x80000000) == 0) {
+                    LOG_INFO(Kernel_SVC, "playing game: the friends module accepted it (result {:08X})",
+                             answer[1]);
+                } else {
+                    LOG_ERROR(Kernel_SVC, "playing game: the friends module refused it (result {:08X})",
+                              answer[1]);
+                }
+                memory.WriteBlock(*asking, target_address, hen_playing.saved.data(),
+                                  hen_playing.saved.size() * sizeof(u32));
+                request_thread->status = ThreadStatus::Running; // (as a thread that sends)
+                const Result again = original->SendSyncRequest(request_thread);
+                if (again.IsSuccess() && request_thread->status == ThreadStatus::WaitIPC) {
+                    hen_sent_on = true;
+                } else {
+                    // (its session is gone: the thread goes on with that as its answer)
+                    LOG_ERROR(Kernel_SVC, "playing game: the thread's own request could not be sent ({:08X})",
+                              again.raw);
+                    const u32 closed[2] = {(hen_playing.saved[0] & 0xFFFF0000) | 0x40, ResultSessionClosed.raw};
+                    memory.WriteBlock(*asking, target_address, closed, sizeof(closed));
+                    request_thread->status = ThreadStatus::WaitIPC;
+                }
+            }
+            hen_playing.admin = nullptr; // (the module sees our session with frd:a close)
+        }
+        if (!hen_sent_on) {
+            // Note: The scheduler is not invoked here.
+            request_thread->ResumeFromWait();
+        }
+#else
         // Note: The scheduler is not invoked here.
         request_thread->ResumeFromWait();
+#endif
+#if HEN_DEV
+        // (Kaizhar: hen_ipc_trace.h)
+#ifdef __SWITCH__
+        if (hen_sent_on) {
+            // (its own request went out just now and was traced there: no answer yet)
+        } else
+#endif
+        if (const auto asking = request_thread->owner_process.lock()) {
+            u32 answer[5] = {};
+            memory.ReadBlock(*asking, target_address, answer, sizeof(answer));
+            HenIpc::Answer(request_thread->thread_id, answer,
+                           static_cast<u64>(kernel.timing.GetGlobalTimeUs().count()));
+        }
+#endif
     }
 
     if (handle_count == 0) {
@@ -1417,6 +1596,10 @@ Result SVC::ReleaseMutex(Handle handle) {
     std::shared_ptr<Mutex> mutex = kernel.GetCurrentProcess()->handle_table.Get<Mutex>(handle);
     R_UNLESS(mutex, ResultInvalidHandle);
 
+#if HEN_DEV
+    HenIpc::Signalled(mutex->GetObjectId(), kernel.GetCurrentThreadManager().GetCurrentThread()->thread_id,
+                      static_cast<u64>(kernel.timing.GetGlobalTimeUs().count()));
+#endif
     return mutex->Release(kernel.GetCurrentThreadManager().GetCurrentThread());
 }
 
@@ -1485,6 +1668,10 @@ Result SVC::ReleaseSemaphore(s32* count, Handle handle, s32 release_count) {
         kernel.GetCurrentProcess()->handle_table.Get<Semaphore>(handle);
     R_UNLESS(semaphore, ResultInvalidHandle);
 
+#if HEN_DEV
+    HenIpc::Signalled(semaphore->GetObjectId(), kernel.GetCurrentThreadManager().GetCurrentThread()->thread_id,
+                      static_cast<u64>(kernel.timing.GetGlobalTimeUs().count()));
+#endif
     return semaphore->Release(count, release_count);
 }
 
@@ -1586,7 +1773,13 @@ Result SVC::SignalEvent(Handle handle) {
     std::shared_ptr<Event> evt = kernel.GetCurrentProcess()->handle_table.Get<Event>(handle);
     R_UNLESS(evt, ResultInvalidHandle);
 
+#if HEN_DEV
+    HenIpc::signalling_thread = kernel.GetCurrentThreadManager().GetCurrentThread()->thread_id;
     evt->Signal();
+    HenIpc::signalling_thread = 0;
+#else
+    evt->Signal();
+#endif
     return ResultSuccess;
 }
 
@@ -1663,8 +1856,17 @@ void SVC::SleepThread(s64 nanoseconds) {
     // Don't attempt to yield execution if there are no available threads to run,
     // this way we avoid a useless reschedule to the idle thread.
     if (nanoseconds == 0 && !thread_manager.HaveReadyThreads()) {
+#if defined(__SWITCH__) && HEN_DEV
+        hen_wait_count[10]++;
+#endif
         return;
     }
+#if defined(__SWITCH__) && HEN_DEV
+    hen_wait_count[8]++;
+    if (nanoseconds == 0) {
+        hen_wait_count[9]++;
+    }
+#endif
 
     // Sleep current thread and check for next thread to schedule
     thread_manager.WaitCurrentThread_Sleep();
@@ -2453,6 +2655,52 @@ const SVC::FunctionDef* SVC::GetSVCInfo(u32 func_num) {
     return &SVC_Table[func_num];
 }
 
+#if defined(__SWITCH__) && HEN_DEV
+// Prints "hen: emu svc: #N": the eight system calls made most since the last report, by
+// number of calls, with the host time in them, and what the waiting calls did (hen_wait_count
+// above). print false only empties the counts (a title starts).
+void HenSvcReport(unsigned seq, bool print) {
+    if (print) {
+        unsigned long long calls = 0, ns = 0;
+        for (int n = 0; n < 256; n++) {
+            calls += hen_svc_seen[n];
+            ns += hen_svc_seen_ns[n];
+        }
+        char line[768];
+        int at = 0;
+        line[0] = 0;
+        for (int i = 0; i < 8 && at < static_cast<int>(sizeof(line)); i++) {
+            int most = 0;
+            for (int n = 1; n < 256; n++) {
+                if (hen_svc_seen[n] > hen_svc_seen[most]) {
+                    most = n;
+                }
+            }
+            if (hen_svc_seen[most] == 0) {
+                break;
+            }
+            const SVC::FunctionDef* const info = most < 180 ? SVC::GetSVCInfo(static_cast<u32>(most)) : nullptr;
+            at += std::snprintf(line + at, sizeof(line) - at, " 0x%02x %s %llu (%.1f ms),", most,
+                                info != nullptr && info->name != nullptr ? info->name : "?", hen_svc_seen[most],
+                                hen_svc_seen_ns[most] / 1e6);
+            hen_svc_seen[most] = 0;
+        }
+        const unsigned long long* const w = hen_wait_count;
+        std::printf("hen: emu svc: #%u %llu system calls in %.1f ms; most calls:%s waits on objects: %llu free at "
+                    "once, %llu polls refused (timeout 0), %llu waited, %llu of the waits timed out; arbiter: "
+                    "%llu waited, %llu timed out, %llu signals, %llu of them woke nobody; sleeps: %llu, %llu of "
+                    "them yields (0 ns), %llu yields with nothing else ready\n",
+                    seq, calls, ns / 1e6, line, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10]);
+    }
+    for (int n = 0; n < 256; n++) {
+        hen_svc_seen[n] = hen_svc_seen_ns[n] = 0;
+    }
+    for (unsigned long long& count : hen_wait_count) {
+        count = 0;
+    }
+}
+#endif
+
 MICROPROFILE_DEFINE(Kernel_SVC, "Kernel", "SVC", MP_RGB(70, 200, 70));
 
 void SVC::CallSVC(u32 immediate) {
@@ -2493,7 +2741,9 @@ void SVC::CallSVC(u32 immediate) {
                     Thread* const now = kernel.GetCurrentThreadManager().GetCurrentThread();
                     if (now != nullptr && now == before && now->status == ThreadStatus::Running &&
                         changes == hen_ready_changes) {
+#if HEN_DEV
                         hen_resched_skipped++;
+#endif
                     } else {
                         kernel.PrepareReschedule();
                     }

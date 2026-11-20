@@ -5,7 +5,7 @@
 // (hen_vktrace_thunks.S) that prints the function's name before calling it.
 // The last line printed is the call the app died in, or the last one it made.
 //
-// Slow (a line per call over the nxlink socket): for the first frames only.
+// Slow (a line per call over the log connection): for the first frames only.
 // Repeats of the same call on the same thread are counted, not printed.
 #include <switch.h>
 

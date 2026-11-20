@@ -8,6 +8,7 @@
 #include "core/core_timing.h"
 #include "core/hle/service/hid/hid.h"
 #include "core/hle/service/ir/extra_hid.h"
+#include "core/hle/service/ir/ir.h"
 #include "core/movie.h"
 
 namespace Service::IR {
@@ -162,6 +163,7 @@ void ExtraHID::OnConnect() {}
 
 void ExtraHID::OnDisconnect() {
     timing.UnscheduleEvent(hid_polling_callback_id, 0);
+    hen_cpp_in_use.store(false); // (ir.h; also from the destructor)
 }
 
 void ExtraHID::HandleConfigureHIDPollingRequest(std::span<const u8> request) {
@@ -175,6 +177,7 @@ void ExtraHID::HandleConfigureHIDPollingRequest(std::span<const u8> request) {
     timing.UnscheduleEvent(hid_polling_callback_id, 0);
     hid_period = request[1];
     timing.ScheduleEvent(msToCycles(hid_period), hid_polling_callback_id);
+    hen_cpp_in_use.store(true); // (the title reads the Circle Pad Pro's stick from here on: ir.h)
 }
 
 void ExtraHID::HandleReadCalibrationDataRequest(std::span<const u8> request_buf) {

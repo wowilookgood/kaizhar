@@ -12,8 +12,14 @@ if(NOT EXISTS "${HEN_PLATFORM_DIR}/hen_thread.c")
 endif()
 include_directories(BEFORE SYSTEM "${HEN_PLATFORM_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/../compat")
 
-# HEN_DEV: the test hooks and the default logging of the development builds (the run
-# director, movies, screenshots to the log, the bench programs, traces, the once-a-second
+# KAIZHAR_TLS: HTTPS. LibreSSL (externals/libressl) is built for the console
+# (src/citra_switch/tls/libressl_switch.cmake); the public room list, the emulated console's
+# HTTPS requests (http:C) and with them the system setup from a real console need it. OFF: no
+# TLS library; HTTPS requests fail.
+option(KAIZHAR_TLS "Build LibreSSL: HTTPS for the room list and the emulated console" ON)
+
+# HEN_DEV: the test hooks and the default logging of the development builds (unattended test
+# runs, movies, screenshots to the log, the bench programs, traces, the once-a-second
 # samples). OFF is the release build: none of them are compiled in.
 option(HEN_DEV "Build the development test hooks and logging" ON)
 if(HEN_DEV)

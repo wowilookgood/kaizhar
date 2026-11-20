@@ -1,5 +1,5 @@
 diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
-index bbdf925..15be90e 100644
+index bbdf925..d02df47 100644
 --- a/src/dynarmic/backend/arm64/a32_address_space.cpp
 +++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
 @@ -5,6 +5,8 @@
@@ -11,7 +11,7 @@ index bbdf925..15be90e 100644
  #include "dynarmic/backend/arm64/a32_jitstate.h"
  #include "dynarmic/backend/arm64/abi.h"
  #include "dynarmic/backend/arm64/devirtualize.h"
-@@ -17,9 +19,74 @@
+@@ -17,9 +19,80 @@
  #include "dynarmic/interface/A32/config.h"
  #include "dynarmic/interface/exclusive_monitor.h"
  #include "dynarmic/ir/opt/passes.h"
@@ -20,7 +20,6 @@ index bbdf925..15be90e 100644
 +
 +// Azahar's Switch 2 port (hen/jit/hen_jit.c): statistics, and a switch for comparing.
 +#if defined(__SWITCH__)
-+extern "C" void hen_jit_note_lookup(void);
 +extern "C" int hen_inline_exclusive;  // --no-inline-exclusive
 +#if HEN_DEV
 +extern "C" int hen_jit_trace;
@@ -32,7 +31,6 @@ index bbdf925..15be90e 100644
 +extern "C" int hen_compact_links;     // --no-compact-links (EmitConfig::hen_compact_links)
 +extern "C" int hen_link_table;
 +#else
-+static void hen_jit_note_lookup() {}
 +static const int hen_inline_exclusive = 0;
 +static const int hen_jit_trace = 0;
 +static int hen_fast_dispatch = 1;
@@ -45,6 +43,14 @@ index bbdf925..15be90e 100644
 +#if defined(__SWITCH__) && HEN_DEV
 +extern "C" int hen_exit_counts;  // --no-exit-counts
 +extern "C" unsigned long long hen_exit_count[8];
++extern "C" void hen_jit_note_lookup(void);
++// ("hen: emu:") 2 = the dispatcher's lookups in C++ and the time in them (the clock
++// is read only with hen_emu_stats_on), and what the dispatch table's entry held at each.
++extern "C" int hen_emu_stats_on;
++extern "C" unsigned long long hen_emu_ns[12], hen_emu_count[12];
++extern "C" unsigned long long hen_dispatch_count[5];
++extern "C" unsigned long long hen_jit_now_ns(void);
++extern "C" void hen_layout_touch(const void* entry);  // ("hen: layout:": the pages block entries are in, a sample)
 +#else
 +static const int hen_exit_counts = 0;
 +static unsigned long long hen_exit_count[8];
@@ -86,7 +92,7 @@ index bbdf925..15be90e 100644
  template<auto mfp, typename T>
  static void* EmitCallTrampoline(oaknut::CodeGenerator& code, T* this_) {
      using namespace oaknut::util;
-@@ -54,10 +121,12 @@ static void* EmitWrappedReadCallTrampoline(oaknut::CodeGenerator& code, T* this_
+@@ -54,10 +127,12 @@ static void* EmitWrappedReadCallTrampoline(oaknut::CodeGenerator& code, T* this_
  
      void* target = code.xptr<void*>();
      ABI_PushRegisters(code, save_regs, 0);
@@ -99,7 +105,7 @@ index bbdf925..15be90e 100644
      code.MOV(Xscratch0, X0);
      ABI_PopRegisters(code, save_regs, 0);
      code.RET();
-@@ -109,11 +178,13 @@ static void* EmitWrappedWriteCallTrampoline(oaknut::CodeGenerator& code, T* this
+@@ -109,11 +184,13 @@ static void* EmitWrappedWriteCallTrampoline(oaknut::CodeGenerator& code, T* this
  
      void* target = code.xptr<void*>();
      ABI_PushRegisters(code, save_regs, 0);
@@ -113,7 +119,7 @@ index bbdf925..15be90e 100644
      ABI_PopRegisters(code, save_regs, 0);
      code.RET();
  
-@@ -158,11 +229,52 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
+@@ -158,11 +235,52 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
  A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
          : AddressSpace(conf.code_cache_size)
          , conf(conf) {
@@ -167,7 +173,7 @@ index bbdf925..15be90e 100644
  
      Optimization::PolyfillPass(ir_block, {});
      Optimization::NamingPass(ir_block);
-@@ -182,7 +294,23 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+@@ -182,7 +300,23 @@ IR::Block A32AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
  }
  
  void A32AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges) {
@@ -192,7 +198,7 @@ index bbdf925..15be90e 100644
  }
  
  void A32AddressSpace::EmitPrelude() {
-@@ -221,6 +349,7 @@ void A32AddressSpace::EmitPrelude() {
+@@ -221,6 +355,7 @@ void A32AddressSpace::EmitPrelude() {
      prelude_info.get_ticks_remaining = EmitCallTrampoline<&A32::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
  
      oaknut::Label return_from_run_code, l_return_to_dispatcher;
@@ -200,7 +206,7 @@ index bbdf925..15be90e 100644
  
      prelude_info.run_code = code.xptr<PreludeInfo::RunCodeFuncType>();
      {
-@@ -230,7 +359,7 @@ void A32AddressSpace::EmitPrelude() {
+@@ -230,7 +365,7 @@ void A32AddressSpace::EmitPrelude() {
          code.MOV(Xstate, X1);
          code.MOV(Xhalt, X2);
          if (conf.page_table) {
@@ -209,7 +215,7 @@ index bbdf925..15be90e 100644
          }
          if (conf.fastmem_pointer) {
              code.MOV(Xfastmem, *conf.fastmem_pointer);
-@@ -254,6 +383,7 @@ void A32AddressSpace::EmitPrelude() {
+@@ -254,6 +389,7 @@ void A32AddressSpace::EmitPrelude() {
          code.MRS(Xscratch1, oaknut::SystemReg::FPCR);
          code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpcr));
          code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
@@ -217,7 +223,7 @@ index bbdf925..15be90e 100644
  
          code.LDAR(Wscratch0, Xhalt);
          code.CBNZ(Wscratch0, return_from_run_code);
-@@ -269,7 +399,7 @@ void A32AddressSpace::EmitPrelude() {
+@@ -269,7 +405,7 @@ void A32AddressSpace::EmitPrelude() {
          code.MOV(Xstate, X1);
          code.MOV(Xhalt, X2);
          if (conf.page_table) {
@@ -226,7 +232,7 @@ index bbdf925..15be90e 100644
          }
          if (conf.fastmem_pointer) {
              code.MOV(Xfastmem, *conf.fastmem_pointer);
-@@ -292,6 +422,7 @@ void A32AddressSpace::EmitPrelude() {
+@@ -292,6 +428,7 @@ void A32AddressSpace::EmitPrelude() {
          code.MRS(Xscratch1, oaknut::SystemReg::FPCR);
          code.STR(Wscratch1, SP, offsetof(StackLayout, save_host_fpcr));
          code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
@@ -234,7 +240,7 @@ index bbdf925..15be90e 100644
  
          oaknut::Label step_hr_loop;
          code.l(step_hr_loop);
-@@ -309,21 +440,58 @@ void A32AddressSpace::EmitPrelude() {
+@@ -309,21 +446,70 @@ void A32AddressSpace::EmitPrelude() {
          oaknut::Label l_this, l_addr;
  
          code.LDAR(Wscratch0, Xhalt);
@@ -285,18 +291,30 @@ index bbdf925..15be90e 100644
 +            if (hen_jit_trace) {
 +                std::printf("L  %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
 +            }
++            HEN_STAT(const unsigned long long hen_lookup_start = hen_emu_stats_on ? hen_jit_now_ns() : 0;)
 +            const CodePtr entry_point = self.HenGetOrDefer(descriptor);
-+            hen_jit_note_lookup();
++            HEN_STAT(hen_jit_note_lookup();)
++            HEN_STAT(hen_emu_count[2]++;)
 +            if (entry_point == self.hen_defer_stub) {
++                HEN_STAT(hen_dispatch_count[3]++;)
++                HEN_STAT(if (hen_lookup_start != 0) {
++                    hen_emu_ns[2] += hen_jit_now_ns() - hen_lookup_start;
++                })
 +                return entry_point;  // (not a block: nothing for the table)
 +            }
 +            // (GetOrEmit may have emptied the table: written after it.)
-+            self.dispatch_table[DispatchIndex(descriptor.Value())] = {descriptor.Value(), entry_point};
++            DispatchEntry& hen_entry = self.dispatch_table[DispatchIndex(descriptor.Value())];
++            HEN_STAT(hen_dispatch_count[hen_entry.entry_point == nullptr ? 0 : hen_entry.descriptor != descriptor.Value() ? 1 : 2]++;)
++            hen_entry = {descriptor.Value(), entry_point};
++            HEN_STAT(hen_layout_touch(entry_point);)
++            HEN_STAT(if (hen_lookup_start != 0) {
++                hen_emu_ns[2] += hen_jit_now_ns() - hen_lookup_start;
++            })
 +            return entry_point;
          };
  
          code.align(8);
-@@ -331,12 +499,16 @@ void A32AddressSpace::EmitPrelude() {
+@@ -331,12 +517,16 @@ void A32AddressSpace::EmitPrelude() {
          code.dx(mcl::bit_cast<u64>(this));
          code.l(l_addr);
          code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
@@ -313,7 +331,7 @@ index bbdf925..15be90e 100644
          if (conf.enable_cycle_counting) {
              code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
              code.SUB(X1, X1, Xticks);
-@@ -356,13 +528,52 @@ void A32AddressSpace::EmitPrelude() {
+@@ -356,13 +546,53 @@ void A32AddressSpace::EmitPrelude() {
          code.RET();
      }
  
@@ -356,6 +374,7 @@ index bbdf925..15be90e 100644
 +    }
 +
      code.align(8);
++    prelude_info.hen_rtd_literal = code.offset();  // (a re-sort copies the prelude and sets this again)
      code.l(l_return_to_dispatcher);
      code.dx(mcl::bit_cast<u64>(prelude_info.return_to_dispatcher));
  
@@ -367,7 +386,7 @@ index bbdf925..15be90e 100644
      ProtectCodeMemory();
  }
  
-@@ -387,6 +598,7 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+@@ -387,6 +617,7 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
          .absolute_offset_page_table = conf.absolute_offset_page_table,
          .detect_misaligned_access_via_page_table = conf.detect_misaligned_access_via_page_table,
          .only_detect_misalignment_via_page_table_on_page_boundary = conf.only_detect_misalignment_via_page_table_on_page_boundary,
@@ -375,7 +394,7 @@ index bbdf925..15be90e 100644
  
          .fastmem_pointer = conf.fastmem_pointer,
          .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
-@@ -411,6 +623,13 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+@@ -411,6 +642,13 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
          .coprocessors = conf.coprocessors,
  
          .very_verbose_debugging_output = conf.very_verbose_debugging_output,
@@ -427,7 +446,7 @@ index 3b9e9fb..c7f0322 100644
  
      const A32::UserConfig conf;
 diff --git a/src/dynarmic/backend/arm64/a32_core.h b/src/dynarmic/backend/arm64/a32_core.h
-index 86f6f28..5b9b57f 100644
+index 86f6f28..e8574da 100644
 --- a/src/dynarmic/backend/arm64/a32_core.h
 +++ b/src/dynarmic/backend/arm64/a32_core.h
 @@ -8,6 +8,14 @@
@@ -445,7 +464,7 @@ index 86f6f28..5b9b57f 100644
  namespace Dynarmic::Backend::Arm64 {
  
  class A32Core final {
-@@ -16,7 +24,13 @@ public:
+@@ -16,13 +24,19 @@ public:
  
      HaltReason Run(A32AddressSpace& process, A32JitState& thread_ctx, volatile u32* halt_reason) {
          const auto location_descriptor = thread_ctx.GetLocationDescriptor();
@@ -460,11 +479,47 @@ index 86f6f28..5b9b57f 100644
          return process.prelude_info.run_code(entry_point, &thread_ctx, halt_reason);
      }
  
+     HaltReason Step(A32AddressSpace& process, A32JitState& thread_ctx, volatile u32* halt_reason) {
+         const auto location_descriptor = A32::LocationDescriptor{thread_ctx.GetLocationDescriptor()}.SetSingleStepping(true);
+-        const auto entry_point = process.GetOrEmit(location_descriptor);
++        const auto entry_point = process.GetOrEmit(location_descriptor, true);  // (never "interpret it")
+         return process.prelude_info.step_code(entry_point, &thread_ctx, halt_reason);
+     }
+ };
 diff --git a/src/dynarmic/backend/arm64/a32_interface.cpp b/src/dynarmic/backend/arm64/a32_interface.cpp
-index 6b38c41..1009bfa 100644
+index 6b38c41..fa5d246 100644
 --- a/src/dynarmic/backend/arm64/a32_interface.cpp
 +++ b/src/dynarmic/backend/arm64/a32_interface.cpp
-@@ -126,6 +126,36 @@ struct Jit::Impl final {
+@@ -31,6 +31,18 @@ struct Jit::Impl final {
+     HaltReason Run() {
+         ASSERT(!jit_interface->is_executing);
+         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
++        // (Azahar's Switch 2 port) Between two slices: no generated code of this JIT is
++        // on any stack, and nothing holds an address of it but the address space's own
++        // tables. A re-sorted copy of the code that is ready is changed over to here.
++        current_address_space.hen_resort_runs++;
++        if (current_address_space.hen_resort_state.load(std::memory_order_relaxed) == 3) [[unlikely]] {
++            current_address_space.HenResortSwitch();
++        }
++        // A full code buffer, or a clear that was asked for: dealt with here, where
++        // nothing of the old code is in use, never inside a slice.
++        if (current_address_space.HenSliceStartWanted()) [[unlikely]] {
++            current_address_space.HenSliceStart();
++        }
+ 
+         jit_interface->is_executing = true;
+         SCOPE_EXIT {
+@@ -47,6 +59,9 @@ struct Jit::Impl final {
+     HaltReason Step() {
+         ASSERT(!jit_interface->is_executing);
+         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
++        if (current_address_space.HenSliceStartWanted()) [[unlikely]] {
++            current_address_space.HenSliceStart();
++        }
+ 
+         jit_interface->is_executing = true;
+         SCOPE_EXIT {
+@@ -126,6 +141,41 @@ struct Jit::Impl final {
          ASSERT_FALSE("Unimplemented");
      }
  
@@ -472,14 +527,8 @@ index 6b38c41..1009bfa 100644
 +        return current_address_space.HenUpgradeLinks(deadline_ns, max_sites);
 +    }
 +
-+    bool HenPeekDefer() {
-+        ASSERT(!jit_interface->is_executing);
-+        // Anything Run() deals with on entry (a cache invalidation asked for, a halt): not here.
-+        if (Atomic::Load(&halt_reason) != 0) {
-+            return false;
-+        }
-+        const CodePtr entry = current_address_space.HenGetOrDefer(current_state.GetLocationDescriptor(), true);
-+        return entry != nullptr && entry == current_address_space.hen_defer_stub;
++    void HenResortTick(u64 now_ns) {
++        current_address_space.HenResortTick(now_ns);
 +    }
 +
 +    size_t HenCompileFrontier(u64 deadline_ns) {
@@ -498,19 +547,26 @@ index 6b38c41..1009bfa 100644
 +        current_address_space.HenSetList(static_cast<const AddressSpace::HenBlock*>(blocks), state, count);
 +    }
 +
++    void HenPark() {
++        current_address_space.HenPark();
++    }
++
++    size_t HenRevalidate(size_t* dropped) {
++        ASSERT(!jit_interface->is_executing);
++        // (what the ended process had asked for and never came back to have done)
++        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
++        return current_address_space.HenRevalidate(dropped);
++    }
++
  private:
      void PerformRequestedCacheInvalidation(HaltReason hr) {
          if (Has(hr, HaltReason::CacheInvalidation)) {
-@@ -232,6 +262,30 @@ void Jit::ClearExclusiveState() {
+@@ -232,6 +282,38 @@ void Jit::ClearExclusiveState() {
      impl->ClearExclusiveState();
  }
  
 +std::size_t Jit::HenUpgradeLinks(std::uint64_t deadline_ns, std::size_t max_sites) {
 +    return impl->HenUpgradeLinks(deadline_ns, max_sites);
-+}
-+
-+bool Jit::HenPeekDefer() {
-+    return impl->HenPeekDefer();
 +}
 +
 +std::size_t Jit::HenCompileFrontier(std::uint64_t deadline_ns) {
@@ -529,52 +585,123 @@ index 6b38c41..1009bfa 100644
 +    impl->HenSetList(blocks, state, count);
 +}
 +
++void Jit::HenResortTick(std::uint64_t now_ns) {
++    impl->HenResortTick(now_ns);
++}
++
++void Jit::HenPark() {
++    impl->HenPark();
++}
++
++std::size_t Jit::HenRevalidate(std::size_t* dropped) {
++    return impl->HenRevalidate(dropped);
++}
++
  void Jit::DumpDisassembly() const {
      impl->DumpDisassembly();
  }
 diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
-index 2c7ae77..fd9a4e8 100644
+index 2c7ae77..90fb84c 100644
 --- a/src/dynarmic/backend/arm64/address_space.cpp
 +++ b/src/dynarmic/backend/arm64/address_space.cpp
-@@ -3,7 +3,10 @@
+@@ -3,10 +3,20 @@
   * SPDX-License-Identifier: 0BSD
   */
  
 +#include <algorithm>
  #include <cstdio>
++#include <cstring>
++#include <new>
 +#include <thread>
++#include <type_traits>
 +#include <vector>
  
  #include <mcl/bit_cast.hpp>
  
-@@ -18,12 +21,37 @@
++// (Azahar's Switch 2 port) The background re-sort's method, order, checks and numbers:
++// Azahar's hen/jit/hen_resort.h (by its path from here: externals/dynarmic/src/dynarmic/backend/arm64).
++#include "../../../../../../hen/jit/hen_resort.h"
++
+ #include "dynarmic/backend/arm64/a64_address_space.h"
+ #include "dynarmic/backend/arm64/a64_jitstate.h"
+ #include "dynarmic/backend/arm64/abi.h"
+@@ -18,12 +28,86 @@
  #include "dynarmic/common/llvm_disassemble.h"
  #include "dynarmic/interface/exclusive_monitor.h"
  
 +#if defined(__SWITCH__)
 +extern "C" int hen_link_table;  // Azahar's hen/jit/hen_jit.c
 +extern "C" int hen_direct_links;  // --no-direct-links
-+extern "C" void hen_jit_note_link(int kind);
-+extern "C" void hen_jit_note_link_upgrades(unsigned long long count);
-+extern "C" void hen_jit_note_compact(int kind, unsigned long long count);  // (kinds: hen/jit/hen_jit.c)
 +#else
 +static const int hen_link_table = 0;
 +static const int hen_direct_links = 0;
-+static void hen_jit_note_link(int) {}
-+static void hen_jit_note_link_upgrades(unsigned long long) {}
-+static void hen_jit_note_compact(int, unsigned long long) {}
 +#endif
 +
++// The development builds' statistics (Azahar's hen/jit/hen_jit.c has the counters and what each
++// kind means). The other builds get empty functions here, so they count nothing; a clock that
++// is read only for these is read through HenStatClock, and what needs more than a call is
++// written inside HEN_STAT (address_space.h).
 +#if defined(__SWITCH__) && HEN_DEV
++extern "C" unsigned long long hen_jit_now_ns(void);
++extern "C" void hen_jit_note_link(int kind);
++extern "C" void hen_jit_note_link_upgrades(unsigned long long count);
++extern "C" void hen_jit_note_link_skip(int skipped);
++extern "C" void hen_jit_note_compact(int kind, unsigned long long count);
 +extern "C" void hen_jit_note_block_ticks(unsigned ticks, int folded);  // (for "hen: code:" and the "hen: exits:" estimate)
++extern "C" void hen_jit_note_block_place(unsigned long long descriptor, unsigned long long entry, unsigned long long bytes);
++extern "C" void hen_jit_note_batch(unsigned blocks, int cut);
++extern "C" void hen_jit_note_early_publish(void);
++extern "C" void hen_jit_note_wake_skipped(void);
++extern "C" void hen_jit_note_translation(unsigned made, unsigned used, unsigned stale);
++extern "C" void hen_jit_note_tier(int kind);
++extern "C" void hen_resort_note(int kind, long long delta);
++extern "C" void hen_resort_note_pause(unsigned long long us);
++static inline unsigned long long HenStatClock() { return hen_jit_now_ns(); }
 +#else
-+static void hen_jit_note_block_ticks(unsigned, int) {}
++static inline void hen_jit_note_link(int) {}
++static inline void hen_jit_note_link_upgrades(unsigned long long) {}
++static inline void hen_jit_note_link_skip(int) {}
++static inline void hen_jit_note_compact(int, unsigned long long) {}
++static inline void hen_jit_note_block_ticks(unsigned, int) {}
++static inline void hen_jit_note_block_place(unsigned long long, unsigned long long, unsigned long long) {}
++static inline void hen_jit_note_batch(unsigned, int) {}
++static inline void hen_jit_note_early_publish() {}
++static inline void hen_jit_note_wake_skipped() {}
++static inline void hen_jit_note_translation(unsigned, unsigned, unsigned) {}
++static inline void hen_jit_note_tier(int) {}
++static inline void hen_resort_note(int, long long) {}
++static inline void hen_resort_note_pause(unsigned long long) {}
++static inline unsigned long long HenStatClock() { return 0; }
++#endif
++
++// (the background re-sort: hen/jit/hen_jit.c) --no-jit-resort; the size of a publish request
++// of a copy; the totals for "hen: layout:" (0 blocks sorted, 1 their bytes, 2 blocks compiled
++// since, 3 their bytes, 4 re-sorts done, 5 abandoned, 6 failed checks).
++#if defined(__SWITCH__)
++extern "C" int hen_resort;
++extern "C" int hen_buffer_grow;  // --jit-buffer-grow
++static const int hen_jit_full_interpret = 1;  // ("A full code buffer" in address_space.h; 0: Emit() clears as upstream)
++extern "C" int hen_resort_chunk;
++#else
++static const int hen_resort = 0;
++static const int hen_buffer_grow = 0;
++static const int hen_jit_full_interpret = 0;
++static const int hen_resort_chunk = 0;
++#endif
++
++// Two triggers for tests, in milliseconds after the title's start (-1: never): a cache clear,
++// and one re-sort whatever the rules say. Development builds only.
++#if defined(__SWITCH__) && HEN_DEV
++extern "C" int hen_jit_clear_at_ms;  // --jit-clear-at SECONDS
++extern "C" int hen_resort_at_ms;     // --jit-resort-at SECONDS
++#else
++static const int hen_jit_clear_at_ms = -1;
++static const int hen_resort_at_ms = -1;
 +#endif
 +
 +extern "C" int hen_bump; // (Azahar, hen/jit/hen_jit.c: --jit-bump)
 +extern "C" int hen_publish_early;
-+extern "C" void hen_jit_note_early_publish(void);
-+extern "C" void hen_jit_note_wake_skipped(void);
++extern "C" int hen_publish_batch; // (Azahar, hen/jit/hen_jit.c: --no-publish-batch)
 +
  namespace Dynarmic::Backend::Arm64 {
  
@@ -586,13 +713,14 @@ index 2c7ae77..fd9a4e8 100644
          , fastmem_manager(exception_handler) {
      ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
  
-@@ -33,7 +61,402 @@ AddressSpace::AddressSpace(size_t code_cache_size)
+@@ -33,7 +117,436 @@ AddressSpace::AddressSpace(size_t code_cache_size)
      });
  }
  
 -AddressSpace::~AddressSpace() = default;
 +AddressSpace::~AddressSpace() {
 +    HenStopWorker();
++    HenResortDestroy();
 +}
 +
 +// (Azahar's Switch 2 port) Translation on a second thread.
@@ -602,16 +730,15 @@ index 2c7ae77..fd9a4e8 100644
 +// emitting host code from the IR. Only the second touches the code cache. So a worker thread
 +// translates the blocks that compiled blocks branch to, before the program gets there, and
 +// the emulation thread only emits. The worker reads the program's memory while the program
-+// may be changing it, so a translation carries a hash of the code it was made from and is
-+// used only if the code still hashes the same (HenTakeTranslation); anything else is
-+// translated again on the spot, as before.
++// may be changing it, so a translation carries a hash of the code it was made from. Nothing
++// takes these translations: the worker that compiles (below) replaced this arrangement, and
++// what is left of it runs only if the compiling worker is switched off while a worker exists.
 +#if defined(__SWITCH__)
 +extern "C" void hen_assert_throws_on_this_thread(void);  // mcl's assert.cpp
 +extern "C" int hen_translation_worker;                   // Azahar's hen/jit/hen_jit.c
-+extern "C" void hen_jit_note_translation(unsigned made, unsigned used, unsigned stale);
 +extern "C" void hen_jit_worker_started(void);
 +extern "C" void hen_jit_worker_creating(void);
-+extern "C" int hen_jit_alias_active(void);  // code stays mapped while it is updated (kaiHEN 0.01)
++extern "C" int hen_jit_alias_active(void);  // code stays mapped while it is updated
 +extern "C" int hen_worker_depth_limit;      // --jit-worker-depth
 +extern "C" unsigned long long hen_jit_now_ns(void);
 +extern "C" int hen_emu_ahead;               // --jit-ahead
@@ -627,14 +754,13 @@ index 2c7ae77..fd9a4e8 100644
 +static void hen_jit_worker_creating() {}
 +static void hen_assert_throws_on_this_thread() {}
 +static const int hen_translation_worker = 0;
-+static void hen_jit_note_translation(unsigned, unsigned, unsigned) {}
 +static int hen_jit_alias_active() { return 0; }
 +static const int hen_worker_depth_limit = 0;
 +static unsigned long long hen_jit_now_ns() { return 0; }
 +static const int hen_emu_ahead = 0;
 +#endif
 +
-+#if defined(__SWITCH__)
++#if defined(__SWITCH__) && HEN_DEV
 +extern "C" void hen_jit_note_lock(unsigned long long ns);
 +unsigned long long AddressSpace::HenLockClock() { return hen_jit_now_ns(); }
 +void AddressSpace::HenLockNote(unsigned long long ns) { hen_jit_note_lock(ns); }
@@ -645,7 +771,7 @@ index 2c7ae77..fd9a4e8 100644
 +
 +// (Azahar's Switch 2 port) Compiling on a second thread (hen_translation_worker == 3).
 +//
-+// Since kaiHEN 0.01, code memory stays mapped while it is updated (hen_jit.c: the update goes
++// Where the HEN offers it, code memory stays mapped while it is updated (hen_jit.c: the update goes
 +// through the HEN's writable view), so new code can be added while the program runs old code. And
 +// with block links in a table (hen_link_table), compiling a block changes no code that exists.
 +// So the worker does all of it for the blocks ahead of the program: translating, emitting and
@@ -673,19 +799,46 @@ index 2c7ae77..fd9a4e8 100644
 +void AddressSpace::HenWorkerCompileBatch() {
 +    constexpr size_t batch = 8;
 +    size_t compiled = 0;
-+    // (2026-11-13, --no-jit-publish-early) A block the program keeps coming back to (asked
++    // (--no-jit-publish-early) A block the program keeps coming back to (asked
 +    // for again after hen_bump visits: hen_worker_hot) is compiled before everything else and
 +    // published at once, not when the batch is full: a loop reaches its visit limit within
 +    // about a batch's length, and the emulation thread then compiled the block itself or
 +    // waited for this lock (Kid Icarus' first five seconds: 520 such compiles, 100 ms of
-+    // waits). The first version ended the batch when the list of asked-for blocks was empty:
++    // waits). Not when the list of asked-for blocks is empty:
 +    // it never is in a title's first seconds (44 batches in a run).
 +    bool hot_done = false;
++    // (--no-publish-batch) A batch is one publish request, and a request costs
++    // about as much as compiling two blocks (44 us against 22 to 28 us a block, Kid Icarus and
++    // Smash), so at eight blocks a batch a fifth of the worker's time goes to
++    // requests. A batch may therefore grow to hen_publish_batch blocks, but only for as long
++    // as the program has not been sent to the interpreter since the batch began
++    // (hen_defers: HenGetOrDefer counts every such answer). While the program interprets
++    // anything, it may be waiting for a block of this batch, and the batch ends at eight as
++    // before; the first time it does so during a longer batch, the batch ends after the block
++    // in work. What makes a block visible is unchanged: nothing of a batch, whatever its
++    // length, is in hen_published or a link slot before ProtectCodeMemory() below has returned.
++    const size_t batch_quiet = hen_publish_batch > static_cast<int>(batch) ? static_cast<size_t>(hen_publish_batch) : batch;
++    bool cut = false;
 +    {
 +        std::scoped_lock big{hen_compile_mutex};
 +        hen_on_worker = true;
 +        protect_deferred = true;
-+        while (compiled < batch && hen_emu_waiting.load(std::memory_order_relaxed) == 0) {
++        const u32 defers_at_start = hen_defers.load(std::memory_order_relaxed);
++        while (hen_emu_waiting.load(std::memory_order_relaxed) == 0) {
++            if (hen_parked.load(std::memory_order_relaxed)) {
++                // (HenPark: the process has ended; nothing is compiled, and the worker sleeps)
++                hen_frontier_work.store(false);
++                break;
++            }
++            if (compiled >= batch) {
++                if (compiled >= batch_quiet) {
++                    break;
++                }
++                if (hen_defers.load(std::memory_order_relaxed) != defers_at_start) {
++                    cut = compiled > batch;
++                    break;
++                }
++            }
 +            IR::LocationDescriptor descriptor{0};
 +            bool queued = false, hot = false;
 +            {
@@ -709,6 +862,14 @@ index 2c7ae77..fd9a4e8 100644
 +                }
 +            }
 +            size_t from_list = SIZE_MAX;
++            // While a re-sort's copy is being built, only what the program asks for is
++            // compiled: every block compiled meanwhile has to be added to the copy afterwards.
++            if (!queued) {
++                const int resort = hen_resort_state.load(std::memory_order_relaxed);
++                if (resort == 1 || resort == 2) {
++                    break;
++                }
++            }
 +            if (!queued && hen_list_blocks != nullptr) {
 +                // Nothing the program asked for is waiting: the saved list, in its order (what
 +                // the program ran last time first). Code that isn't there yet (a module loaded
@@ -718,7 +879,7 @@ index 2c7ae77..fd9a4e8 100644
 +                    hen_list_retry = false;
 +                    hen_list_repass_ns = hen_jit_now_ns() + 2'000'000'000ull;
 +                }
-+                while (hen_list_next < hen_list_count && GetRemainingSize() >= 16 * 1024 * 1024) {
++                while (hen_list_next < hen_list_count && GetRemainingSize() >= HenAheadRoom(16 * 1024 * 1024)) {
 +                    const size_t i = hen_list_next++;
 +                    if (hen_list_state[i] == 1) {
 +                        continue;
@@ -739,12 +900,17 @@ index 2c7ae77..fd9a4e8 100644
 +                    queued = true;
 +                    break;
 +                }
++                hen_list_busy.store(queued, std::memory_order_relaxed);  // (no re-sort during the list's pass)
++            } else if (!queued) {
++                hen_list_busy.store(false, std::memory_order_relaxed);
 +            }
 +            if (!queued) {
 +                // Nothing near the program is waiting: outwards from all compiled blocks, as the
 +                // emulation thread did in its idle time (HenCompileFrontier), while the cache
 +                // is less than half full.
-+                constexpr size_t speculation_limit = 80 * 1024 * 1024;
++                // (not scaled down when the buffer can grow. Scaled, a title started in a
++                // small buffer had a sixth less code compiled ahead at 10 s than in a large one.)
++                const size_t speculation_limit = hen_buffer_grow ? 80 * 1024 * 1024 : HenScaled(80 * 1024 * 1024);
 +                if (hen_frontier.empty() || static_cast<size_t>(code.offset()) > speculation_limit || !HenWorkerCompiles()) {
 +                    hen_frontier_work.store(false);
 +                    break;
@@ -757,11 +923,21 @@ index 2c7ae77..fd9a4e8 100644
 +                hen_worker_seen.erase(descriptor);
 +                continue;
 +            }
-+            if (!HenWorkerCompiles() || GetRemainingSize() < 16 * 1024 * 1024) {
-+                std::scoped_lock lock{hen_worker_mutex};
-+                hen_worker_todo.clear();
-+            hen_worker_hot.clear();
-+                hen_worker_seen.clear();
++            // What the program asked for is compiled down to the last 2 MiB; only what
++            // nobody asked for (the frontier; the saved list has its own test above) stops with
++            // 16 MiB of 124 left. Were everything to stop there, every new block from then on
++            // would be interpreted until its 1000th visit: with 3.6 MiB of a 28 MiB buffer
++            // left and growth only once full, Kid Icarus ran a minute at 70 to 95%.
++            // (Upstream's stop is there because its Emit() clears the cache when it runs
++            // low; here it does not: HenEmitAhead refuses below hen_full_room.)
++            if (!HenWorkerCompiles() || GetRemainingSize() < HenAheadRoom(queued ? 0 : 16 * 1024 * 1024)) {
++                if (queued || !HenWorkerCompiles()) {
++                    std::scoped_lock lock{hen_worker_mutex};
++                    hen_worker_todo.clear();
++                    hen_worker_hot.clear();
++                    hen_worker_seen.clear();
++                    hen_worker_refused.clear();
++                }
 +                hen_frontier_work.store(false);
 +                break;
 +            }
@@ -777,8 +953,14 @@ index 2c7ae77..fd9a4e8 100644
 +                hot_done |= hot;
 +                std::scoped_lock lock{hen_worker_mutex};
 +                hen_worker_seen.erase(descriptor);  // (it may be wanted again after an invalidation)
++            } else if (queued) {
++                // (a refusal stays in hen_worker_seen: not tried again until an invalidation,
++                // HenForgetRefusals)
++                std::scoped_lock lock{hen_worker_mutex};
++                if (hen_worker_refused.size() < 60000) {
++                    hen_worker_refused.insert(descriptor);
++                }
 +            }
-+            // (a refusal stays in hen_worker_seen: not tried again)
 +        }
 +        protect_deferred = false;
 +        if (compiled != 0) {
@@ -800,6 +982,7 @@ index 2c7ae77..fd9a4e8 100644
 +    }
 +    if (compiled != 0) {
 +        hen_jit_note_translation(static_cast<unsigned>(compiled), 0, 0);
++        hen_jit_note_batch(static_cast<unsigned>(compiled), cut);
 +    }
 +    // (the mutex isn't fair: let the emulation thread have it)
 +    while (hen_emu_waiting.load(std::memory_order_relaxed) != 0) {
@@ -815,6 +998,7 @@ index 2c7ae77..fd9a4e8 100644
 +    hen_list_next = 0;
 +    hen_list_retry = false;
 +    hen_list_repass_ns = 0;
++    hen_list_busy.store(blocks != nullptr && count != 0, std::memory_order_relaxed);
 +    if (blocks != nullptr && hen_worker_started && !hen_frontier_work.exchange(true)) {
 +        hen_worker_wake.notify_one();
 +    }
@@ -834,7 +1018,7 @@ index 2c7ae77..fd9a4e8 100644
 +}
 +
 +void AddressSpace::HenQueueTranslation(IR::LocationDescriptor descriptor) {
-+    if (!hen_translation_worker || hen_tag == 0xffff) {
++    if (!hen_translation_worker || hen_tag == 0xffff || hen_parked.load(std::memory_order_relaxed)) {
 +        return;
 +    }
 +    {
@@ -891,14 +1075,20 @@ index 2c7ae77..fd9a4e8 100644
 +            // call for every new block while it was busy anyway was 14% of the emulation
 +            // thread's time in Kid Icarus' first gaps)
 +            hen_worker_asleep = true;
-+            hen_worker_wake.wait(lock, [this] { return hen_worker_stop || !hen_worker_todo.empty() || !hen_worker_hot.empty() || (hen_translation_worker == 3 && hen_frontier_work.load()); });
++            hen_worker_wake.wait(lock, [this] {
++                // (a re-sort with work for this thread, or a change of its state to look at)
++                const int resort = hen_resort_state.load(std::memory_order_relaxed);
++                return hen_worker_stop || !hen_worker_todo.empty() || !hen_worker_hot.empty() || (hen_translation_worker == 3 && hen_frontier_work.load()) || hen_resort_wake || (resort != 0 && resort != 3);
++            });
 +            hen_worker_asleep = false;
++            hen_resort_wake = false;
 +            if (hen_worker_stop) {
 +                return;
 +            }
 +            if (hen_translation_worker == 3) {
 +                lock.unlock();
 +                HenWorkerCompileBatch();
++                HenResortWork();  // (one bounded step of a re-sort, between two batches)
 +                continue;
 +            }
 +            // Newest first: nearest to where the program is.
@@ -949,71 +1139,44 @@ index 2c7ae77..fd9a4e8 100644
 +            }
 +            hen_worker_seen.insert(descriptor);
 +            hen_worker_done.insert_or_assign(descriptor, std::move(made));
++        } else {
++            // (a refusal stays in hen_worker_seen: not tried again until an invalidation)
++            std::scoped_lock lock{hen_worker_mutex};
++            if (hen_worker_refused.size() < 60000) {
++                hen_worker_refused.insert(descriptor);
++            }
 +        }
-+        // (a refusal stays in hen_worker_seen: not tried again)
 +    }
-+}
-+
-+bool AddressSpace::HenHasTranslation(IR::LocationDescriptor descriptor) {
-+    // (mode 1: the worker translates but nothing of it is used, for telling whether a fault
-+    // comes from the worker running at all or from using what it made)
-+    if (hen_translation_worker != 2) {
-+        return false;
-+    }
-+    std::scoped_lock lock{hen_worker_mutex};
-+    return hen_worker_done.contains(descriptor);
-+}
-+
-+std::unique_ptr<AddressSpace::HenTranslated> AddressSpace::HenTakeTranslation(IR::LocationDescriptor descriptor) {
-+    if (hen_translation_worker != 2) {
-+        return nullptr;
-+    }
-+    std::unique_ptr<HenTranslated> made;
-+    {
-+        std::scoped_lock lock{hen_worker_mutex};
-+        const auto found = hen_worker_done.find(descriptor);
-+        if (found == hen_worker_done.end()) {
-+            return nullptr;
-+        }
-+        made = std::move(found.value());
-+        hen_worker_done.erase(found);
-+        hen_worker_seen.erase(descriptor);  // (it may be asked for again after an invalidation)
-+    }
-+    u32 hash = 0;
-+    if (!HenHash(static_cast<u32>(descriptor.Value()), made->words, hash) || hash != made->hash) {
-+        hen_jit_note_translation(0, 0, 1);
-+        return nullptr;
-+    }
-+    hen_jit_note_translation(0, 1, 0);
-+    return made;
 +}
  
  CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
      if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
-@@ -60,17 +483,409 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
+@@ -60,17 +573,414 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
      return nullptr;
  }
  
+-CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
 +#if defined(__SWITCH__)
 +extern "C" void hen_jit_note_compile(unsigned long long ir_ns, unsigned long long emit_ns, unsigned blocks);
 +extern "C" unsigned long long hen_jit_now_ns(void);
 +// A lookup that had to take the compile lock: kind 0 the block was there after all (the worker
 +// had it in its batch), 1 it was queued for the worker, 2 it was a known branch target not
 +// queued, 3 no block had named it (reached by an indirect jump or from outside).
-+extern "C" void hen_jit_note_miss(int kind, unsigned long long lock_ns, unsigned long long total_ns);
++HEN_STAT(extern "C" void hen_jit_note_miss(int kind, unsigned long long lock_ns, unsigned long long total_ns);)
 +extern "C" void hen_jit_note_split(unsigned long long translate_ns, unsigned long long emit_ns);
-+extern "C" void hen_jit_note_emit_parts(unsigned long long a, unsigned long long b, unsigned long long c, unsigned long long d, unsigned long long e, unsigned long long f);
++HEN_STAT(extern "C" void hen_jit_note_emit_parts(unsigned long long a, unsigned long long b, unsigned long long c, unsigned long long d, unsigned long long e, unsigned long long f);)
 +namespace {
++// (the count of blocks is used in every build: the times only by the development builds)
 +struct CompileTimer {
-+    unsigned long long ir = 0, emit = 0, mark = hen_jit_now_ns();
++    unsigned long long ir = 0, emit = 0, mark = HenStatClock();
 +    unsigned blocks = 0;
 +    void IrDone() {
-+        const auto now = hen_jit_now_ns();
++        const auto now = HenStatClock();
 +        ir += now - mark;
 +        mark = now;
 +    }
 +    void EmitDone() {
-+        const auto now = hen_jit_now_ns();
++        const auto now = HenStatClock();
 +        emit += now - mark;
 +        mark = now;
 +        blocks++;
@@ -1035,11 +1198,9 @@ index 2c7ae77..fd9a4e8 100644
 +#if defined(__SWITCH__)
 +extern "C" int hen_tier;        // --jit-tier N: visits before the emulation thread compiles (0: off)
 +extern "C" int hen_tier_force;  // the next unknown block is compiled at once (the interpreter refused it)
-+extern "C" void hen_jit_note_tier(int kind);
 +#else
 +static const int hen_tier = 0;
 +static int hen_tier_force = 0;
-+static void hen_jit_note_tier(int) {}
 +#endif
 +
 +// Interpreter first. A miss costs the emulation thread a translation, an emission, a wait for
@@ -1047,22 +1208,17 @@ index 2c7ae77..fd9a4e8 100644
 +// 33,000 in the first minute. Azahar's interpreter runs a block in well under a microsecond,
 +// so a block is interpreted until the worker has compiled it; one that comes round hen_tier
 +// times first is compiled here, so a loop can't stay in the interpreter.
-+//
-+// peek (the caller is interpreting a run of blocks and asks about the next one, see
-+// A32::Jit::HenPeekDefer): the same visit, counted and queued once, when the answer is
-+// hen_defer_stub; where this would compile instead, nothing is touched and the answer is
-+// nullptr, and the caller comes back through the generated code's entry without peek.
-+CodePtr AddressSpace::HenGetOrDefer(IR::LocationDescriptor descriptor, bool peek) {
++CodePtr AddressSpace::HenGetOrDefer(IR::LocationDescriptor descriptor) {
 +    if (hen_tier <= 0 || hen_defer_stub == nullptr || !HenWorkerCompiles()) {
-+        return peek ? nullptr : GetOrEmit(descriptor);
++        // (a block the interpreter refused when the buffer was full comes back here too)
++        const bool must = hen_tier_force != 0;
++        hen_tier_force = 0;
++        return GetOrEmit(descriptor, must);
 +    }
 +    // The first block of an address space is compiled here: its code memory, the dispatcher
 +    // and this stub included, is first made executable by a code update, and the worker's first
 +    // one would come after the program had already jumped there. (Core 1's JIT crashed so.)
 +    if (!hen_tier_ready) {
-+        if (peek) {
-+            return nullptr;
-+        }
 +        const CodePtr entry = GetOrEmit(descriptor);
 +        hen_tier_ready = true;
 +        return entry;
@@ -1074,21 +1230,15 @@ index 2c7ae77..fd9a4e8 100644
 +        }
 +    }
 +    if (hen_tier_force) {
-+        if (peek) {
-+            return nullptr;
-+        }
 +        hen_tier_force = 0;
 +        hen_jit_note_tier(2);
-+        return GetOrEmit(descriptor);
++        return GetOrEmit(descriptor, true);  // (the interpreter refused it)
 +    }
 +    if (hen_visits.size() > 400000) {
 +        hen_visits.clear();
 +    }
 +    u16& visits = hen_visits[descriptor];
 +    if (visits >= hen_tier) {
-+        if (peek) {
-+            return nullptr;  // (the count stays: the lookup that follows compiles it)
-+        }
 +        hen_visits.erase(descriptor);
 +        hen_jit_note_tier(1);
 +        return GetOrEmit(descriptor);
@@ -1113,24 +1263,46 @@ index 2c7ae77..fd9a4e8 100644
 +        }
 +    }
 +    hen_jit_note_tier(0);
++    // (the program interprets this block: a worker batch in progress ends at its usual length)
++    hen_defers.fetch_add(1, std::memory_order_relaxed);
 +    return hen_defer_stub;
 +}
 +
- CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
++CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor, bool must) {
 +    {
 +        std::scoped_lock lookup{hen_lookup_mutex};
 +        if (const auto found = hen_published.find(descriptor); found != hen_published.end()) {
 +            return found->second;
 +        }
 +    }
-+    const auto hen_m0 = hen_jit_now_ns();
++    HEN_STAT(const auto hen_m0 = hen_jit_now_ns();)
 +    HenEmuLock hen_lock{*this};
-+    const auto hen_m1 = hen_jit_now_ns();
++    const auto hen_m1 = hen_jit_now_ns();  // (every build: when a buffer was found full, below)
      if (CodePtr block_entry = Get(descriptor)) {
-+        hen_jit_note_miss(0, hen_m1 - hen_m0, 0);
++        HEN_STAT(hen_jit_note_miss(0, hen_m1 - hen_m0, 0);)
          return block_entry;
      }
-+    struct HenMissNote {
++    // ("A full code buffer" in address_space.h) No room: nothing is compiled, and nothing
++    // is cleared here, where generated code may be on the stack. The block is interpreted, and
++    // the start of the next slice deals with the buffer.
++    if (hen_jit_full_interpret && hen_defer_stub != nullptr) {
++        const size_t room = GetRemainingSize();
++        if (room < (must ? hen_full_floor : hen_full_room)) {
++            if (!hen_full.load(std::memory_order_relaxed)) {
++                hen_full_since_ns = hen_m1;
++                hen_full_interpreted = 0;
++                hen_full.store(true);
++            }
++            if (must || room < hen_full_floor) {
++                // (the interpreter will refuse it again and come straight back: cleared then)
++                hen_clear_wanted.store(true);
++            }
++            hen_full_interpreted++;
++            HEN_STAT(hen_jit_note_miss(0, hen_m1 - hen_m0, 0);)
++            return hen_defer_stub;
++        }
++    }
++    HEN_STAT(struct HenMissNote {
 +        int kind;
 +        unsigned long long lock_ns, start;
 +        ~HenMissNote() { hen_jit_note_miss(kind, lock_ns, hen_jit_now_ns() - start); }
@@ -1142,24 +1314,15 @@ index 2c7ae77..fd9a4e8 100644
 +        } else if (hen_known_targets.contains(descriptor)) {
 +            hen_miss_note.kind = 2;
 +        }
-+    }
++    })
 +    // With the compile worker, only a few blocks ahead here: the rest are its.
 +    const size_t ahead_blocks = HenWorkerCompiles() ? static_cast<size_t>(hen_emu_ahead) : compile_ahead_blocks;
 +
 +    CompileTimer timer;
-+    // The wanted block: from the worker's translation if it has one (see "Translation on a
-+    // second thread"), translated here otherwise.
++    // The wanted block.
 +    const auto make_wanted = [&]() -> EmittedBlockInfo {
 +        HEN_TRACE("M  %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
 +        hen_emit_wanted = true;
-+        if (std::unique_ptr<HenTranslated> made = HenTakeTranslation(descriptor)) {
-+            timer.IrDone();
-+            HenRecord(descriptor, made->end);
-+            EmittedBlockInfo info = Emit(std::move(made->block));
-+            hen_emit_wanted = false;
-+            timer.EmitDone();
-+            return info;
-+        }
 +        IR::Block ir_block = GenerateIR(descriptor);
 +        timer.IrDone();
 +        HenRecord(descriptor, ir_block.EndLocation());
@@ -1171,10 +1334,7 @@ index 2c7ae77..fd9a4e8 100644
 +    if (ahead_blocks == 0) {
 +        return make_wanted().entry_point;
 +    }
- 
--    IR::Block ir_block = GenerateIR(descriptor);
--    const EmittedBlockInfo block_info = Emit(std::move(ir_block));
--    return block_info.entry_point;
++
 +    // Compile ahead (see compile_ahead_blocks): the wanted block, then breadth-first the blocks
 +    // it links to. Emit() clears the cache when it runs low, which would drop the blocks of this
 +    // batch, so stop well before that.
@@ -1184,35 +1344,23 @@ index 2c7ae77..fd9a4e8 100644
 +    for (const auto& [target, relocations] : first.block_relocations) {
 +        pending.push_back(target);
 +    }
-+    // The blocks the wanted one branches to, breadth-first. One translated here counts against
-+    // compile_ahead_blocks; one the worker has translated already only needs emitting and
-+    // doesn't (up to a limit on the whole batch). The batch is one code update either way.
-+    //
-+    // Two other arrangements were measured in Super Smash Bros. and were worse than no worker
-+    // at all: emitting everything the worker had finished at each miss (419,000 blocks emitted
-+    // against 222,000, first intervals 24% and 54%), and leaving every block not yet
-+    // translated to the worker (152,733 updates against 22,826, each costing as much as
-+    // translating a block and a half).
-+    size_t extra = 0, free_extra = 0;
-+    for (size_t i = 0; i < pending.size() && extra < ahead_blocks && free_extra < 96; i++) {
-+        if (GetRemainingSize() < 2 * 1024 * 1024) {
++    // The blocks the wanted one branches to, breadth-first, up to ahead_blocks of them. The
++    // batch is one code update.
++    size_t extra = 0;
++    for (size_t i = 0; i < pending.size() && extra < ahead_blocks; i++) {
++        if (GetRemainingSize() < HenAheadRoom(0)) {
 +            break;
 +        }
 +        if (Get(pending[i])) {
 +            continue;
 +        }
-+        const bool translated = hen_translation_worker && hen_tag != 0xffff && HenHasTranslation(pending[i]);
 +        EmittedBlockInfo next;
 +        if (!HenEmitAhead(pending[i], &next)) {
 +            continue;
 +        }
 +        timer.IrDone();
 +        timer.EmitDone();
-+        if (translated) {
-+            free_extra++;
-+        } else {
-+            extra++;
-+        }
++        extra++;
 +        for (const auto& [target, relocations] : next.block_relocations) {
 +            pending.push_back(target);
 +        }
@@ -1232,6 +1380,11 @@ index 2c7ae77..fd9a4e8 100644
 +    if (hen_not_code.contains(descriptor)) {
 +        return false;
 +    }
++    // Nothing is compiled ahead into the last of the room: Emit() must never find the
++    // buffer full from here (every caller stops earlier; this is the one place that says so).
++    if (hen_jit_full_interpret && hen_defer_stub != nullptr && GetRemainingSize() < hen_full_room) {
++        return false;
++    }
 +    // Memory that isn't there or is still zero (a module not loaded yet) would compile, to
 +    // code that is wrong once the module is loaded: wait until the program gets there.
 +    const std::optional<u32> first_word = HenReadCode(static_cast<u32>(descriptor.Value()) & ~u32(3));
@@ -1243,21 +1396,24 @@ index 2c7ae77..fd9a4e8 100644
 +        hen_assert_throws = 1;
 +    }
 +    HEN_TRACE("m+ %016llx\n", static_cast<unsigned long long>(descriptor.Value()));
++    // (which group of the sorted order the block belongs to, for Emit's entry in hen_log)
++    hen_emit_speculative = speculative;
++    struct HenSpeculativeEnd {
++        bool& flag;
++        ~HenSpeculativeEnd() { flag = false; }
++    } hen_speculative_end{hen_emit_speculative};
 +    try {
 +        IR::LocationDescriptor end{0};
-+        if (std::unique_ptr<HenTranslated> made = HenTakeTranslation(descriptor)) {
-+            end = made->end;
-+            *out = Emit(std::move(made->block));
-+        } else {
++        {
 +            // (timed apart: the CompileTimer in GetOrEmit can't see inside this call, and
 +            // counted all of it as translation)
-+            const auto t0 = hen_jit_now_ns();
++            const auto t0 = HenStatClock();
 +            IR::Block ir_block = hen_on_worker ? HenGenerateIRQuiet(descriptor) : GenerateIR(descriptor);
-+            const auto t1 = hen_jit_now_ns();
++            const auto t1 = HenStatClock();
 +            end = ir_block.EndLocation();
 +            *out = Emit(std::move(ir_block));
 +            if (!hen_on_worker) {
-+                hen_jit_note_split(t1 - t0, hen_jit_now_ns() - t1);
++                hen_jit_note_split(t1 - t0, HenStatClock() - t1);  // (its count of blocks: every build)
 +            }
 +        }
 +        if (!hen_on_worker) {
@@ -1296,6 +1452,10 @@ index 2c7ae77..fd9a4e8 100644
 +
 +void AddressSpace::HenRecord(IR::LocationDescriptor descriptor, IR::LocationDescriptor end_location, bool speculative) const {
 +#if defined(__SWITCH__)
++    // (HenRevalidate) What this block was made from replaces what an earlier block at the
++    // same location was made from; a block that leaves below without a hash has no record, and
++    // is not kept when the JIT goes to another process.
++    hen_block_code.erase(descriptor);
 +    if (hen_tag == 0xffff) {
 +        return;
 +    }
@@ -1312,6 +1472,7 @@ index 2c7ae77..fd9a4e8 100644
 +    if (words > 0xffff || !HenHash(pc, words, hash)) {
 +        return;
 +    }
++    hen_block_code.insert_or_assign(descriptor, HenCodeOf{hash, words});
 +    hen_jit_record_block(speculative ? hen_tag | 0x8000u : hen_tag, descriptor.Value(), words, hash);
 +#else
 +    (void)descriptor;
@@ -1323,16 +1484,16 @@ index 2c7ae77..fd9a4e8 100644
 +size_t AddressSpace::HenCompileFrontier(u64 deadline_ns) {
 +    size_t compiled = 0;
 +#if defined(__SWITCH__)
-+    if (HenWorkerCompiles()) {
-+        return 0;  // (the worker does this, without waiting for idle time)
++    if (HenWorkerCompiles() || hen_parked.load(std::memory_order_relaxed)) {
++        return 0;  // (the worker does this, without waiting for idle time; parked: nobody does)
 +    }
 +    HenEmuLock hen_lock{*this};
 +    // A cache that fills up is thrown away whole: speculation only gets the first part of it.
-+    constexpr size_t speculation_limit = 24 * 1024 * 1024;
++    const size_t speculation_limit = hen_buffer_grow ? 24 * 1024 * 1024 : HenScaled(24 * 1024 * 1024);
 +    protect_deferred = true;
 +    // (In small batches: making a batch executable takes time after the deadline check.)
 +    while (!hen_frontier.empty() && compiled < 48) {
-+        if (hen_jit_now_ns() >= deadline_ns || static_cast<size_t>(code.offset()) > speculation_limit || GetRemainingSize() < 8 * 1024 * 1024) {
++        if (hen_jit_now_ns() >= deadline_ns || static_cast<size_t>(code.offset()) > speculation_limit || GetRemainingSize() < HenAheadRoom(8 * 1024 * 1024)) {
 +            break;
 +        }
 +        const IR::LocationDescriptor descriptor = hen_frontier.front();
@@ -1354,11 +1515,17 @@ index 2c7ae77..fd9a4e8 100644
 +#endif
 +    return compiled;
 +}
-+
+ 
+-    IR::Block ir_block = GenerateIR(descriptor);
+-    const EmittedBlockInfo block_info = Emit(std::move(ir_block));
+-    return block_info.entry_point;
 +size_t AddressSpace::HenPrecompile(const HenBlock* blocks, u8* state, size_t count, u64 deadline_ns, size_t* compiled) {
 +    size_t i = 0;
 +    *compiled = 0;
 +#if defined(__SWITCH__)
++    if (hen_parked.load(std::memory_order_relaxed)) {
++        return 0;  // (HenPark: the process has ended)
++    }
 +    HenEmuLock hen_lock{*this};
 +    protect_deferred = true;
 +    for (; i < count; i++) {
@@ -1366,7 +1533,7 @@ index 2c7ae77..fd9a4e8 100644
 +            continue;
 +        }
 +        // (Emit() clears the whole cache when it runs low: keep well away from that.)
-+        if (hen_jit_now_ns() >= deadline_ns || GetRemainingSize() < 4 * 1024 * 1024) {
++        if (hen_jit_now_ns() >= deadline_ns || GetRemainingSize() < HenAheadRoom(4 * 1024 * 1024)) {
 +            break;
 +        }
 +        const IR::LocationDescriptor descriptor{blocks[i].descriptor};
@@ -1403,13 +1570,15 @@ index 2c7ae77..fd9a4e8 100644
      UnprotectCodeMemory();
  
      for (const auto& descriptor : descriptors) {
-@@ -82,29 +897,75 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+@@ -82,193 +992,788 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
          // Unlink before removal because InvalidateBasicBlocks can be called within a fastmem callback,
          // and the currently executing block may have references to itself which need to be unlinked.
          RelinkForDescriptor(descriptor, nullptr);
 +        HenTombstone(descriptor, iter->second);
++        HenResortNoteAbort("blocks were invalidated");  // (a copy in the making has them)
  
          block_entries.erase(iter);
++        hen_block_code.erase(descriptor);
 +        {
 +            std::scoped_lock lookup{hen_lookup_mutex};
 +            hen_published.erase(descriptor);
@@ -1417,21 +1586,95 @@ index 2c7ae77..fd9a4e8 100644
      }
  
      ProtectCodeMemory();
- }
- 
++    HenForgetRefusals();
++}
++
++/// Under the compile lock, at an invalidation: the program's code changed (a module
++/// loaded or unloaded, code written), so an address that was refused because nothing was mapped
++/// there, or because what was there was not code, may be code now. Without this such an address
++/// is never looked at again by the worker, and the emulation thread compiles it when the
++/// program gets there.
++void AddressSpace::HenForgetRefusals() {
++    hen_not_code.clear();
++    std::scoped_lock lock{hen_worker_mutex};
++    for (const IR::LocationDescriptor& refused : hen_worker_refused) {
++        hen_worker_seen.erase(refused);
++    }
++    hen_worker_refused.clear();
++}
++
++// (Azahar's Switch 2 port) See address_space.h, "A JIT kept after its process has
++// ended".
++void AddressSpace::HenPark() {
++    hen_parked.store(true);
++    HenEmuLock hen_lock{*this};  // (the worker's batch in progress has ended, and published)
++    HenResortNoteAbort("the process ended");
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        hen_worker_todo.clear();
++        hen_worker_hot.clear();
++        hen_worker_seen.clear();
++        hen_worker_refused.clear();
++        hen_worker_done.clear();
++    }
++    hen_frontier.clear();
++    hen_frontier_work.store(false);
++}
++
++size_t AddressSpace::HenRevalidate(size_t* dropped) {
++    size_t kept = 0;
++    tsl::robin_set<IR::LocationDescriptor> gone;
++    {
++        HenEmuLock hen_lock{*this};
++        // Nothing the ended process left queued, counted or ruled out is carried over: only
++        // compiled blocks, each checked against the code that is there now.
++        {
++            std::scoped_lock lock{hen_worker_mutex};
++            hen_worker_todo.clear();
++            hen_worker_hot.clear();
++            hen_worker_seen.clear();
++            hen_worker_refused.clear();
++            hen_worker_done.clear();
++        }
++        hen_frontier.clear();
++        hen_frontier_work.store(false);
++        hen_not_code.clear();
++        hen_visits.clear();
++        for (auto block = block_entries.begin(); block != block_entries.end(); ++block) {
++            const IR::LocationDescriptor descriptor = block->first;
++            const auto code_of = hen_block_code.find(descriptor);
++            u32 hash = 0;
++            if (code_of != hen_block_code.end() && HenHash(static_cast<u32>(descriptor.Value()), code_of->second.words, hash) && hash == code_of->second.hash) {
++                kept++;
++            } else {
++                gone.insert(descriptor);
++            }
++        }
++        if (!gone.empty()) {
++            InvalidateBasicBlocks(gone);  // (unlinked and written over, as after a write to their code)
++        }
++    }
++    *dropped = gone.size();
++    hen_parked.store(false);
++    return kept;
++}
++
 +#if defined(__SWITCH__)
 +extern "C" void hen_jit_note_cache_clear(void);  // statistics (Azahar's hen/jit/hen_jit.c)
++HEN_STAT(extern "C" unsigned long long hen_dispatch_count[5];)  // ("hen: emu:": 4 = the table was emptied)
 +#endif
 +
 +void AddressSpace::ClearDispatchTable() {
 +    if (!dispatch_table) {
 +        dispatch_table = std::make_unique<DispatchEntry[]>(dispatch_table_size);
++    } else {
++        HEN_STAT(hen_dispatch_count[4]++;)
 +    }
 +    for (size_t i = 0; i < dispatch_table_size; i++) {
 +        dispatch_table[i] = {~u64(0), nullptr};
 +    }
-+}
-+
+ }
+ 
  void AddressSpace::ClearCache() {
 +    HenEmuLock hen_lock{*this};
 +#if defined(__SWITCH__)
@@ -1442,8 +1685,20 @@ index 2c7ae77..fd9a4e8 100644
 +        hen_worker_todo.clear();
 +            hen_worker_hot.clear();
 +        hen_worker_seen.clear();
++        hen_worker_refused.clear();
 +    }
++    // The saved list's blocks are gone with the rest: the worker goes through the list
++    // again (state 1, "compiled", was for good until now; under the compile lock, as the
++    // worker's own pass is).
++    for (size_t i = 0; i < hen_list_count; i++) {
++        if (hen_list_state[i] == 1) {
++            hen_list_state[i] = 0;
++        }
++    }
++    hen_list_next = 0;
++    hen_not_code.clear();
      block_entries.clear();
++    hen_block_code.clear();
 +    {
 +        std::scoped_lock lookup{hen_lookup_mutex};
 +        hen_published.clear();
@@ -1462,6 +1717,15 @@ index 2c7ae77..fd9a4e8 100644
 +    hen_depth_of.clear();
 +    ClearDispatchTable();
 +    hen_frontier.clear();
++    // No blocks: nothing is sorted, and a copy in the making is of code that is gone.
++    HenResortNoteAbort("the cache was cleared");
++    hen_log.clear();
++    hen_log_count.store(0, std::memory_order_relaxed);
++    hen_log_bytes.store(0, std::memory_order_relaxed);
++    hen_log_unsorted_bytes.store(0, std::memory_order_relaxed);
++    HenResortCounts(0, 0, 0, 0);
++    hen_resort_window_ns = 0;
++    hen_resort_window_known = false;
      code.set_offset(prelude_info.end_of_prelude);
 +    mem.rewind(static_cast<size_t>(prelude_info.end_of_prelude));
  }
@@ -1473,6 +1737,16 @@ index 2c7ae77..fd9a4e8 100644
      }
  }
  
++size_t AddressSpace::HenScaled(size_t bytes) const {
++    constexpr size_t full = size_t(124) << 20;
++    const size_t usable = std::min(code_cache_size, mem.usable_size());
++    return usable >= full ? bytes : static_cast<size_t>(u64(bytes) * usable / full);
++}
++
++size_t AddressSpace::HenAheadRoom(size_t bytes) const {
++    return std::max<size_t>(HenScaled(bytes), 2 * 1024 * 1024);
++}
++
  size_t AddressSpace::GetRemainingSize() {
 -    return code_cache_size - static_cast<size_t>(code.offset());
 +    const size_t usable = std::min(code_cache_size, mem.usable_size());
@@ -1480,8 +1754,35 @@ index 2c7ae77..fd9a4e8 100644
 +    return usable > used ? usable - used : 0;
  }
  
++#if defined(__SWITCH__)
++extern "C" int hen_jit_write_full(struct hen_jit* jit);       // Azahar's hen/jit/hen_jit.c
++extern "C" size_t hen_jit_write_first_size(void);
++#endif
++
  EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
-@@ -114,19 +975,79 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+-    if (GetRemainingSize() < 1024 * 1024) {
++#if defined(__SWITCH__)
++    // (Azahar's Switch 2 port) A buffer has a short write area (64 KiB, for the prelude)
++    // until its first block: a JIT that never compiles, one per core a process never runs on,
++    // costs no 128 MiB. Every block of every tier is emitted through here, under the compile
++    // lock, and nothing else writes past the prelude before a first block exists; the execute
++    // addresses do not change, only where the bytes are written before they are published, so
++    // the one thing to re-seat is this object's code generator.
++    if (hen_jit_write_full(mem.HenBuffer()) > 0) {
++        const std::ptrdiff_t offset = code.offset();
++        ASSERT_MSG(static_cast<size_t>(offset) <= hen_jit_write_first_size(), "the prelude is longer than a buffer's first write area");
++        mem.HenRefresh();
++        code.~CodeGenerator();
++        new (&code) oaknut::CodeGenerator(mem.wptr(), mem.xptr());
++        code.set_offset(offset);
++    }
++#endif
++    // (with hen_jit_full_interpret nothing gets here with so little room left, see "A full
++    // code buffer" in address_space.h. What is left of the old rule: an address space without
++    // the interpreter's stub.)
++    if (GetRemainingSize() < (hen_jit_full_interpret && hen_defer_stub != nullptr ? 128 * 1024 : 1024 * 1024)) {
+         ClearCache();
+     }
  
      UnprotectCodeMemory();
  
@@ -1499,12 +1800,13 @@ index 2c7ae77..fd9a4e8 100644
 +    const IR::Terminal hen_terminal = block.GetTerminal();
 +    const bool hen_folded = (block.Location().Value() & (u64(1) << 32)) == 0 && boost::get<IR::Term::If>(&hen_terminal) != nullptr;
 +    hen_jit_note_block_ticks(static_cast<unsigned>(block.CycleCount()), hen_folded);
-+    const auto hen_t0 = hen_jit_now_ns();
++    HEN_STAT(const auto hen_t0 = hen_jit_now_ns();)
      EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
-+    const auto hen_t1 = hen_jit_now_ns();
++    HEN_STAT(const auto hen_t1 = hen_jit_now_ns();)
 +    hen_jit_note_compact(4, block_info.size);
  
      ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
++    hen_jit_note_block_place(block.Location().Value(), mcl::bit_cast<u64>(block_info.entry_point), block_info.size);  // ("hen: dispatch:", "hen: layout:")
 +    if (hen_on_worker) {
 +        hen_batch_new.emplace_back(block.Location(), block_info.entry_point);  // (seen once published)
 +    } else {
@@ -1513,18 +1815,27 @@ index 2c7ae77..fd9a4e8 100644
 +    }
      ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
      ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
-+    const auto hen_t2 = hen_jit_now_ns();
++    // Every block in the order compiled: what a re-sort copies, and what it has not sorted yet.
++    hen_log.push_back({block.Location().Value(), block_info.entry_point, static_cast<u32>(block_info.size), static_cast<u8>(hen_emit_speculative ? 1 : 0)});
++    hen_log_count.fetch_add(1, std::memory_order_relaxed);
++    hen_log_bytes.fetch_add(block_info.size, std::memory_order_relaxed);
++    hen_log_unsorted_bytes.fetch_add(block_info.size, std::memory_order_relaxed);
++    HEN_STAT(hen_resort_mine[2] += 1;)
++    HEN_STAT(hen_resort_mine[3] += block_info.size;)
++    hen_resort_note(2, 1);
++    hen_resort_note(3, static_cast<long long>(block_info.size));
++    HEN_STAT(const auto hen_t2 = hen_jit_now_ns();)
  
      Link(block_info);
      RelinkForDescriptor(block.Location(), block_info.entry_point);
-+    const auto hen_t3 = hen_jit_now_ns();
-+
++    HEN_STAT(const auto hen_t3 = hen_jit_now_ns();)
+ 
 +#if defined(__SWITCH__)
-+    if (hen_tag != 0xffff && hen_known_targets.size() < 2000000) {
++    HEN_STAT(if (hen_tag != 0xffff && hen_known_targets.size() < 2000000) {
 +        for (const auto& [target, relocations] : block_info.block_relocations) {
 +            hen_known_targets.insert(target);
 +        }
-+    }
++    })
 +    if (hen_tag != 0xffff && hen_frontier.size() < 100000) {
 +        for (const auto& [target, relocations] : block_info.block_relocations) {
 +            if (!block_entries.contains(target)) {
@@ -1550,49 +1861,216 @@ index 2c7ae77..fd9a4e8 100644
 +        }
 +    }
 +#endif
- 
-+    const auto hen_t4 = hen_jit_now_ns();
++
++    HEN_STAT(const auto hen_t4 = hen_jit_now_ns();)
      mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
      ProtectCodeMemory();
-+    const auto hen_t5 = hen_jit_now_ns();
++    HEN_STAT(const auto hen_t5 = hen_jit_now_ns();)
  
      RegisterNewBasicBlock(block, block_info);
-+    hen_jit_note_emit_parts(hen_t1 - hen_t0, hen_t2 - hen_t1, hen_t3 - hen_t2, hen_t4 - hen_t3, hen_t5 - hen_t4, hen_jit_now_ns() - hen_t5);
++    HEN_STAT(hen_jit_note_emit_parts(hen_t1 - hen_t0, hen_t2 - hen_t1, hen_t3 - hen_t2, hen_t4 - hen_t3, hen_t5 - hen_t4, hen_jit_now_ns() - hen_t5);)
  
      return block_info;
  }
-@@ -136,12 +1057,28 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+ 
+-void AddressSpace::Link(EmittedBlockInfo& block_info) {
++// (the buffer and its prelude are arguments: a re-sort writes the same calls for a block's
++// copy in another buffer, HenResortLink.)
++void AddressSpace::HenLinkRelocations(const EmittedBlockInfo& block_info, CodePtr entry_point, u32* wmem, u32* xmem, const PreludeInfo& prelude) {
+     using namespace oaknut;
      using namespace oaknut::util;
  
      for (auto [ptr_offset, target] : block_info.relocations) {
 -        CodeGenerator c{mem.ptr(), mem.ptr()};
-+        CodeGenerator c{mem.wptr(), mem.xptr()};
-         c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
+-        c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
++        CodeGenerator c{wmem, xmem};
++        c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
  
          switch (target) {
          case LinkTarget::ReturnToDispatcher:
 -            c.B(prelude_info.return_to_dispatcher);
-+            c.B(prelude_info.hen_exit_other ? prelude_info.hen_exit_other : prelude_info.return_to_dispatcher);
++            c.B(prelude.hen_exit_other ? prelude.hen_exit_other : prelude.return_to_dispatcher);
 +            break;
 +        case LinkTarget::HenReturnPredicted:
-+            if (prelude_info.hen_exit_predicted) {
-+                c.B(prelude_info.hen_exit_predicted);
++            if (prelude.hen_exit_predicted) {
++                c.B(prelude.hen_exit_predicted);
 +            } else {
 +                c.BR(Xscratch1);
 +            }
 +            break;
 +        case LinkTarget::HenReturnToDispatcher:
-+            c.B(prelude_info.hen_exit_return ? prelude_info.hen_exit_return : prelude_info.return_to_dispatcher);
++            c.B(prelude.hen_exit_return ? prelude.hen_exit_return : prelude.return_to_dispatcher);
 +            break;
 +        case LinkTarget::HenIndirectToDispatcher:
-+            c.B(prelude_info.hen_exit_indirect ? prelude_info.hen_exit_indirect : prelude_info.return_to_dispatcher);
++            c.B(prelude.hen_exit_indirect ? prelude.hen_exit_indirect : prelude.return_to_dispatcher);
 +            break;
 +        case LinkTarget::HenUnlinkedToDispatcher:
-+            c.B(prelude_info.hen_exit_unlinked ? prelude_info.hen_exit_unlinked : prelude_info.return_to_dispatcher);
++            c.B(prelude.hen_exit_unlinked ? prelude.hen_exit_unlinked : prelude.return_to_dispatcher);
              break;
          case LinkTarget::ReturnFromRunCode:
-             c.B(prelude_info.return_from_run_code);
-@@ -267,8 +1204,326 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+-            c.B(prelude_info.return_from_run_code);
++            c.B(prelude.return_from_run_code);
+             break;
+         case LinkTarget::ReadMemory8:
+-            c.BL(prelude_info.read_memory_8);
++            c.BL(prelude.read_memory_8);
+             break;
+         case LinkTarget::ReadMemory16:
+-            c.BL(prelude_info.read_memory_16);
++            c.BL(prelude.read_memory_16);
+             break;
+         case LinkTarget::ReadMemory32:
+-            c.BL(prelude_info.read_memory_32);
++            c.BL(prelude.read_memory_32);
+             break;
+         case LinkTarget::ReadMemory64:
+-            c.BL(prelude_info.read_memory_64);
++            c.BL(prelude.read_memory_64);
+             break;
+         case LinkTarget::ReadMemory128:
+-            c.BL(prelude_info.read_memory_128);
++            c.BL(prelude.read_memory_128);
+             break;
+         case LinkTarget::WrappedReadMemory8:
+-            c.BL(prelude_info.wrapped_read_memory_8);
++            c.BL(prelude.wrapped_read_memory_8);
+             break;
+         case LinkTarget::WrappedReadMemory16:
+-            c.BL(prelude_info.wrapped_read_memory_16);
++            c.BL(prelude.wrapped_read_memory_16);
+             break;
+         case LinkTarget::WrappedReadMemory32:
+-            c.BL(prelude_info.wrapped_read_memory_32);
++            c.BL(prelude.wrapped_read_memory_32);
+             break;
+         case LinkTarget::WrappedReadMemory64:
+-            c.BL(prelude_info.wrapped_read_memory_64);
++            c.BL(prelude.wrapped_read_memory_64);
+             break;
+         case LinkTarget::WrappedReadMemory128:
+-            c.BL(prelude_info.wrapped_read_memory_128);
++            c.BL(prelude.wrapped_read_memory_128);
+             break;
+         case LinkTarget::ExclusiveReadMemory8:
+-            c.BL(prelude_info.exclusive_read_memory_8);
++            c.BL(prelude.exclusive_read_memory_8);
+             break;
+         case LinkTarget::ExclusiveReadMemory16:
+-            c.BL(prelude_info.exclusive_read_memory_16);
++            c.BL(prelude.exclusive_read_memory_16);
+             break;
+         case LinkTarget::ExclusiveReadMemory32:
+-            c.BL(prelude_info.exclusive_read_memory_32);
++            c.BL(prelude.exclusive_read_memory_32);
+             break;
+         case LinkTarget::ExclusiveReadMemory64:
+-            c.BL(prelude_info.exclusive_read_memory_64);
++            c.BL(prelude.exclusive_read_memory_64);
+             break;
+         case LinkTarget::ExclusiveReadMemory128:
+-            c.BL(prelude_info.exclusive_read_memory_128);
++            c.BL(prelude.exclusive_read_memory_128);
+             break;
+         case LinkTarget::WriteMemory8:
+-            c.BL(prelude_info.write_memory_8);
++            c.BL(prelude.write_memory_8);
+             break;
+         case LinkTarget::WriteMemory16:
+-            c.BL(prelude_info.write_memory_16);
++            c.BL(prelude.write_memory_16);
+             break;
+         case LinkTarget::WriteMemory32:
+-            c.BL(prelude_info.write_memory_32);
++            c.BL(prelude.write_memory_32);
+             break;
+         case LinkTarget::WriteMemory64:
+-            c.BL(prelude_info.write_memory_64);
++            c.BL(prelude.write_memory_64);
+             break;
+         case LinkTarget::WriteMemory128:
+-            c.BL(prelude_info.write_memory_128);
++            c.BL(prelude.write_memory_128);
+             break;
+         case LinkTarget::WrappedWriteMemory8:
+-            c.BL(prelude_info.wrapped_write_memory_8);
++            c.BL(prelude.wrapped_write_memory_8);
+             break;
+         case LinkTarget::WrappedWriteMemory16:
+-            c.BL(prelude_info.wrapped_write_memory_16);
++            c.BL(prelude.wrapped_write_memory_16);
+             break;
+         case LinkTarget::WrappedWriteMemory32:
+-            c.BL(prelude_info.wrapped_write_memory_32);
++            c.BL(prelude.wrapped_write_memory_32);
+             break;
+         case LinkTarget::WrappedWriteMemory64:
+-            c.BL(prelude_info.wrapped_write_memory_64);
++            c.BL(prelude.wrapped_write_memory_64);
+             break;
+         case LinkTarget::WrappedWriteMemory128:
+-            c.BL(prelude_info.wrapped_write_memory_128);
++            c.BL(prelude.wrapped_write_memory_128);
+             break;
+         case LinkTarget::ExclusiveWriteMemory8:
+-            c.BL(prelude_info.exclusive_write_memory_8);
++            c.BL(prelude.exclusive_write_memory_8);
+             break;
+         case LinkTarget::ExclusiveWriteMemory16:
+-            c.BL(prelude_info.exclusive_write_memory_16);
++            c.BL(prelude.exclusive_write_memory_16);
+             break;
+         case LinkTarget::ExclusiveWriteMemory32:
+-            c.BL(prelude_info.exclusive_write_memory_32);
++            c.BL(prelude.exclusive_write_memory_32);
+             break;
+         case LinkTarget::ExclusiveWriteMemory64:
+-            c.BL(prelude_info.exclusive_write_memory_64);
++            c.BL(prelude.exclusive_write_memory_64);
+             break;
+         case LinkTarget::ExclusiveWriteMemory128:
+-            c.BL(prelude_info.exclusive_write_memory_128);
++            c.BL(prelude.exclusive_write_memory_128);
+             break;
+         case LinkTarget::CallSVC:
+-            c.BL(prelude_info.call_svc);
++            c.BL(prelude.call_svc);
+             break;
+         case LinkTarget::ExceptionRaised:
+-            c.BL(prelude_info.exception_raised);
++            c.BL(prelude.exception_raised);
+             break;
+         case LinkTarget::InstructionSynchronizationBarrierRaised:
+-            c.BL(prelude_info.isb_raised);
++            c.BL(prelude.isb_raised);
+             break;
+         case LinkTarget::InstructionCacheOperationRaised:
+-            c.BL(prelude_info.ic_raised);
++            c.BL(prelude.ic_raised);
+             break;
+         case LinkTarget::DataCacheOperationRaised:
+-            c.BL(prelude_info.dc_raised);
++            c.BL(prelude.dc_raised);
+             break;
+         case LinkTarget::GetCNTPCT:
+-            c.BL(prelude_info.get_cntpct);
++            c.BL(prelude.get_cntpct);
+             break;
+         case LinkTarget::AddTicks:
+-            c.BL(prelude_info.add_ticks);
++            c.BL(prelude.add_ticks);
+             break;
+         case LinkTarget::GetTicksRemaining:
+-            c.BL(prelude_info.get_ticks_remaining);
++            c.BL(prelude.get_ticks_remaining);
+             break;
+         default:
+             ASSERT_FALSE("Invalid relocation target");
+         }
+     }
++}
++
++void AddressSpace::Link(EmittedBlockInfo& block_info) {
++    HenLinkRelocations(block_info, block_info.entry_point, mem.wptr(), mem.xptr(), prelude_info);
  
      for (auto [target_descriptor, list] : block_info.block_relocations) {
          block_references[target_descriptor].insert(block_info.entry_point);
@@ -1664,7 +2142,7 @@ index 2c7ae77..fd9a4e8 100644
 +//
 +// What may change in code that is running, and who changes it:
 +//   - A stub is written once, before any site that leads to it can run, and never again.
-+//     What it does changes through the link slot it reads: data, as before.
++//     What it does changes through the link slot it reads: data, as for any link.
 +//   - A site changes once, from "B stub" to "B target": one instruction, written by the
 +//     emulation thread (HenUpgradeLinks) under hen_compile_mutex when the target is published.
 +//     Before and after are both right at any moment: the stub reads the slot, which already
@@ -1672,7 +2150,30 @@ index 2c7ae77..fd9a4e8 100644
 +//     zeroed (stub: unlinked exit) and its first instructions become the same unlinked exit
 +//     (HenTombstone), which is where "B target" then leads.
 +//   - The compile worker writes only code that isn't published yet (new blocks, new stubs) and
-+//     link slots (deferred to after the publish, as before).
++//     link slots (deferred to after the publish, as for any link).
++/// The ten instructions of a link stub (see above), at stub in the buffer given: for the code in
++/// use and for a re-sort's copy alike.
++void AddressSpace::HenWriteStub(u32* wmem, u32* xmem, CodePtr stub, u64 slot, u32 pc, size_t pc_offset, void* exit) {
++    using namespace oaknut;
++    using namespace oaknut::util;
++
++    constexpr size_t stub_bytes = 10 * sizeof(u32);
++    ASSERT(slot < (u64(1) << 48));
++    CodeGenerator c{wmem, xmem};
++    c.set_xptr(reinterpret_cast<u32*>(stub));
++    c.dw(0xD2800000u | (0u << 21) | (static_cast<u32>(slot & 0xffff) << 5) | 16u);          // MOVZ X16, #slot[15:0]
++    c.dw(0xF2800000u | (1u << 21) | (static_cast<u32>((slot >> 16) & 0xffff) << 5) | 16u);  // MOVK X16, #slot[31:16], LSL #16
++    c.dw(0xF2800000u | (2u << 21) | (static_cast<u32>((slot >> 32) & 0xffff) << 5) | 16u);  // MOVK X16, #slot[47:32], LSL #32
++    c.LDR(Xscratch0, Xscratch0);
++    c.dw(0xB4000000u | (2u << 5) | 16u);                                                    // CBZ X16, +8
++    c.BR(Xscratch0);
++    c.dw(0x52800000u | ((pc & 0xffff) << 5) | 16u);                                         // MOVZ W16, #pc[15:0]
++    c.dw(0x72a00000u | (((pc >> 16) & 0xffff) << 5) | 16u);                                 // MOVK W16, #pc[31:16], LSL #16
++    c.STR(Wscratch0, Xstate, pc_offset);
++    c.B(exit);
++    ASSERT(c.xptr<CodePtr>() == stub + stub_bytes);
++}
++
 +CodePtr AddressSpace::HenLinkStub(IR::LocationDescriptor target, CodePtr site) {
 +    using namespace oaknut;
 +    using namespace oaknut::util;
@@ -1694,21 +2195,8 @@ index 2c7ae77..fd9a4e8 100644
 +    ASSERT(HenBranchReaches(site, stub));
 +
 +    const u64 slot = mcl::bit_cast<u64>(HenLinkSlot(target));
-+    ASSERT(slot < (u64(1) << 48));
-+    const u32 pc = static_cast<u32>(target.Value());
-+    CodeGenerator c{mem.wptr(), mem.xptr()};
-+    c.set_xptr(reinterpret_cast<u32*>(stub));
-+    c.dw(0xD2800000u | (0u << 21) | (static_cast<u32>(slot & 0xffff) << 5) | 16u);          // MOVZ X16, #slot[15:0]
-+    c.dw(0xF2800000u | (1u << 21) | (static_cast<u32>((slot >> 16) & 0xffff) << 5) | 16u);  // MOVK X16, #slot[31:16], LSL #16
-+    c.dw(0xF2800000u | (2u << 21) | (static_cast<u32>((slot >> 32) & 0xffff) << 5) | 16u);  // MOVK X16, #slot[47:32], LSL #32
-+    c.LDR(Xscratch0, Xscratch0);
-+    c.dw(0xB4000000u | (2u << 5) | 16u);                                                    // CBZ X16, +8
-+    c.BR(Xscratch0);
-+    c.dw(0x52800000u | ((pc & 0xffff) << 5) | 16u);                                         // MOVZ W16, #pc[15:0]
-+    c.dw(0x72a00000u | (((pc >> 16) & 0xffff) << 5) | 16u);                                 // MOVK W16, #pc[31:16], LSL #16
-+    c.STR(Wscratch0, Xstate, hen_pc_offset);
-+    c.B(prelude_info.hen_exit_unlinked ? prelude_info.hen_exit_unlinked : prelude_info.return_to_dispatcher);
-+    ASSERT(c.xptr<CodePtr>() == stub + stub_bytes);
++    HenWriteStub(mem.wptr(), mem.xptr(), stub, slot, static_cast<u32>(target.Value()), hen_pc_offset,
++                 prelude_info.hen_exit_unlinked ? prelude_info.hen_exit_unlinked : prelude_info.return_to_dispatcher);
 +
 +    hen_link_stub_of.insert_or_assign(target, stub);
 +    hen_jit_note_compact(3, 1);
@@ -1721,7 +2209,7 @@ index 2c7ae77..fd9a4e8 100644
 +void AddressSpace::HenFlushLinkStubs() {
 +    if (hen_stub_dirty != nullptr && hen_stub_next > hen_stub_dirty) {
 +        mem.invalidate(reinterpret_cast<u32*>(hen_stub_dirty), static_cast<size_t>(hen_stub_next - hen_stub_dirty));
-+    }
+     }
 +    hen_stub_dirty = hen_stub_next;
 +}
 +
@@ -1823,21 +2311,19 @@ index 2c7ae77..fd9a4e8 100644
 +#if defined(__SWITCH__)
 +    // (the count, not the vector: the worker adds to the vector under the lock this thread
 +    // doesn't hold yet, and taking the lock every frame would cut its batches short)
-+    if (!hen_direct_links || !hen_link_table || hen_ready_count.load(std::memory_order_relaxed) == 0) {
++    if (!hen_direct_links || !hen_link_table || hen_ready_count.load(std::memory_order_relaxed) == 0 || hen_parked.load(std::memory_order_relaxed)) {
 +        return 0;
 +    }
-+    // (Not worth a wait: when the worker has the lock, try again next frame, and only after
-+    // half a second of that ask it to end its batch.)
++    // (Not worth a wait: when the worker has the lock, try again next frame. If half a
++    // second of that ends in a wait for the lock, with the worker asked to end its batch, the
++    // worker can take 58 ms over that: a gap of 59 ms between two frames with nothing
++    // else in it. The upgrade only makes links faster, so it never waits.)
 +    std::unique_lock hen_lock{hen_compile_mutex, std::try_to_lock};
 +    if (!hen_lock.owns_lock()) {
-+        if (++hen_upgrade_skips < 30) {
-+            return 0;
-+        }
-+        hen_emu_waiting.fetch_add(1, std::memory_order_relaxed);
-+        hen_lock.lock();
-+        hen_emu_waiting.fetch_sub(1, std::memory_order_relaxed);
++        hen_jit_note_link_skip(1);
++        return 0;
 +    }
-+    hen_upgrade_skips = 0;
++    hen_jit_note_link_skip(0);
 +    bool open = false;
 +    while (!hen_ready_targets.empty() && done < max_sites && hen_jit_now_ns() < deadline_ns) {
 +        const IR::LocationDescriptor target = hen_ready_targets.back();
@@ -1905,7 +2391,7 @@ index 2c7ae77..fd9a4e8 100644
 +
 +    if (!hen_direct_links || !hen_link_table) {
 +        return;
-     }
++    }
 +    const auto info = block_infos.find(entry_point);
 +    ASSERT(info != block_infos.end() && info->second.size >= 4 * sizeof(u32));
 +    CodeGenerator c{mem.wptr(), mem.xptr()};
@@ -1920,7 +2406,7 @@ index 2c7ae77..fd9a4e8 100644
  }
  
  void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
-@@ -276,7 +1531,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+@@ -276,7 +1781,7 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
      using namespace oaknut::util;
  
      for (auto [ptr_offset, type] : block_relocations_list) {
@@ -1929,7 +2415,7 @@ index 2c7ae77..fd9a4e8 100644
          c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
  
          switch (type) {
-@@ -301,6 +1556,26 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+@@ -301,6 +1806,26 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
  }
  
  void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
@@ -1956,8 +2442,1168 @@ index 2c7ae77..fd9a4e8 100644
      for (auto code_ptr : block_references[target_descriptor]) {
          if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
              const EmittedBlockInfo& block_info = block_iter->second;
+@@ -314,6 +1839,1159 @@ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor,
+     }
+ }
+ 
++// (Azahar's Switch 2 port) Re-sorting the code in the background.
++//
++// Why, the order, the checks and the numbers: Azahar's hen/jit/hen_resort.h. How, here.
++//
++// The copy ("world") is everything that holds a host code address, made anew for a second code
++// buffer: the buffer with its own prelude at the same offsets (the prelude's code is relative
++// throughout; the one address of itself it holds as data is set again), the blocks, the block
++// tables, the link slots, the link stubs, the records of link sites still to be upgraded, and
++// the log of blocks. Nothing of the code in use is changed while the copy is made, and the copy
++// refers to nothing of it: the code in use goes on running, compiling and linking as it is.
++//
++// Who does what:
++//   - The emulation thread's tick (HenResortTick, once a frame) decides that a re-sort begins.
++//   - The compile worker builds the copy between its batches (HenResortWork: one bounded step a
++//     turn, each under the compile lock for as long as it reads the tables in use, ended as a
++//     batch is when the emulation thread wants the lock). The steps: the blocks alive now, from
++//     the log (the snapshot); their order and offsets, and the copy's block table, so that every
++//     link between two of them is a direct branch from the start; each block's bytes copied and
++//     its calls into the prelude and its link sites written for the new addresses; then the
++//     blocks compiled meanwhile, appended in compile order, round after round until none is
++//     left; published in pieces as it goes; in development builds, checked.
++//   - The emulation thread changes over at the start of a slice (HenResortSwitch, from
++//     Jit::Run before generated code is entered): it appends the blocks compiled since the
++//     worker's last round, publishes them, and swaps the buffer, the prelude's addresses and
++//     every table for the copy's; the dispatcher's table is emptied. No host code address of
++//     this address space is live on that thread at that point: the return stack buffer and the
++//     saved registers of generated code are on the host stack only inside a slice, and the
++//     state between slices holds program values only.
++//   - The worker then frees what the old code needed and reports. The old buffer is kept as the
++//     next re-sort's (or released: --jit-resort-release).
++//
++// What ends a re-sort without a change-over: blocks invalidated or the cache cleared while the
++// copy was being made (the copy has code that is gone: it is thrown away, and the tick starts
++// another later), the process ending (HenPark), no second buffer, a failed check. The code in
++// use is untouched in every such case.
++#if defined(__SWITCH__)
++extern "C" {
++extern int hen_resort_release; // --jit-resort-release
++extern int hen_resort_poison;  // --jit-resort-poison
++int hen_resort_claim(void);
++void hen_resort_unclaim(void);
++unsigned hen_resort_number(void);
++unsigned long long hen_resort_origin(void);
++unsigned long long hen_resort_busy_last(void);
++int hen_jit_resort_prepare(struct hen_jit* jit, unsigned long long* map_ns);
++void hen_jit_resort_publish(struct hen_jit* jit, size_t begin, size_t size, unsigned long long* ns, unsigned* requests, unsigned long long* longest_ns);
++}
++
++struct AddressSpace::HenResortWorld {
++    struct hen_jit* jit = nullptr;  ///< the buffer the copy is made in; after the change-over, the old one
++    u32* w = nullptr;               ///< its write area
++    u32* x = nullptr;               ///< its execute address
++    const u32* old_w = nullptr;     ///< the buffer in use while the copy is made
++    CodePtr old_x = nullptr;
++    size_t usable = 0;
++    size_t old_usable = 0;          ///< the length of the buffer in use while the copy is made
++    size_t grow_from = 0;           ///< not 0: this re-sort is a growth from a buffer of that size
++    PreludeInfo prelude{};
++    CodePtr defer_stub = nullptr;
++    unsigned number = 0;
++    int phase = 0;        ///< 0 snapshot, 1 order, 2 copy, 3 what was compiled since
++    size_t snap = 0;      ///< log entries in the snapshot
++    size_t cursor = 0;
++    size_t log_done = 0;  ///< entries of the log in use that are in the copy (or dead)
++    std::vector<HenResort::Item> items;
++    size_t top = 0;       ///< the copy's code ends here
++    size_t old_top = 0;
++    CodePtr stub_next = nullptr, stub_end = nullptr;
++    std::vector<std::pair<size_t, size_t>> dirty;  ///< written, not published
++    size_t dirty_bytes = 0;
++
++    tsl::robin_map<IR::LocationDescriptor, CodePtr> entries, published;
++    std::map<CodePtr, IR::LocationDescriptor> reverse;
++    tsl::robin_map<CodePtr, EmittedBlockInfo> infos;
++    tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> references;
++    std::deque<std::array<u64, 2>> slots;
++    tsl::robin_map<IR::LocationDescriptor, std::array<u64, 2>*> slot_of;
++    tsl::robin_map<IR::LocationDescriptor, CodePtr> stub_of;
++    tsl::robin_set<CodePtr> tombstoned;
++    tsl::robin_map<IR::LocationDescriptor, std::vector<HenSlotSite>> pending;
++    std::vector<IR::LocationDescriptor> ready;
++    std::vector<HenLogEntry> log;
++    HEN_STAT(std::vector<u32> old_offsets;)  ///< per entry of log: where the block was copied from (for the checks)
++
++    size_t sorted_blocks = 0, appended_blocks = 0;
++    u64 sorted_bytes = 0, appended_bytes = 0;
++    size_t checked = 0, checked_top = 0;
++    unsigned rounds = 0;
++    u64 ready_ns = 0;
++    // (for the development builds' report of a re-sort)
++    HEN_STAT(size_t direct_sites = 0, slot_sites = 0, stubs = 0;
++    u64 figure = 0;
++    u64 start_ns = 0, copy_ns = 0, link_ns = 0, publish_ns = 0, publish_longest_ns = 0, check_ns = 0, map_ns = 0;
++    unsigned publish_requests = 0;)
++    const char* fail = nullptr;
++    u64 fail_at = 0;
++    bool fail_is_check = false;
++
++    void Mark(size_t begin, size_t end) {
++        dirty_bytes += end - begin;
++        for (auto range = dirty.rbegin(); range != dirty.rend(); ++range) {
++            if (begin >= range->first && begin <= range->second) {
++                range->second = std::max(range->second, end);
++                return;
++            }
++        }
++        dirty.emplace_back(begin, end);
++    }
++};
++
++/// This address space's share of the totals "hen: layout:" reports (hen/jit/hen_jit.c): blocks
++/// and bytes in sorted order, blocks and bytes compiled since. Under the compile lock.
++void AddressSpace::HenResortCounts([[maybe_unused]] u64 sorted_blocks, [[maybe_unused]] u64 sorted_bytes, [[maybe_unused]] u64 unsorted_blocks, [[maybe_unused]] u64 unsorted_bytes) {
++    HEN_STAT(const u64 now[4] = {sorted_blocks, sorted_bytes, unsorted_blocks, unsorted_bytes};
++    for (int i = 0; i < 4; i++) {
++        hen_resort_note(i, static_cast<long long>(now[i]) - static_cast<long long>(hen_resort_mine[i]));
++        hen_resort_mine[i] = now[i];
++    })
++}
++
++void AddressSpace::HenResortUnclaim() {
++    if (hen_resort_claimed.exchange(false)) {
++        hen_resort_unclaim();
++    }
++}
++
++void AddressSpace::HenResortWakeWorker() {
++    {
++        std::scoped_lock lock{hen_worker_mutex};
++        hen_resort_wake = true;
++    }
++    hen_worker_wake.notify_all();
++}
++
++/// Under the compile lock, from whatever makes a copy in the making stale.
++void AddressSpace::HenResortNoteAbort(const char* why) {
++    const int state = hen_resort_state.load(std::memory_order_relaxed);
++    if (state < 1 || state > 3 || hen_resort_abort) {
++        return;
++    }
++    hen_resort_abort = true;
++    hen_resort_abort_why = why;
++    if (state == 3) {
++        // (the worker sleeps while the copy waits for the emulation thread)
++        hen_resort_state.store(5);
++        HenResortWakeWorker();
++    }
++}
++
++void AddressSpace::HenResortTick(u64 now_ns) {
++    if (!hen_resort || hen_resort_off || hen_tag == 0xffff || !hen_worker_started || !HenWorkerCompiles()) {
++        return;
++    }
++    const u64 count = hen_log_count.load(std::memory_order_relaxed);
++    if (hen_resort_window_ns == 0) {
++        hen_resort_window_ns = now_ns;
++        hen_resort_window_count = count;
++        hen_resort_window_runs = hen_resort_runs;
++    } else if (now_ns - hen_resort_window_ns >= HenResort::kWindowNs) {
++        hen_resort_window_blocks = count >= hen_resort_window_count ? count - hen_resort_window_count : 0;
++        hen_resort_window_ran = hen_resort_runs != hen_resort_window_runs;
++        hen_resort_window_known = true;
++        hen_resort_window_ns = now_ns;
++        hen_resort_window_count = count;
++        hen_resort_window_runs = hen_resort_runs;
++    }
++    const int state = hen_resort_state.load(std::memory_order_relaxed);
++    if (state == 3) {
++        // A copy that is ready and not taken: this JIT's core is not running (the change-over
++        // is at the start of a slice). It is not kept waiting, with its tables, for a slice
++        // that may never come.
++        const u64 ready = hen_resort_ready_ns.load(std::memory_order_relaxed);
++        if (ready != 0 && now_ns > ready && now_ns - ready > HenResort::kWindowNs) {
++            HenEmuLock hen_lock{*this};
++            hen_resort_idle_abandons++;  // (the next try waits twice as long)
++            HenResortNoteAbort("the JIT ran no slice for two seconds after the copy was ready");
++        }
++        return;
++    }
++    if (state != 0) {
++        return;
++    }
++    // A full buffer that can grow: asked for now, whatever the rules below say. The
++    // program is interpreting every new block until the change-over.
++    // The same from where the worker stops compiling what nobody asked for (87% of any
++    // size, HenAheadRoom): the growth is due at seven tenths, and if it has not come by then
++    // (the rules of the first seconds, a copy given up), it is not to wait for them any longer.
++    const bool full = (hen_full.load(std::memory_order_relaxed) ||
++                       (hen_buffer_grow &&
++                        static_cast<size_t>(code.offset()) + HenAheadRoom(16 * 1024 * 1024) > std::min(code_cache_size, mem.usable_size()))) &&
++                      HenCanGrow();
++    if (!full && (!hen_resort_window_known || !hen_resort_window_ran)) {
++        return;  // (not running: nothing to gain, and nobody to change over)
++    }
++    // (--jit-buffer-grow) A buffer smaller than the largest that is seven tenths full is
++    // re-sorted into one 32 MiB larger now, whatever the rules for an ordinary re-sort say: the
++    // copy is to be in use before the buffer is full (a full buffer is thrown away whole,
++    // ClearCache, which has never run on the console). A JIT that is compiling hard may have its
++    // copy given up ("code kept being compiled"); the next tick asks again.
++    bool grow = false;
++    if (hen_buffer_grow && hen_resort_at_ms < 0) {
++        constexpr size_t largest = size_t(124) << 20, step = size_t(32) << 20;
++        const size_t usable = std::min(code_cache_size, mem.usable_size());
++        const size_t used = static_cast<size_t>(code.offset());  // (read without the lock: a figure only)
++        const bool due = full ? (hen_resort_last_start_ns == 0 || now_ns - hen_resort_last_start_ns >= 200'000'000ull)
++                              : used >= usable / 10 * 7 &&
++                                    (hen_resort_last_start_ns == 0 || now_ns - hen_resort_last_start_ns >= 2'000'000'000ull);
++        if (usable < largest && due && !hen_parked.load(std::memory_order_relaxed)) {
++            grow = true;
++            hen_grow_target = std::min(largest, usable + step);
++        }
++    }
++    if (grow) {
++    } else if (hen_resort_at_ms >= 0) {
++        // (--jit-resort-at: one re-sort at that time whatever the rules say, and no other)
++        if (hen_resort_at_done || count == 0 || hen_parked.load(std::memory_order_relaxed) ||
++            now_ns - hen_resort_origin() < static_cast<u64>(hen_resort_at_ms) * 1'000'000ull) {
++            return;
++        }
++    } else {
++        HenResort::PolicyIn in{};
++        in.now_ns = now_ns;
++        in.last_start_ns = hen_resort_last_start_ns;
++        in.busy_last_ns = hen_resort_busy_last();
++        in.window_blocks = hen_resort_window_blocks;
++        in.window_known = hen_resort_window_known;
++        in.list_pending = hen_list_busy.load(std::memory_order_relaxed);
++        in.parked = hen_parked.load(std::memory_order_relaxed);
++        in.total_bytes = hen_log_bytes.load(std::memory_order_relaxed);
++        in.unsorted_bytes = hen_log_unsorted_bytes.load(std::memory_order_relaxed);
++        in.idle_abandons = hen_resort_idle_abandons;
++        if (HenResort::PolicyWait(in) != nullptr) {
++            return;
++        }
++    }
++    // (one copy in the making at a time, over all address spaces: they share the publish path)
++    if (!hen_resort_claim()) {
++        return;
++    }
++    hen_resort_claimed.store(true);
++    if (!grow) {
++        hen_grow_target = 0;
++    }
++    hen_resort_at_done = true;
++    hen_resort_last_start_ns = now_ns;
++    hen_resort_state.store(1);
++    HenResortWakeWorker();
++}
++
++bool AddressSpace::HenCanGrow() const {
++    constexpr size_t largest = size_t(124) << 20;
++    return hen_buffer_grow && hen_resort && !hen_resort_off && hen_resort_at_ms < 0 &&
++           hen_tag != 0xffff && hen_worker_started && HenWorkerCompiles() && !hen_parked.load(std::memory_order_relaxed) &&
++           std::min(code_cache_size, mem.usable_size()) < largest;
++}
++
++bool AddressSpace::HenSliceStartWanted() const {
++    // (the time is looked at here. Going into HenSliceStart, and so taking the compile
++    // lock, at every slice until the time has come gives Kid Icarus first reports at 21 and 65%
++    // with --jit-clear-at 40, 3950 ms of waiting for the lock, the worker's batches cut to 1.3
++    // blocks.)
++    return hen_full.load(std::memory_order_relaxed) || hen_clear_wanted.load(std::memory_order_relaxed) ||
++           (hen_jit_clear_at_ms >= 0 && !hen_clear_at_done &&
++            hen_jit_now_ns() >= hen_resort_origin() + static_cast<u64>(hen_jit_clear_at_ms) * 1'000'000ull);
++}
++
++/// The emulation thread, between two slices (see "A full code buffer" in address_space.h).
++void AddressSpace::HenSliceStart() {
++    const u64 origin = hen_resort_origin();  // (before now: it is set when first asked for)
++    const u64 now = std::max<u64>(hen_jit_now_ns(), origin);
++    HenEmuLock hen_lock{*this};
++    if (hen_jit_clear_at_ms >= 0 && !hen_clear_at_done &&
++        now - origin >= static_cast<u64>(hen_jit_clear_at_ms) * 1'000'000ull) {
++        hen_clear_at_done = true;
++        if (static_cast<size_t>(code.offset()) > static_cast<size_t>(prelude_info.end_of_prelude)) {
++            HenClearNow("asked for by --jit-clear-at");
++            return;
++        }
++    }
++    if (hen_clear_wanted.load(std::memory_order_relaxed)) {
++        HenClearNow("no room left for a block the interpreter cannot run");
++        return;
++    }
++    if (!hen_full.load(std::memory_order_relaxed)) {
++        return;
++    }
++    if (GetRemainingSize() >= hen_full_room) {
++        // (a larger buffer has been changed over to, just before this in Jit::Run; or the
++        // cache was cleared or parts of it were asked for by the program meanwhile)
++        std::printf("hen: jit full: JIT 0x%03x at %.1f s: room again after %.0f ms, %llu lookups answered \"interpret\" "
++                    "meanwhile; the buffer is %zu MiB now, %zu KiB in use\n",
++                    static_cast<unsigned>(hen_tag), (now - origin) / 1e9, (now > hen_full_since_ns ? now - hen_full_since_ns : 0) / 1e6,
++                    static_cast<unsigned long long>(hen_full_interpreted), std::min(code_cache_size, mem.usable_size()) >> 20,
++                    static_cast<size_t>(code.offset()) >> 10);
++        hen_full.store(false);
++        return;
++    }
++    if (HenCanGrow() && (now < hen_full_since_ns || now - hen_full_since_ns < hen_full_wait_ns)) {
++        if (hen_full_interpreted == 1) {
++            hen_full_interpreted++;  // (said once)
++            std::printf("hen: jit full: JIT 0x%03x at %.1f s: its %zu MiB code buffer is full (%zu KiB left); new blocks are "
++                        "interpreted until a larger buffer is in use\n",
++                        static_cast<unsigned>(hen_tag), (now - origin) / 1e9,
++                        std::min(code_cache_size, mem.usable_size()) >> 20, GetRemainingSize() >> 10);
++        }
++        return;
++    }
++    HenClearNow(HenCanGrow() ? "the buffer is full and no larger one was in use after three seconds"
++                             : "the buffer is full and cannot grow");
++}
++
++void AddressSpace::HenClearNow(const char* why) {
++    const u64 t0 = hen_jit_now_ns();
++    const size_t blocks = block_entries.size();
++    const size_t old_top = static_cast<size_t>(code.offset());
++    const size_t prelude_end = static_cast<size_t>(prelude_info.end_of_prelude);
++    const bool was_full = hen_full.load(std::memory_order_relaxed);
++    ClearCache();
++#if HEN_DEV
++    if (hen_resort_poison && old_top > prelude_end) {
++        // (--jit-resort-poison) Anything that still led into the old code would go on working
++        // by accident until new code was written over it: it is filled with an instruction
++        // that faults.
++        UnprotectCodeMemory();
++        u32* const write = mem.wptr() + prelude_end / sizeof(u32);
++        const size_t words = (old_top - prelude_end) / sizeof(u32);
++        for (size_t i = 0; i < words; i++) {
++            write[i] = 0xD4200000u | (0x57u << 5);  // BRK #0x57
++        }
++        mem.invalidate(mem.xptr() + prelude_end / sizeof(u32), words * sizeof(u32));
++        ProtectCodeMemory();
++        mem.rewind(prelude_end);
++    }
++#endif
++    hen_full.store(false);
++    hen_clear_wanted.store(false);
++    const u64 origin = hen_resort_origin();
++    const u64 now = std::max<u64>(hen_jit_now_ns(), origin);
++    std::printf("hen: jit clear: JIT 0x%03x at %.1f s: code cache cleared between two slices: %s; %zu blocks, %zu KiB thrown "
++                "away in %.1f ms%s; buffer %zu MiB\n",
++                static_cast<unsigned>(hen_tag), (now - origin) / 1e9, why, blocks, (old_top - prelude_end) >> 10,
++                (now - t0) / 1e6, was_full ? " (blocks had been interpreted for lack of room)" : "",
++                std::min(code_cache_size, mem.usable_size()) >> 20);
++}
++
++void AddressSpace::HenResortWork() {
++    // A copy's tables are ordinary allocations (the block tables of a title's main JIT
++    // come to tens of MiB). When the heap cannot give one, the re-sort is given up like any
++    // other that cannot be finished; otherwise the exception leaves the worker's thread and
++    // ends the program (seen in a session with the online modules on).
++    switch (hen_resort_state.load()) {
++    case 1:
++        try {
++            if (!HenResortBegin()) {
++                hen_resort_state.store(5);
++            }
++        } catch (const std::bad_alloc&) {
++            if (hen_resort_world != nullptr) {
++                hen_resort_world->fail = "no memory for the copy's tables";
++            }
++            hen_resort_off = true;  // (not asked for again: the memory is not to be had)
++            hen_resort_state.store(5);
++        }
++        break;
++    case 2:
++        try {
++            if (!HenResortStep()) {
++                hen_resort_state.store(5);
++            }
++        } catch (const std::bad_alloc&) {
++            hen_resort_world->fail = "no memory for the copy's tables";
++            hen_resort_off = true;
++            hen_resort_state.store(5);
++        }
++        break;
++    case 4:
++        HenResortFinish(true);
++        break;
++    case 5:
++        HenResortFinish(false);
++        break;
++    default:
++        break;
++    }
++    // (the mutex isn't fair: let the emulation thread have it)
++    while (hen_emu_waiting.load(std::memory_order_relaxed) != 0) {
++        std::this_thread::yield();
++    }
++}
++
++/// The worker: the second buffer, its prelude, and where the log stands. False: given up
++/// (the world, if there is one, says why).
++bool AddressSpace::HenResortBegin() {
++    HenResortWorld* const world = new HenResortWorld;
++    hen_resort_world = world;
++    world->number = hen_resort_number();
++    HEN_STAT(world->start_ns = hen_jit_now_ns();)
++    if (prelude_info.hen_rtd_literal == 0) {
++        world->fail = "this address space's prelude cannot be copied";
++        hen_resort_off = true;
++        return false;
++    }
++    // The buffer's size: the one in use, or a larger one when this re-sort is a growth.
++    const size_t target = hen_grow_target != 0 ? hen_grow_target : code_cache_size;
++    // (what the buffer in use can hold, which is less than its size if part of its address
++    // range was occupied when it was mapped: hen_jit.c, try_alias)
++    world->grow_from = hen_grow_target != 0 ? std::min(code_cache_size, mem.usable_size()) : 0;
++    if (hen_resort_spare != nullptr && hen_jit_usable_size(hen_resort_spare) != target) {
++        hen_jit_destroy(hen_resort_spare);
++        hen_resort_spare = nullptr;
++    }
++    if (hen_resort_spare == nullptr) {
++        hen_resort_spare = hen_jit_create(target);
++    }
++    unsigned long long map_ns = 0;
++    if (hen_resort_spare == nullptr || !hen_jit_resort_prepare(hen_resort_spare, &map_ns)) {
++        world->fail = "no second code buffer";
++        hen_resort_off = true;  // (not asked for again: the memory or the mapping is not to be had)
++        return false;
++    }
++    HEN_STAT(world->map_ns = map_ns;)
++    world->jit = hen_resort_spare;
++    world->w = hen_jit_wptr(world->jit);
++    world->x = hen_jit_xptr(world->jit);
++    world->usable = std::min(target, hen_jit_usable_size(world->jit));
++    static_assert(std::is_trivially_copyable_v<PreludeInfo> && sizeof(PreludeInfo) % sizeof(u64) == 0);
++    {
++        std::scoped_lock big{hen_compile_mutex};
++        hen_resort_abort = false;
++        hen_resort_abort_why = "";
++        if (hen_parked.load(std::memory_order_relaxed)) {
++            world->fail = "the process ended";
++            return false;
++        }
++        world->old_w = mem.wptr();
++        world->old_x = reinterpret_cast<CodePtr>(mem.xptr());
++        world->old_top = static_cast<size_t>(code.offset());
++        world->old_usable = std::min(code_cache_size, mem.usable_size());
++        world->snap = hen_log.size();
++        const size_t prelude_bytes = static_cast<size_t>(prelude_info.end_of_prelude);
++        if (world->usable < std::min(code_cache_size, mem.usable_size()) || prelude_bytes == 0 || prelude_bytes >= world->usable) {
++            world->fail = "the second code buffer is smaller";
++            hen_resort_off = true;
++            return false;
++        }
++        // The prelude: the same bytes at the same offsets, so every address of it is the old
++        // one moved by the distance between the two buffers.
++        std::memcpy(world->w, world->old_w, prelude_bytes);
++        const u64 old_base = mcl::bit_cast<u64>(world->old_x);
++        const u64 delta = mcl::bit_cast<u64>(world->x) - old_base;
++        u64 fields[sizeof(PreludeInfo) / sizeof(u64)];
++        std::memcpy(fields, &prelude_info, sizeof(PreludeInfo));
++        for (u64& field : fields) {
++            if (field >= old_base && field < old_base + prelude_bytes) {
++                field += delta;
++            }
++        }
++        std::memcpy(&world->prelude, fields, sizeof(PreludeInfo));
++        world->defer_stub = hen_defer_stub + delta;
++        const u64 rtd = mcl::bit_cast<u64>(world->prelude.return_to_dispatcher);
++        std::memcpy(reinterpret_cast<u8*>(world->w) + world->prelude.hen_rtd_literal, &rtd, sizeof(rtd));
++        world->top = prelude_bytes;
++        world->Mark(0, prelude_bytes);
++    }
++#if HEN_DEV
++    // (no word of the copied prelude may still be an address inside the old buffer)
++    for (size_t at = 0; at + 8 <= world->top; at += 4) {
++        u64 value;
++        std::memcpy(&value, reinterpret_cast<const u8*>(world->w) + at, sizeof(value));
++        // (within the old buffer's own length. With the copy's, which is longer when the
++        // buffer grows, whatever lay behind the old buffer counted as part of it.)
++        if (value >= mcl::bit_cast<u64>(world->old_x) && value < mcl::bit_cast<u64>(world->old_x) + world->old_usable) {
++            world->fail = "check failed: the copied prelude holds an address of the old buffer";
++            world->fail_at = at;
++            world->fail_is_check = true;
++            hen_resort_off = true;
++            return false;
++        }
++    }
++#endif
++    world->phase = 0;
++    hen_resort_state.store(2);
++    return true;
++}
++
++/// Written but not published code of the copy, to the HEN: when there is a piece's worth, or all of
++/// it. Not under the compile lock (the worker), except at the change-over, where it is a few
++/// blocks.
++void AddressSpace::HenResortPublish(HenResortWorld& world, bool all) {
++    if (world.dirty.empty() || (!all && world.dirty_bytes < static_cast<size_t>(hen_resort_chunk))) {
++        return;
++    }
++    for (const auto& [begin, end] : world.dirty) {
++        unsigned long long ns = 0, longest = 0;
++        unsigned requests = 0;
++        hen_jit_resort_publish(world.jit, begin, end - begin, &ns, &requests, &longest);
++        HEN_STAT(world.publish_ns += ns;
++        world.publish_requests += requests;
++        world.publish_longest_ns = std::max<u64>(world.publish_longest_ns, longest);)
++    }
++    world.dirty.clear();
++    world.dirty_bytes = 0;
++}
++
++/// Under the compile lock. One block of the code in use into the copy at new_offset: its bytes,
++/// its record, its place in the copy's tables. sorted: the copy's block table has it already.
++bool AddressSpace::HenResortAppend(HenResortWorld& world, const HenLogEntry& entry, size_t new_offset, bool sorted) {
++    const auto old_info = block_infos.find(entry.entry);
++    if (old_info == block_infos.end() || old_info->second.size != entry.size || (entry.size & 3) != 0 || entry.size == 0) {
++        world.fail = "a block of the log has no record";
++        world.fail_at = entry.descriptor;
++        return false;
++    }
++    if (new_offset + entry.size + 1024 * 1024 > world.usable) {
++        world.fail = "the second code buffer is full";
++        world.fail_at = entry.descriptor;
++        return false;
++    }
++    const size_t old_offset = static_cast<size_t>(entry.entry - world.old_x);
++    std::memcpy(reinterpret_cast<u8*>(world.w) + new_offset, reinterpret_cast<const u8*>(world.old_w) + old_offset, entry.size);
++    const CodePtr new_entry = reinterpret_cast<CodePtr>(world.x) + new_offset;
++    const IR::LocationDescriptor descriptor{entry.descriptor};
++    EmittedBlockInfo info = old_info->second;
++    info.entry_point = new_entry;
++    const u64 delta = mcl::bit_cast<u64>(new_entry) - mcl::bit_cast<u64>(entry.entry);
++    for (auto patch = info.fastmem_patch_info.begin(); patch != info.fastmem_patch_info.end(); ++patch) {
++        patch.value().fc.call_pc += delta;
++    }
++    world.infos.insert_or_assign(new_entry, std::move(info));
++    world.reverse.insert_or_assign(world.reverse.end(), new_entry, descriptor);
++    world.log.push_back({entry.descriptor, new_entry, entry.size, entry.speculative});
++    HEN_STAT(world.old_offsets.push_back(static_cast<u32>(old_offset));
++    world.figure = HenResort::FigureAdd(world.figure, entry.descriptor, new_offset);)
++    world.Mark(new_offset, new_offset + entry.size);
++    if (sorted) {
++        world.sorted_blocks++;
++        world.sorted_bytes += entry.size;
++    } else {
++        world.entries.insert_or_assign(descriptor, new_entry);
++        world.published.insert_or_assign(descriptor, new_entry);
++        world.appended_blocks++;
++        world.appended_bytes += entry.size;
++    }
++    return true;
++}
++
++/// The calls into the prelude and the link sites of a block of the copy, for where it lies now.
++/// A link to a block that is in the copy is a direct branch (or the block's address, for a
++/// return stack entry); one to a block that is not goes through the target's link slot of the
++/// copy (a compact site: by way of the target's stub in the copy), and is recorded for
++/// HenUpgradeLinks as in the code in use.
++bool AddressSpace::HenResortLink(HenResortWorld& world, IR::LocationDescriptor descriptor, CodePtr new_entry) {
++    const auto found = world.infos.find(new_entry);
++    if (found == world.infos.end()) {
++        world.fail = "a block of the copy has no record";
++        world.fail_at = descriptor.Value();
++        return false;
++    }
++    const EmittedBlockInfo& info = found->second;
++    HenLinkRelocations(info, new_entry, world.w, world.x, world.prelude);
++
++    const auto slot_of = [&world](IR::LocationDescriptor target) -> u64 {
++        if (const auto have = world.slot_of.find(target); have != world.slot_of.end()) {
++            return mcl::bit_cast<u64>(have->second);
++        }
++        const auto there = world.entries.find(target);
++        const u64 entry = there != world.entries.end() ? mcl::bit_cast<u64>(there->second) : 0;
++        world.slots.push_back({entry, entry != 0 ? entry : mcl::bit_cast<u64>(world.prelude.return_to_dispatcher)});
++        std::array<u64, 2>* const slot = &world.slots.back();
++        world.slot_of.emplace(target, slot);
++        return mcl::bit_cast<u64>(slot);
++    };
++    constexpr size_t stub_bytes = HenResort::kStubWords * sizeof(u32);
++    const auto stub_of = [&](IR::LocationDescriptor target) -> u64 {
++        if (const auto have = world.stub_of.find(target); have != world.stub_of.end()) {
++            return mcl::bit_cast<u64>(have->second);
++        }
++        if (world.stub_next == nullptr || static_cast<size_t>(world.stub_end - world.stub_next) < stub_bytes) {
++            // A new run of stubs at the end of the copy's code, zeroed (what is never written
++            // there must not look like an instruction to HenResort::CheckRange).
++            const size_t run = 400 * stub_bytes;
++            if (world.top + run + 1024 * 1024 > world.usable) {
++                return 0;
++            }
++            std::memset(reinterpret_cast<u8*>(world.w) + world.top, 0, run);
++            world.stub_next = reinterpret_cast<CodePtr>(world.x) + world.top;
++            world.stub_end = world.stub_next + run;
++            world.top += run;
++        }
++        const CodePtr stub = world.stub_next;
++        world.stub_next += stub_bytes;
++        HenWriteStub(world.w, world.x, stub, slot_of(target), static_cast<u32>(target.Value()), hen_pc_offset,
++                     world.prelude.hen_exit_unlinked ? world.prelude.hen_exit_unlinked : world.prelude.return_to_dispatcher);
++        world.stub_of.emplace(target, stub);
++        HEN_STAT(world.stubs++;)
++        const size_t at = static_cast<size_t>(stub - reinterpret_cast<CodePtr>(world.x));
++        world.Mark(at, at + stub_bytes);
++        return mcl::bit_cast<u64>(stub);
++    };
++
++    for (const auto& [target, list] : info.block_relocations) {
++        const auto there = world.entries.find(target);
++        const u64 direct = hen_direct_links && there != world.entries.end() ? mcl::bit_cast<u64>(there->second) : 0;
++        for (const auto& [ptr_offset, type] : list) {
++            const CodePtr site = new_entry + ptr_offset;
++            const std::uint8_t kind = type == BlockRelocationType::BranchCompact ? HenResort::LinkCompact
++                                    : type == BlockRelocationType::Branch       ? HenResort::LinkBranch
++                                                                                : HenResort::LinkMove;
++            u64 through = 0;
++            if (direct == 0) {
++                through = kind == HenResort::LinkCompact ? stub_of(target) : slot_of(target);
++                if (through == 0) {
++                    world.fail = "the second code buffer is full";
++                    world.fail_at = descriptor.Value();
++                    return false;
++                }
++                if (hen_direct_links) {
++                    world.pending[target].push_back({site, type, new_entry});
++                }
++                HEN_STAT(world.slot_sites++;)
++            } else {
++                HEN_STAT(world.direct_sites++;)
++            }
++            u32* const words = world.w + static_cast<size_t>(site - reinterpret_cast<CodePtr>(world.x)) / sizeof(u32);
++            if (!HenResort::WriteSite(words, kind, mcl::bit_cast<u64>(site), direct, through, 16, 17)) {
++                world.fail = "a link site of the copy is out of a branch's reach";
++                world.fail_at = descriptor.Value();
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++/// Under the compile lock. The blocks of the log in use that the copy does not have yet, at the
++/// end of the copy in the order compiled, at most limit of them; a target that arrives this way
++/// has its link slot of the copy set, and the copy's sites that wait for it noted for
++/// HenUpgradeLinks. False: given up.
++bool AddressSpace::HenResortAppendNew(HenResortWorld& world, size_t limit) {
++    const size_t first = world.log.size();
++    size_t added = 0;
++    HEN_STAT(const u64 t0 = hen_jit_now_ns();)
++    while (world.log_done < hen_log.size() && added < limit && hen_emu_waiting.load(std::memory_order_relaxed) == 0) {
++        const HenLogEntry entry = hen_log[world.log_done++];
++        if (Get(IR::LocationDescriptor{entry.descriptor}) != entry.entry) {
++            continue;  // (thrown away since it was compiled)
++        }
++        const size_t at = world.top;
++        if (!HenResortAppend(world, entry, at, false)) {
++            return false;
++        }
++        world.top = at + entry.size;
++        added++;
++    }
++    HEN_STAT(const u64 t1 = hen_jit_now_ns();)
++    for (size_t i = first; i < world.log.size(); i++) {
++        const IR::LocationDescriptor descriptor{world.log[i].descriptor};
++        if (!HenResortLink(world, descriptor, world.log[i].entry)) {
++            return false;
++        }
++        if (const auto slot = world.slot_of.find(descriptor); slot != world.slot_of.end()) {
++            (*slot->second)[0] = mcl::bit_cast<u64>(world.log[i].entry);
++            (*slot->second)[1] = mcl::bit_cast<u64>(world.log[i].entry);
++        }
++        if (hen_direct_links && world.pending.contains(descriptor)) {
++            world.ready.push_back(descriptor);
++        }
++    }
++    HEN_STAT(world.copy_ns += t1 - t0;
++    world.link_ns += hen_jit_now_ns() - t1;)
++    return true;
++}
++
++/// Development builds: the copy's blocks from entry from_log of its log on, each against the
++/// block it was copied from, and everything the copy holds against the copy's bounds. nullptr,
++/// or what is wrong. Reads the old write area's words outside link sites, which never change
++/// (an invalidated block's first words do: the caller ignores the answer when blocks were
++/// invalidated meanwhile).
++const char* AddressSpace::HenResortCheck([[maybe_unused]] HenResortWorld& world, [[maybe_unused]] size_t from_log, [[maybe_unused]] u64* where) {
++#if HEN_DEV
++    const HenResort::Bounds bounds{mcl::bit_cast<u64>(world.x), mcl::bit_cast<u64>(world.old_x),
++                                   static_cast<u64>(world.prelude.end_of_prelude), world.top};
++    std::vector<HenResort::Site> sites;
++    std::vector<std::uint8_t> marks;
++    for (size_t i = from_log; i < world.log.size(); i++) {
++        const HenLogEntry& entry = world.log[i];
++        *where = entry.descriptor;
++        const auto info = world.infos.find(entry.entry);
++        const auto listed = world.entries.find(IR::LocationDescriptor{entry.descriptor});
++        const auto reversed = world.reverse.find(entry.entry);
++        const auto published = world.published.find(IR::LocationDescriptor{entry.descriptor});
++        if (info == world.infos.end() || info->second.entry_point != entry.entry || info->second.size != entry.size ||
++            listed == world.entries.end() || listed->second != entry.entry || reversed == world.reverse.end() ||
++            reversed->second.Value() != entry.descriptor || published == world.published.end() || published->second != entry.entry) {
++            return "the copy's tables do not agree about a block";
++        }
++        sites.clear();
++        for (const auto& [ptr_offset, target] : info->second.relocations) {
++            sites.push_back({static_cast<std::uint32_t>(ptr_offset), HenResort::Prelude, 0, 0});
++        }
++        for (const auto& [target, list] : info->second.block_relocations) {
++            const auto there = world.entries.find(target);
++            const u64 direct = hen_direct_links && there != world.entries.end() ? mcl::bit_cast<u64>(there->second) : 0;
++            const auto slot = world.slot_of.find(target);
++            const u64 through = slot != world.slot_of.end() ? mcl::bit_cast<u64>(slot->second) : 0;
++            for (const auto& [ptr_offset, type] : list) {
++                const std::uint8_t kind = type == BlockRelocationType::BranchCompact ? HenResort::LinkCompact
++                                        : type == BlockRelocationType::Branch       ? HenResort::LinkBranch
++                                                                                    : HenResort::LinkMove;
++                sites.push_back({static_cast<std::uint32_t>(ptr_offset), kind, direct, through});
++            }
++        }
++        const size_t new_offset = static_cast<size_t>(entry.entry - reinterpret_cast<CodePtr>(world.x));
++        std::uint32_t at = 0;
++        const char* const why = HenResort::CheckBlock(world.w + new_offset / 4, world.old_w + world.old_offsets[i] / 4, entry.size,
++                                                      mcl::bit_cast<u64>(entry.entry), mcl::bit_cast<u64>(world.old_x) + world.old_offsets[i],
++                                                      sites.data(), sites.size(), bounds, world.w, marks, &at, 16, 17);
++        if (why != nullptr) {
++            return why;
++        }
++    }
++    *where = 0;
++    if (world.entries.size() != world.log.size() || world.infos.size() != world.log.size() || world.reverse.size() != world.log.size() ||
++        world.published.size() != world.log.size()) {
++        return "the copy's tables are not of one size";
++    }
++    {
++        const u64 from = std::max<u64>(world.checked_top, static_cast<u64>(world.prelude.end_of_prelude));
++        u64 at = 0;
++        if (const char* const why = HenResort::CheckRange(world.w, from, world.top, bounds, &at)) {
++            *where = at;
++            return why;
++        }
++    }
++    for (const auto& slot : world.slots) {
++        if (!HenResort::InCopy(slot[0], bounds) || !HenResort::InCopy(slot[1], bounds) || slot[1] == 0) {
++            return "a link slot of the copy holds an address outside the copy";
++        }
++    }
++    for (const auto& [target, stub] : world.stub_of) {
++        if (!HenResort::InCopy(mcl::bit_cast<u64>(stub), bounds)) {
++            return "a link stub of the copy is outside the copy";
++        }
++    }
++    for (const auto& [target, list] : world.pending) {
++        for (const HenSlotSite& site : list) {
++            if (!HenResort::InCopy(mcl::bit_cast<u64>(site.site), bounds) || !world.infos.contains(site.block)) {
++                return "a link site recorded for the copy is outside the copy";
++            }
++        }
++    }
++    u64 fields[sizeof(PreludeInfo) / sizeof(u64)];
++    std::memcpy(fields, &world.prelude, sizeof(PreludeInfo));
++    for (const u64 field : fields) {
++        if (field >= mcl::bit_cast<u64>(world.old_x) && field < mcl::bit_cast<u64>(world.old_x) + world.old_usable) {
++            return "the copy's prelude addresses name the old buffer";
++        }
++    }
++#endif
++    return nullptr;
++}
++
++/// The worker: one bounded step. False: given up (world.fail says why).
++bool AddressSpace::HenResortStep() {
++    HenResortWorld& world = *hen_resort_world;
++    const auto stale = [&]() {
++        if (hen_resort_abort || hen_parked.load(std::memory_order_relaxed)) {
++            world.fail = hen_resort_abort ? hen_resort_abort_why : "the process ended";
++            return true;
++        }
++        return false;
++    };
++    switch (world.phase) {
++    case 0: {
++        // The blocks alive now, in the order compiled.
++        std::scoped_lock big{hen_compile_mutex};
++        if (stale()) {
++            return false;
++        }
++        if (world.items.capacity() < world.snap) {
++            world.items.reserve(world.snap);
++        }
++        for (size_t n = 0; world.cursor < world.snap && n < 4096 && hen_emu_waiting.load(std::memory_order_relaxed) == 0; world.cursor++, n++) {
++            const HenLogEntry& entry = hen_log[world.cursor];
++            if (Get(IR::LocationDescriptor{entry.descriptor}) != entry.entry) {
++                continue;  // (invalidated since it was compiled)
++            }
++            world.items.push_back({entry.descriptor, static_cast<std::uint32_t>(entry.entry - world.old_x), entry.size, 0,
++                                   static_cast<std::uint32_t>(world.cursor), entry.speculative});
++        }
++        if (world.cursor == world.snap) {
++            world.phase = 1;
++        }
++        return true;
++    }
++    case 1: {
++        // Their order and places, and the copy's block table: nothing of the code in use is read.
++        HEN_STAT(const u64 t0 = hen_jit_now_ns();)
++        HenResort::Sort(world.items);
++        const u64 end = HenResort::Assign(world.items, world.top);
++        if (end + 4 * 1024 * 1024 > world.usable) {
++            world.fail = "the second code buffer is full";
++            return false;
++        }
++        world.top = static_cast<size_t>(end);
++        const size_t room = world.items.size() + world.items.size() / 4 + 4096;
++        world.entries.reserve(room);
++        world.published.reserve(room);
++        world.infos.reserve(room);
++        world.log.reserve(room);
++        HEN_STAT(world.old_offsets.reserve(room);)
++        for (const HenResort::Item& item : world.items) {
++            const CodePtr entry = reinterpret_cast<CodePtr>(world.x) + item.new_offset;
++            world.entries.insert_or_assign(IR::LocationDescriptor{item.descriptor}, entry);
++            world.published.insert_or_assign(IR::LocationDescriptor{item.descriptor}, entry);
++        }
++        HEN_STAT(world.figure = HenResort::FigureStart(hen_tag);)
++        world.cursor = 0;
++        world.phase = 2;
++        HEN_STAT(world.copy_ns += hen_jit_now_ns() - t0;)
++        return true;
++    }
++    case 2: {
++        {
++            std::scoped_lock big{hen_compile_mutex};
++            if (stale()) {
++                return false;
++            }
++            const size_t first = world.cursor;
++            HEN_STAT(const u64 t0 = hen_jit_now_ns();)
++            for (size_t n = 0; world.cursor < world.items.size() && n < 256 && hen_emu_waiting.load(std::memory_order_relaxed) == 0; world.cursor++, n++) {
++                const HenResort::Item& item = world.items[world.cursor];
++                const HenLogEntry entry{item.descriptor, world.old_x + item.old_offset, item.size, item.speculative};
++                if (!HenResortAppend(world, entry, item.new_offset, true)) {
++                    return false;
++                }
++            }
++            HEN_STAT(const u64 t1 = hen_jit_now_ns();)
++            for (size_t k = first; k < world.cursor; k++) {
++                const HenResort::Item& item = world.items[k];
++                if (!HenResortLink(world, IR::LocationDescriptor{item.descriptor}, reinterpret_cast<CodePtr>(world.x) + item.new_offset)) {
++                    return false;
++                }
++            }
++            HEN_STAT(world.copy_ns += t1 - t0;
++            world.link_ns += hen_jit_now_ns() - t1;)
++            if (world.cursor == world.items.size()) {
++                world.log_done = world.snap;
++                world.phase = 3;
++            }
++        }
++        HenResortPublish(world, world.phase == 3);
++        return true;
++    }
++    default: {
++        // What was compiled since the snapshot, in rounds, until a round finds nothing new;
++        // then the copy is the emulation thread's.
++        bool level = false;
++        {
++            std::scoped_lock big{hen_compile_mutex};
++            if (stale()) {
++                return false;
++            }
++            if (!HenResortAppendNew(world, 256)) {
++                return false;
++            }
++            level = world.log_done == hen_log.size();
++        }
++        HenResortPublish(world, true);
++        if (!level) {
++            return true;
++        }
++        HEN_STAT(const u64 t0 = hen_jit_now_ns();)
++        u64 where = 0;
++        const char* const wrong = HenResortCheck(world, world.checked, &where);
++        HEN_STAT(world.check_ns += hen_jit_now_ns() - t0;
++        const unsigned number = world.number;
++        size_t ready_blocks = 0;
++        double ready_ms = 0;)
++        {
++        std::scoped_lock big{hen_compile_mutex};
++        if (stale()) {
++            return false;
++        }
++        if (wrong != nullptr) {
++            world.fail = wrong;
++            world.fail_at = where;
++            world.fail_is_check = true;
++            hen_resort_off = true;
++            return false;
++        }
++        world.checked = world.log.size();
++        world.checked_top = world.top;
++        if (world.log_done != hen_log.size()) {
++            // (more was compiled during the check)
++            if (++world.rounds > HenResort::kRounds) {
++                world.fail = "code kept being compiled while the copy was made";
++                return false;
++            }
++            return true;
++        }
++        world.ready_ns = hen_jit_now_ns();
++        hen_resort_ready_ns.store(world.ready_ns);
++        HenResortUnclaim();  // (built and published: another address space may begin its copy)
++        HEN_STAT(ready_blocks = world.log.size();
++        ready_ms = (world.ready_ns - world.start_ns) / 1e6;)
++        hen_resort_state.store(3);
++        }
++        // (The copy is the emulation thread's from here: nothing of the world is read. This line
++        // comes before the full one, which follows the change-over: if the program ends between
++        // the two, it is what says a re-sort was the last thing done.)
++        HEN_STAT(std::printf("hen: resort: #%u JIT 0x%03x: a copy of %zu blocks is ready after %.0f ms; the emulation thread changes over at its "
++                    "next slice\n",
++                    number, static_cast<unsigned>(hen_tag), ready_blocks, ready_ms);)
++        return true;
++    }
++    }
++}
++
++void AddressSpace::HenResortSwitch() {
++    HEN_STAT(const u64 t0 = hen_jit_now_ns();)
++    HenEmuLock hen_lock{*this};
++    if (hen_resort_state.load() != 3 || hen_resort_world == nullptr) {
++        return;
++    }
++    HenResortWorld& world = *hen_resort_world;
++    const auto give_up = [&](const char* why, bool check) {
++        world.fail = why;
++        world.fail_is_check = check;
++        if (check) {
++            hen_resort_off = true;
++        }
++        hen_resort_state.store(5);
++        HenResortWakeWorker();
++    };
++    if (hen_resort_abort || hen_parked.load(std::memory_order_relaxed)) {
++        give_up(hen_resort_abort ? hen_resort_abort_why : "the process ended", false);
++        return;
++    }
++    if (hen_on_worker || protect_deferred || !hen_batch_new.empty() || !hen_deferred_slots.empty() ||
++        world.old_w != mem.wptr() || world.old_x != reinterpret_cast<CodePtr>(mem.xptr())) {
++        give_up("the address space was not at rest at the change-over", false);
++        return;
++    }
++    if (hen_log.size() - world.log_done > HenResort::kCatchUp) {
++        // Too much has been compiled since the worker's last round to add here: its again.
++        if (++world.rounds > HenResort::kRounds) {
++            give_up("code kept being compiled while the copy was made", false);
++            return;
++        }
++        hen_resort_state.store(2);
++        HenResortWakeWorker();
++        return;
++    }
++    const size_t log_before = world.log.size();
++    try {
++        while (world.log_done < hen_log.size()) {
++            if (!HenResortAppendNew(world, ~size_t(0))) {
++                give_up(world.fail, false);
++                return;
++            }
++        }
++    } catch (const std::bad_alloc&) {
++        // (the copy's tables could not grow; nothing of the code in use has changed yet)
++        give_up("no memory for the copy's tables", false);
++        return;
++    }
++    hen_resort_at_switch = world.log.size() - log_before;
++#if HEN_DEV
++    if (hen_resort_at_switch != 0) {
++        u64 where = 0;
++        if (const char* const wrong = HenResortCheck(world, log_before, &where)) {
++            world.fail_at = where;
++            give_up(wrong, true);
++            return;
++        }
++    }
++#endif
++    HenResortPublish(world, true);
++
++    // From here on nothing can fail: the copy becomes the code in use, and the world keeps what
++    // the old code needed for the worker to free.
++    world.jit = mem.HenSwap(world.jit);
++    code_cache_size = world.usable;  // (the same unless this was a growth)
++    hen_resort_spare = nullptr;  // (it is the buffer in use now; the worker decides about the old one)
++    hen_resort_idle_abandons = 0;
++    code.~CodeGenerator();
++    new (&code) oaknut::CodeGenerator(mem.wptr(), mem.xptr());
++    code.set_offset(static_cast<std::ptrdiff_t>(world.top));
++    std::swap(prelude_info, world.prelude);
++    std::swap(hen_defer_stub, world.defer_stub);
++    block_entries.swap(world.entries);
++    {
++        std::scoped_lock lookup{hen_lookup_mutex};
++        hen_published.swap(world.published);
++    }
++    reverse_block_entries.swap(world.reverse);
++    block_infos.swap(world.infos);
++    block_references.swap(world.references);
++    hen_link_slots.swap(world.slots);
++    hen_link_slot_of.swap(world.slot_of);
++    hen_link_stub_of.swap(world.stub_of);
++    hen_tombstoned.swap(world.tombstoned);
++    hen_pending_sites.swap(world.pending);
++    hen_ready_targets.swap(world.ready);
++    hen_ready_count.store(hen_ready_targets.size(), std::memory_order_relaxed);
++    hen_stub_next = world.stub_next;
++    hen_stub_end = world.stub_end;
++    hen_stub_dirty = world.stub_next;
++    hen_log.swap(world.log);
++    hen_log_count.store(hen_log.size(), std::memory_order_relaxed);
++    hen_log_bytes.store(world.sorted_bytes + world.appended_bytes, std::memory_order_relaxed);
++    hen_log_unsorted_bytes.store(world.appended_bytes, std::memory_order_relaxed);
++    HenResortCounts(world.sorted_blocks, world.sorted_bytes, world.appended_blocks, world.appended_bytes);
++    hen_resort_window_count = hen_log.size();
++    // (the dispatcher's table holds entry points of the old code; not counted as "emptied",
++    // which is the report's word for invalidations)
++    for (size_t i = 0; i < dispatch_table_size; i++) {
++        dispatch_table[i] = {~u64(0), nullptr};
++    }
++    HEN_STAT(hen_resort_pause_ns = hen_jit_now_ns() - t0;)
++    hen_resort_state.store(4);
++    HenResortWakeWorker();
++}
++
++/// The worker: the end of a re-sort either way. Frees what is no longer needed, reports, and
++/// lets the next one begin.
++void AddressSpace::HenResortFinish(bool switched) {
++    HenResortWorld* world = nullptr;
++    const char* abort_why = "";
++    {
++        std::scoped_lock big{hen_compile_mutex};
++        world = hen_resort_world;
++        hen_resort_world = nullptr;
++        abort_why = hen_resort_abort ? hen_resort_abort_why : "";
++    }
++    HEN_STAT(const u64 now = hen_jit_now_ns();)
++    const unsigned number = world != nullptr ? world->number : 0;
++    HEN_STAT(const double at_s = world != nullptr ? (world->start_ns - hen_resort_origin()) / 1e9 : 0.0;)
++    if (switched && world != nullptr) {
++        // world->jit is the old buffer now, and the world's tables are the old code's.
++        HEN_STAT(const size_t pause_us = static_cast<size_t>(hen_resort_pause_ns / 1000);
++        hen_resort_note_pause(pause_us);)
++        hen_resort_note(4, 1);
++#if HEN_DEV
++        if (hen_resort_poison) {
++            // Anything that still led into the old code would go on working by accident: it is
++            // filled with an instruction that faults.
++            const size_t words = world->old_top / sizeof(u32);
++            u32* const old_write = hen_jit_wptr(world->jit);
++            for (size_t i = 0; i < words; i++) {
++                old_write[i] = 0xD4200000u | (0x56u << 5);  // BRK #0x56
++            }
++            unsigned long long ns = 0, longest = 0;
++            unsigned requests = 0;
++            hen_jit_resort_publish(world->jit, 0, world->old_top, &ns, &requests, &longest);
++        }
++#endif
++        if (world->grow_from != 0) {
++            std::printf("hen: resort: #%u JIT 0x%03x: its code buffer grew from %zu to %zu MiB (it was %zu KiB full)\n",
++                        number, static_cast<unsigned>(hen_tag), world->grow_from >> 20, world->usable >> 20, world->old_top >> 10);
++        }
++        // (a buffer of another size is of no use to the next re-sort)
++        const bool release = hen_resort_release != 0 || world->grow_from != 0;
++        if (release) {
++            hen_jit_destroy(world->jit);
++            hen_resort_spare = nullptr;
++        } else {
++            hen_resort_spare = world->jit;
++        }
++        HEN_STAT(std::printf("hen: resort: #%u JIT 0x%03x started at %.1f s, %zu blocks %zu KiB, built in %.0f ms on the worker (copy %.1f ms, "
++                    "relink %.1f ms, publish %.1f ms in %u requests, longest %.2f ms; mapping the buffer %.1f ms, checks %.1f ms), "
++                    "switch paused the emulation thread %zu us, %zu blocks appended in compile order after the snapshot (%zu of "
++                    "them at the switch), figure %016llx, old buffer %s; %zu link sites direct, %zu through slots, %zu stubs; "
++                    "code %zu -> %zu KiB; waited %.1f ms for the slice boundary\n",
++                    number, static_cast<unsigned>(hen_tag), at_s, world->sorted_blocks, static_cast<size_t>(world->sorted_bytes >> 10),
++                    (world->ready_ns - world->start_ns) / 1e6, world->copy_ns / 1e6, world->link_ns / 1e6, world->publish_ns / 1e6,
++                    world->publish_requests, world->publish_longest_ns / 1e6, world->map_ns / 1e6, world->check_ns / 1e6, pause_us,
++                    world->appended_blocks, hen_resort_at_switch, static_cast<unsigned long long>(world->figure),
++                    release ? "released" : "kept", world->direct_sites, world->slot_sites, world->stubs, world->old_top >> 10,
++                    world->top >> 10, (now - world->ready_ns) / 1e6);)
++    } else {
++        const char* why = world != nullptr && world->fail != nullptr ? world->fail : abort_why[0] != 0 ? abort_why : "no reason recorded";
++        const bool check = world != nullptr && world->fail_is_check;
++        hen_resort_note(check ? 6 : 5, 1);
++        // The second buffer goes back to the heap with the copy: 258 MiB that a JIT
++        // whose copy was not taken (an idle module's, most often) held until the title ended.
++        // The next re-sort makes one again (about 5 ms on this thread). A running JIT whose copy
++        // went stale (blocks invalidated, code still being compiled) keeps its buffer.
++        if (hen_resort_spare != nullptr && (hen_resort_idle_abandons != 0 || hen_resort_off)) {
++            hen_jit_destroy(hen_resort_spare);
++            hen_resort_spare = nullptr;
++        }
++#if HEN_DEV
++        std::printf("hen: resort: #%u JIT 0x%03x started at %.1f s, abandoned after %.0f ms: %s%s (at %016llx); the code in use is "
++                    "unchanged%s\n",
++                    number, static_cast<unsigned>(hen_tag), at_s, world != nullptr ? (now - world->start_ns) / 1e6 : 0.0,
++                    check ? "check failed: " : "", why, world != nullptr ? static_cast<unsigned long long>(world->fail_at) : 0ull,
++                    hen_resort_off ? "; no more re-sorts for this JIT" : "");
++#else
++        std::printf("hen: resort: #%u JIT 0x%03x abandoned: %s%s (at %016llx); the code in use is unchanged%s\n",
++                    number, static_cast<unsigned>(hen_tag), check ? "check failed: " : "", why,
++                    world != nullptr ? static_cast<unsigned long long>(world->fail_at) : 0ull,
++                    hen_resort_off ? "; no more re-sorts for this JIT" : "");
++#endif
++    }
++    delete world;
++    hen_grow_target = 0;
++    HenResortUnclaim();
++    hen_resort_state.store(0);
++}
++
++/// From the destructor, after the worker has ended.
++void AddressSpace::HenResortDestroy() {
++    HenResortUnclaim();
++    hen_resort_state.store(0);
++    if (hen_resort_world != nullptr) {
++        if (hen_resort_world->jit != nullptr && hen_resort_world->jit != hen_resort_spare) {
++            hen_jit_destroy(hen_resort_world->jit);  // (changed over, not yet cleared up: the old buffer)
++        }
++        delete hen_resort_world;
++        hen_resort_world = nullptr;
++    }
++    if (hen_resort_spare != nullptr) {
++        hen_jit_destroy(hen_resort_spare);
++        hen_resort_spare = nullptr;
++    }
++    HenResortCounts(0, 0, 0, 0);
++}
++#else
++struct AddressSpace::HenResortWorld {};
++void AddressSpace::HenResortCounts(u64, u64, u64, u64) {}
++void AddressSpace::HenResortUnclaim() {}
++void AddressSpace::HenResortWakeWorker() {}
++void AddressSpace::HenResortNoteAbort(const char*) {}
++void AddressSpace::HenResortTick(u64) {}
++void AddressSpace::HenResortSwitch() {}
++void AddressSpace::HenResortWork() {}
++bool AddressSpace::HenResortBegin() { return false; }
++bool AddressSpace::HenResortStep() { return false; }
++void AddressSpace::HenResortFinish(bool) {}
++bool AddressSpace::HenResortAppend(HenResortWorld&, const HenLogEntry&, size_t, bool) { return false; }
++bool AddressSpace::HenResortLink(HenResortWorld&, IR::LocationDescriptor, CodePtr) { return false; }
++bool AddressSpace::HenResortAppendNew(HenResortWorld&, size_t) { return false; }
++void AddressSpace::HenResortPublish(HenResortWorld&, bool) {}
++const char* AddressSpace::HenResortCheck(HenResortWorld&, size_t, u64*) { return nullptr; }
++void AddressSpace::HenResortDestroy() {}
++bool AddressSpace::HenCanGrow() const { return false; }
++bool AddressSpace::HenSliceStartWanted() const { return false; }
++void AddressSpace::HenSliceStart() {}
++void AddressSpace::HenClearNow(const char*) {}
++#endif
++
+ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+     {
+         const auto host_ptr = mcl::bit_cast<CodePtr>(host_pc);
 diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
-index 835566b..6596a20 100644
+index 835566b..b4f6a65 100644
 --- a/src/dynarmic/backend/arm64/address_space.h
 +++ b/src/dynarmic/backend/arm64/address_space.h
 @@ -5,7 +5,16 @@
@@ -1977,7 +3623,46 @@ index 835566b..6596a20 100644
  #include <optional>
  
  #include <mcl/stdint.hpp>
-@@ -28,6 +37,10 @@ public:
+@@ -20,6 +29,38 @@
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/location_descriptor.h"
+ 
++// (Azahar's Switch 2 port) Statements that only feed the development builds' statistics are
++// written inside HEN_STAT(): the other builds compile none of them, so they count nothing and
++// read no clock for it.
++#if defined(__SWITCH__) && HEN_DEV
++#define HEN_STAT(...) __VA_ARGS__
++#else
++#define HEN_STAT(...)
++#endif
++
++namespace Dynarmic::Backend::Arm64 {
++// (Azahar's Switch 2 port) The code buffer of an address space, which a re-sort replaces
++// by another (AddressSpace::HenResortSwitch): on Switch a buffer is a hen_jit (Azahar's
++// hen/jit/hen_jit.c), and the block can be made to stand for another one.
++#if defined(__SWITCH__)
++struct HenCodeBlock : oaknut::CodeBlock {
++    using oaknut::CodeBlock::CodeBlock;
++    hen_jit* HenBuffer() const { return m_jit; }
++    /// The block is other from now on; returns the buffer it was.
++    /// The buffer's write area was replaced by a longer one (hen_jit_write_full).
++    void HenRefresh() { m_memory = hen_jit_wptr(m_jit); }
++    hen_jit* HenSwap(hen_jit* other) {
++        hen_jit* const was = m_jit;
++        m_jit = other;
++        m_memory = hen_jit_wptr(other);
++        return was;
++    }
++};
++#else
++using HenCodeBlock = oaknut::CodeBlock;
++#endif
++}  // namespace Dynarmic::Backend::Arm64
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
+ class AddressSpace {
+@@ -28,6 +69,10 @@ public:
      virtual ~AddressSpace();
  
      virtual IR::Block GenerateIR(IR::LocationDescriptor) const = 0;
@@ -1988,25 +3673,65 @@ index 835566b..6596a20 100644
  
      CodePtr Get(IR::LocationDescriptor descriptor);
  
-@@ -38,6 +51,16 @@ public:
+@@ -37,20 +82,288 @@ public:
+     // Returns "most likely" entry_point associated with the emitted code at that location
      CodePtr ReverseGetEntryPoint(CodePtr host_pc);
  
-     CodePtr GetOrEmit(IR::LocationDescriptor descriptor);
+-    CodePtr GetOrEmit(IR::LocationDescriptor descriptor);
++    /// must (Azahar's Switch 2 port): the interpreter has refused the block, so "interpret
++    /// it" is no answer for it. See "A full code buffer" below.
++    CodePtr GetOrEmit(IR::LocationDescriptor descriptor, bool must = false);
 +    /// (Azahar's Switch 2 port) Interpreter first: the block if it is compiled; otherwise it
 +    /// is queued for the compile worker and the answer is hen_defer_stub, which leaves the
 +    /// generated code with HaltReason::UserDefined2 so the caller can interpret the block.
 +    /// A block asked for more than hen_tier times is compiled here after all.
-+    /// peek: only ask (hen_defer_stub: interpret it, the visit is counted; anything else: enter
-+    /// the generated code as usual, nothing was counted).
-+    CodePtr HenGetOrDefer(IR::LocationDescriptor descriptor, bool peek = false);
++    CodePtr HenGetOrDefer(IR::LocationDescriptor descriptor);
 +    CodePtr hen_defer_stub = nullptr;
 +    bool hen_tier_ready = false;
 +    tsl::robin_map<IR::LocationDescriptor, u16> hen_visits;
  
      void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
  
-@@ -45,12 +68,138 @@ public:
+     void ClearCache();
  
++    // (Azahar's Switch 2 port) A full code buffer.
++    //
++    // Upstream's Emit() throws the whole cache away when less than 1 MiB is left, from wherever
++    // it is called: most often from the dispatcher's lookup, with generated code on the stack.
++    // The return stack buffer on that stack then still holds addresses of the old code, and the
++    // link slots old code reads are freed (never seen to go wrong: no cache was ever cleared
++    // on the console). Here nothing is cleared inside a slice:
++    //   - GetOrEmit, finding less than hen_full_room left, compiles nothing and answers
++    //     hen_defer_stub: the block is interpreted, as a block the worker has not compiled yet
++    //     is. hen_full is set.
++    //   - A block the interpreter cannot run (must) is still compiled while more than
++    //     hen_full_floor is left: the room between the two is kept for those.
++    //   - At the start of the next slice (HenSliceStart, from Jit::Run and Jit::Step before
++    //     generated code is entered, where a re-sorted copy is changed over to as well): if the
++    //     buffer can still grow (--jit-buffer-grow, a re-sort into a larger one, which the tick
++    //     asks for at once when hen_full is set), nothing is done for up to hen_full_wait_ns and
++    //     new blocks go on being interpreted until the change-over; otherwise, or when even the
++    //     floor is gone, the cache is cleared there. No host code address of this address space
++    //     is live at that point (see HenResortSwitch).
++    //   - Compiling ahead (the worker, the list, the frontier) stops with at least 2 MiB left, so
++    //     only blocks the program is at reach the last of the room.
++    static constexpr size_t hen_full_room = 3 * 512 * 1024;
++    static constexpr size_t hen_full_floor = 512 * 1024;
++    static constexpr u64 hen_full_wait_ns = 3'000'000'000ull;
++    std::atomic<bool> hen_full{false};         ///< blocks are being interpreted for lack of room
++    std::atomic<bool> hen_clear_wanted{false}; ///< clear at the next slice start whatever else
++    u64 hen_full_since_ns = 0;
++    u64 hen_full_interpreted = 0;
++    bool hen_clear_at_done = false;            ///< (--jit-clear-at)
++    /// What Jit::Run looks at before every slice (cheap): whether HenSliceStart has work.
++    bool HenSliceStartWanted() const;
++    void HenSliceStart();
++    bool HenCanGrow() const;
++    /// Under the compile lock, between two slices only.
++    void HenClearNow(const char* why);
++    /// At least 2 MiB: the room compiling ahead leaves (bytes: the figure for a 124 MiB buffer).
++    size_t HenAheadRoom(size_t bytes) const;
++
      void DumpDisassembly() const;
  
 +    // Azahar's Switch 2 port: a table the dispatcher looks compiled blocks up in without
@@ -2056,7 +3781,99 @@ index 835566b..6596a20 100644
 +    size_t HenCompileFrontier(u64 deadline_ns);
 +    size_t HenUpgradeLinks(u64 deadline_ns, size_t max_sites);
 +
++    // (Azahar's Switch 2 port) A JIT kept after its process has ended, to be
++    // handed to a later process that is the same program at the same addresses (Azahar's
++    // core/arm/dynarmic/arm_dynarmic.cpp, "Parked JITs"; the embedder gives the new process
++    // the page table this JIT was made for).
++    /// The process has ended. From the emulation thread: waits for the worker's batch in
++    /// progress, empties everything queued for it, and nothing is compiled from then on (not
++    /// by the worker, not from a list, not along branches) until HenRevalidate.
++    void HenPark();
++    /// The page table has the new process's code. Every block whose guest code no longer
++    /// hashes to what it was compiled from (hen_block_code), or that has no such record, is
++    /// invalidated as a write to its code would have; the worker may compile again.
++    /// From the emulation thread, outside generated code.
++    /// @returns the number of blocks kept; *dropped: how many were invalidated
++    size_t HenRevalidate(size_t* dropped);
++    std::atomic<bool> hen_parked{false};
++
++    // (Azahar's Switch 2 port) The background re-sort: address_space.cpp,
++    // "Re-sorting the code in the background"; the method and the numbers are in Azahar's
++    // hen/jit/hen_resort.h.
++    /// Once a frame, from the emulation thread (it may be inside generated code's callbacks:
++    /// only counts are read): decides whether a re-sort is to begin, and asks the worker.
++    void HenResortTick(u64 now_ns);
++    /// From the emulation thread between two slices (Jit::Run, before generated code is
++    /// entered: no host code address of this address space is live anywhere then), when
++    /// hen_resort_state says a copy is ready: adds what was compiled since, and changes over.
++    void HenResortSwitch();
++    /// 0 nothing, 1 asked for, 2 the worker is building a copy, 3 the copy is ready for the
++    /// emulation thread, 4 changed over (the worker clears up and reports), 5 given up (the
++    /// worker clears up).
++    std::atomic<int> hen_resort_state{0};
++    /// Slices begun (Jit::Run, the emulation thread's): a JIT that is not running gets no re-sort.
++    u64 hen_resort_runs = 0;
++
  protected:
++    struct HenResortWorld;
++    struct PreludeInfo;
++    HenResortWorld* hen_resort_world = nullptr;  ///< the copy in the making (the worker's; the emulation thread's in state 3)
++    struct hen_jit* hen_resort_spare = nullptr;  ///< the buffer not in use, kept for the next re-sort
++    /// Every block in the order compiled (under the compile lock); after a re-sort the sorted
++    /// part comes first and then what was compiled since.
++    struct HenLogEntry {
++        u64 descriptor;
++        CodePtr entry;
++        u32 size;
++        u8 speculative;
++    };
++    std::vector<HenLogEntry> hen_log;
++    std::atomic<u64> hen_log_count{0}, hen_log_bytes{0};  ///< (the same, for the emulation thread's tick)
++    std::atomic<u64> hen_log_unsorted_bytes{0};
++    bool hen_emit_speculative = false;  ///< (under the compile lock) the block being emitted was not asked for
++    std::atomic<bool> hen_list_busy{false};  ///< the worker took its last block from the saved list
++    bool hen_resort_abort = false;       ///< (under the compile lock) blocks were invalidated or thrown away: the copy is stale
++    const char* hen_resort_abort_why = "";
++    bool hen_resort_wake = false;        ///< (under hen_worker_mutex) the worker is to look at hen_resort_state
++    bool hen_resort_off = false;         ///< a check failed: no more re-sorts for this address space
++    u64 hen_resort_window_ns = 0, hen_resort_window_count = 0, hen_resort_window_blocks = 0;
++    bool hen_resort_window_known = false;
++    u64 hen_resort_last_start_ns = 0;
++    unsigned hen_resort_idle_abandons = 0;  ///< copies in a row this JIT ran no slice to take
++    size_t hen_grow_target = 0;  ///< the re-sort asked for is into a buffer of this size (0: the same size)
++    /// A size that was chosen for a 124 MiB buffer, for this buffer: the same from 124 MiB
++    /// up, in proportion below.
++    size_t HenScaled(size_t bytes) const;
++    bool hen_resort_at_done = false;
++    u64 hen_resort_window_runs = 0;      ///< hen_resort_runs when the window began
++    bool hen_resort_window_ran = false;  ///< slices were begun in the last whole window
++    std::atomic<u64> hen_resort_ready_ns{0};   ///< when the copy became ready for the emulation thread
++    std::atomic<bool> hen_resort_claimed{false};  ///< this address space holds hen_jit.c's one claim on making a copy
++    void HenResortUnclaim();
++    u64 hen_resort_pause_ns = 0;         ///< of the last change-over (for the worker's report)
++    size_t hen_resort_at_switch = 0;     ///< blocks the change-over itself added
++    u64 hen_resort_mine[4] = {};         ///< (under the compile lock) this address space's part of hen_jit.c's totals
++    void HenResortCounts(u64 sorted_blocks, u64 sorted_bytes, u64 unsorted_blocks, u64 unsorted_bytes);
++    void HenResortDestroy();
++    void HenResortNoteAbort(const char* why);
++    void HenResortWakeWorker();
++    void HenResortWork();
++    bool HenResortBegin();
++    bool HenResortStep();
++    void HenResortFinish(bool switched);
++    bool HenResortAppend(HenResortWorld& world, const HenLogEntry& entry, size_t new_offset, bool sorted);
++    bool HenResortLink(HenResortWorld& world, IR::LocationDescriptor descriptor, CodePtr new_entry);
++    bool HenResortAppendNew(HenResortWorld& world, size_t limit);
++    void HenResortPublish(HenResortWorld& world, bool all);
++    const char* HenResortCheck(HenResortWorld& world, size_t from_log, u64* where);
++    void HenLinkRelocations(const EmittedBlockInfo& block_info, CodePtr entry_point, u32* wmem, u32* xmem, const PreludeInfo& prelude);
++
++    /// What each compiled block was made from (HenRecord), for HenRevalidate.
++    struct HenCodeOf {
++        u32 hash;
++        u32 words;
++    };
++    mutable tsl::robin_map<IR::LocationDescriptor, HenCodeOf> hen_block_code;
 +    virtual std::optional<u32> HenReadCode(u32) const { return std::nullopt; }
 +    bool HenHash(u32 pc, u32 words, u32& hash) const;
 +    void HenRecord(IR::LocationDescriptor descriptor, IR::LocationDescriptor end, bool speculative = false) const;
@@ -2078,9 +3895,6 @@ index 835566b..6596a20 100644
 +    };
 +    void HenStopWorker();
 +    void HenQueueTranslation(IR::LocationDescriptor descriptor);
-+    /// The worker's translation of a block, if it has one that still matches the program's code.
-+    std::unique_ptr<HenTranslated> HenTakeTranslation(IR::LocationDescriptor descriptor);
-+    bool HenHasTranslation(IR::LocationDescriptor descriptor);
 +    void HenWorkerMain();
 +    pthread_t hen_worker{};
 +    bool hen_worker_started = false;
@@ -2091,6 +3905,10 @@ index 835566b..6596a20 100644
 +    std::vector<IR::LocationDescriptor> hen_worker_hot;  // asked for again (hen_bump visits): first, and published at once
 +    std::vector<IR::LocationDescriptor> hen_worker_todo;                                  // newest last
 +    tsl::robin_set<IR::LocationDescriptor> hen_worker_seen;                               // queued, in work, done or refused
++    /// Those of hen_worker_seen that were refused (the memory was not there, the bytes
++    /// were not code): forgotten at the next invalidation, after which either may have changed.
++    tsl::robin_set<IR::LocationDescriptor> hen_worker_refused;
++    void HenForgetRefusals();
 +    tsl::robin_map<IR::LocationDescriptor, std::unique_ptr<HenTranslated>> hen_worker_done;
 +    /// Branches between a block the program asked for and a block not compiled yet (the least
 +    /// seen); the worker translates up to hen_worker_depth.
@@ -2100,6 +3918,7 @@ index 835566b..6596a20 100644
 +    /// that changes or reads the blocks takes this, on either thread.
 +    std::recursive_mutex hen_compile_mutex;
 +    std::atomic<int> hen_emu_waiting{0};  ///< the emulation thread wants the mutex: the worker ends its batch
++    std::atomic<u32> hen_defers{0};       ///< times the program was sent to the interpreter (HenGetOrDefer): a batch grows past eight blocks only while this stands still
 +    bool hen_on_worker = false;           ///< (under the mutex) the worker is compiling a batch
 +    /// Link-slot stores of the worker's batch, made once its code has been published.
 +    std::vector<std::tuple<std::array<u64, 2>*, u64, u64>> hen_deferred_slots;
@@ -2109,7 +3928,7 @@ index 835566b..6596a20 100644
 +    std::mutex hen_lookup_mutex;
 +    tsl::robin_map<IR::LocationDescriptor, CodePtr> hen_published;
 +    /// Every location a compiled block has named as a branch target (for the miss statistics).
-+    tsl::robin_set<IR::LocationDescriptor> hen_known_targets;
++    HEN_STAT(tsl::robin_set<IR::LocationDescriptor> hen_known_targets;)
 +    std::vector<std::pair<IR::LocationDescriptor, CodePtr>> hen_batch_new;
 +    /// The frontier has blocks for the worker (it takes them when nothing nearer is queued).
 +    std::atomic<bool> hen_frontier_work{false};
@@ -2119,11 +3938,11 @@ index 835566b..6596a20 100644
 +    static void HenLockNote(unsigned long long ns);
 +    struct HenEmuLock {
 +        explicit HenEmuLock(AddressSpace& self_) : self(self_) {
-+            const auto t0 = HenLockClock();
++            HEN_STAT(const auto t0 = HenLockClock();)
 +            self.hen_emu_waiting.fetch_add(1, std::memory_order_relaxed);
 +            self.hen_compile_mutex.lock();
 +            self.hen_emu_waiting.fetch_sub(1, std::memory_order_relaxed);
-+            HenLockNote(HenLockClock() - t0);
++            HEN_STAT(HenLockNote(HenLockClock() - t0);)
 +        }
 +        ~HenEmuLock() { self.hen_compile_mutex.unlock(); }
 +        AddressSpace& self;
@@ -2144,8 +3963,11 @@ index 835566b..6596a20 100644
          mem.protect();
  #endif
      }
-@@ -66,9 +215,43 @@ protected:
+@@ -64,13 +377,47 @@ protected:
+     size_t GetRemainingSize();
+     EmittedBlockInfo Emit(IR::Block ir_block);
      void Link(EmittedBlockInfo& block);
++    static void HenWriteStub(u32* wmem, u32* xmem, CodePtr stub, u64 slot, u32 pc, size_t pc_offset, void* exit);
      void LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list);
      void RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr);
 +    std::array<u64, 2>* HenLinkSlot(IR::LocationDescriptor target);
@@ -2168,12 +3990,13 @@ index 835566b..6596a20 100644
 +    tsl::robin_map<IR::LocationDescriptor, std::vector<HenSlotSite>> hen_pending_sites;
 +    std::vector<IR::LocationDescriptor> hen_ready_targets;
 +    std::atomic<size_t> hen_ready_count{0};
-+    unsigned hen_upgrade_skips = 0;
 +    size_t hen_pc_offset = 0;  // (of the program counter in the state: set by the A32 address space)
 +    void HenWriteLinkSites(const CodePtr entry_point, IR::LocationDescriptor target, const std::vector<BlockRelocation>& block_relocations_list);
  
      FakeCall FastmemCallback(u64 host_pc);
  
+-    const size_t code_cache_size;
+-    oaknut::CodeBlock mem;
 +    // Where making code executable is expensive (Switch 2 homebrew: a remap through a system
 +    // service per change, see Azahar's hen/jit/hen_jit.c), GetOrEmit also compiles the blocks the
 +    // new block links to, up to this many, and makes them all executable at once.
@@ -2185,10 +4008,12 @@ index 835566b..6596a20 100644
 +#endif
 +    bool protect_deferred = false;
 +
-     const size_t code_cache_size;
-     oaknut::CodeBlock mem;
++    size_t code_cache_size;  // (Azahar: no longer const: a buffer can be replaced by a larger one)
++    HenCodeBlock mem;
      oaknut::CodeGenerator code;
-@@ -79,6 +262,9 @@ protected:
+ 
+     // A IR::LocationDescriptor will have one current CodePtr.
+@@ -79,18 +426,31 @@ protected:
      std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
      tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
      tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
@@ -2198,7 +4023,15 @@ index 835566b..6596a20 100644
  
      ExceptionHandler exception_handler;
      FastmemManager fastmem_manager;
-@@ -91,6 +277,13 @@ protected:
+ 
+     struct PreludeInfo {
+         std::ptrdiff_t end_of_prelude;
++        /// Where the prelude holds the address of return_to_dispatcher as data (what a
++        /// slice's return stack is filled with): the one address of its own code it contains.
++        std::ptrdiff_t hen_rtd_literal = 0;
+ 
+         using RunCodeFuncType = HaltReason (*)(CodePtr entry_point, void* jit_state, volatile u32* halt_reason);
+         RunCodeFuncType run_code;
          RunCodeFuncType step_code;
          void* return_to_dispatcher;
          void* return_from_run_code;
@@ -2212,6 +4045,16 @@ index 835566b..6596a20 100644
  
          void* read_memory_8;
          void* read_memory_16;
+@@ -132,7 +492,8 @@ protected:
+         void* get_cntpct;
+         void* add_ticks;
+         void* get_ticks_remaining;
+-    } prelude_info;
++    } prelude_info{};  // (the fields an address space never sets are null, not whatever the memory held: a
++                       // re-sort's checks read every field as a possible address)
+ };
+ 
+ }  // namespace Dynarmic::Backend::Arm64
 diff --git a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
 index 1ecb542..69a9ce2 100644
 --- a/src/dynarmic/backend/arm64/emit_arm64.cpp
@@ -2890,10 +4733,10 @@ index 24b5797..c81e6cb 100644
              if (const auto vfp_decoder = DecodeVFP<TranslatorVisitor>(*arm_instruction)) {
                  should_continue = vfp_decoder->get().call(visitor, *arm_instruction);
 diff --git a/src/dynarmic/interface/A32/a32.h b/src/dynarmic/interface/A32/a32.h
-index e1c5b40..96b30d7 100644
+index e1c5b40..d014013 100644
 --- a/src/dynarmic/interface/A32/a32.h
 +++ b/src/dynarmic/interface/A32/a32.h
-@@ -89,6 +89,23 @@ public:
+@@ -89,6 +89,22 @@ public:
          return is_executing;
      }
  
@@ -2903,16 +4746,15 @@ index e1c5b40..96b30d7 100644
 +    void HenSetTag(std::uint16_t tag);
 +    std::size_t HenCompileFrontier(std::uint64_t deadline_ns);
 +    std::size_t HenUpgradeLinks(std::uint64_t deadline_ns, std::size_t max_sites);
++    /// Backend::Arm64::AddressSpace::HenResortTick: once a frame, from the thread that runs this JIT.
++    void HenResortTick(std::uint64_t now_ns);
 +    std::size_t HenPrecompile(const void* blocks, std::uint8_t* state, std::size_t count, std::uint64_t deadline_ns, std::size_t* compiled);
-+    /// Interpreter first (AddressSpace::HenGetOrDefer), for a caller that has just interpreted a
-+    /// block and has written the new PC, CPSR and FPSCR here: true if Run() would only come
-+    /// back with UserDefined2 for the block at this location (not compiled yet, to be
-+    /// interpreted). The visit is then counted and the block queued exactly as Run() would
-+    /// have, so Run() must not be called for it as well. False (nothing counted): call Run().
-+    /// Always false with a halt or a cache invalidation pending. Not while executing.
-+    bool HenPeekDefer();
 +    /// The same list, for the compile worker instead (AddressSpace::HenSetList).
 +    void HenSetList(const void* blocks, std::uint8_t* state, std::size_t count);
++    /// (Azahar's Switch 2 port) The process this JIT ran has ended and the JIT is kept for a
++    /// later one: see Backend::Arm64::AddressSpace::HenPark and HenRevalidate.
++    void HenPark();
++    std::size_t HenRevalidate(std::size_t* dropped);
 +
      /// Debugging: Dump a disassembly all compiled code to the console.
      void DumpDisassembly() const;

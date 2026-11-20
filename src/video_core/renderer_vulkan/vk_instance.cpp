@@ -7,6 +7,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/hen_frame_work.h"
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/custom_textures/custom_format.h"
@@ -14,6 +15,24 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
+
+#ifdef __SWITCH__
+#include <cstdio>
+#include <mutex>
+extern "C" int hen_vma_small_blocks; // hen/jit/hen_jit.c: --no-vma-small-blocks
+// since the last report: images made, in memory of their own, bound into memory over 8 MiB;
+// the most blocks and bytes held; and the first three again over the whole title
+extern "C" unsigned long long hen_image_memory_stats[8];
+namespace {
+constexpr VkDeviceSize HEN_VMA_BLOCK_BYTES = 8ull << 20;
+std::mutex hen_image_memory_mutex;
+VmaAllocator hen_image_memory_allocator = nullptr;
+} // namespace
+namespace Vulkan {
+void HenNoteImageMemory(VmaAllocator allocator, VmaAllocation allocation);
+void HenImageMemoryEnd(VmaAllocator allocator);
+} // namespace Vulkan
+#endif
 
 namespace Vulkan {
 
@@ -167,6 +186,9 @@ Instance::Instance(Frontend::EmuWindow& window, u32 physical_device_index)
 }
 
 Instance::~Instance() {
+#ifdef __SWITCH__
+    HenImageMemoryEnd(allocator);
+#endif
     vmaDestroyAllocator(allocator);
 }
 
@@ -420,7 +442,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 13> enabled_extensions;
+    boost::container::static_vector<const char*, 14> enabled_extensions;
     const auto add_extension = [&](std::string_view extension, bool blacklist = false,
                                    std::string_view reason = "") -> bool {
         const auto result =
@@ -481,10 +503,36 @@ bool Instance::CreateDevice() {
                                                   vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
                                     .get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
                                     .graphicsPipelineLibrary;
+    // Coarse shading for the generic fragment shader's draws (vk_rasterizer.cpp, HenDrawGeneric):
+    // the fragment size is dynamic state of every pipeline where the device has it.
+    if (add_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) &&
+        physical_device
+            .getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>()
+            .get<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>()
+            .pipelineFragmentShadingRate) {
+        hen_coarse_shading = 1;
+        for (const auto& rate : physical_device.getFragmentShadingRatesKHR()) {
+            if ((rate.sampleCounts & vk::SampleCountFlagBits::e1) && rate.fragmentSize.width == rate.fragmentSize.height &&
+                (rate.fragmentSize.width == 2 || rate.fragmentSize.width == 4)) {
+                hen_coarse_shading = std::max(hen_coarse_shading, rate.fragmentSize.width);
+            }
+        }
+        if (hen_coarse_shading == 1) {
+            hen_coarse_shading = 0; // (the extension without a square size above 1x1: nothing to use)
+        }
+    }
 #endif
+#ifdef __SWITCH__
+    // Not taken on Switch even when the driver offers it: lit draws keep the geometry shader, the
+    // path this port has been measured with. The barycentric path has not run on the console.
+    const bool has_fragment_shader_barycentric =
+        add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, true,
+                      "this port keeps the geometry shader for lit draws");
+#else
     const bool has_fragment_shader_barycentric =
         add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, is_moltenvk,
                       "the PerVertexKHR attribute is not supported by MoltenVK");
+#endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -553,6 +601,14 @@ bool Instance::CreateDevice() {
         auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
         library_features.pNext = const_cast<void*>(create_info.pNext);
         create_info.pNext = &library_features;
+    }
+    vk::PhysicalDeviceFragmentShadingRateFeaturesKHR shading_rate_features{
+        .pipelineFragmentShadingRate = true,
+    };
+    if (hen_coarse_shading != 0) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        shading_rate_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &shading_rate_features;
     }
 #endif
 
@@ -680,6 +736,21 @@ void Instance::CreateAllocator() {
     const VmaAllocatorCreateInfo allocator_info = {
         .physicalDevice = physical_device,
         .device = GetDevice(),
+#ifdef __SWITCH__
+        // (--no-vma-small-blocks for the library's default of 256 MiB, begun at
+        // 32) The console's driver makes every GPU-only allocation over 8 MiB "chunked"
+        // memory, and an image bound into chunked memory gets a GPU address range of its
+        // own and one mapping request to the GPU service per 4 MiB chunk it touches: 12% of
+        // what the GPU thread did while the emulation thread waited for it in the gaps of six
+        // cold routes. A block of 8 MiB is a slice of one of the driver's pooled 16 MiB
+        // arenas, where a colour image is bound by arithmetic. Counts: the driver allows
+        // 4096 allocations and 1024 arenas; 1 GiB of images is 128 blocks.
+        // An image over 4 MiB gets memory of its own from the library; over 8 MiB that is
+        // chunked all the same (a 2048 x 2048 target, two to five requests).
+        // Only images and the screenshot's buffer come from this allocator; the stream
+        // buffers allocate for themselves.
+        .preferredLargeHeapBlockSize = hen_vma_small_blocks ? HEN_VMA_BLOCK_BYTES : 0,
+#endif
         .pVulkanFunctions = &functions,
         .instance = GetInstance(),
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -689,7 +760,100 @@ void Instance::CreateAllocator() {
     if (result != VK_SUCCESS) {
         UNREACHABLE_MSG("Failed to initialize VMA with error {}", result);
     }
+#ifdef __SWITCH__
+    {
+        std::scoped_lock lock{hen_image_memory_mutex};
+        hen_image_memory_allocator = allocator;
+    }
+#if HEN_DEV
+    std::printf("hen: gfx: image memory in blocks of %s\n",
+                hen_vma_small_blocks ? "8 MiB" : "the allocator's default size (256 MiB, begun at 32)");
+#endif
+#endif
 }
+
+#ifdef __SWITCH__
+// Image memory, for the frontend's report (development builds print it): what the allocator
+// holds now, and what was made since the last report.
+void HenNoteImageMemory([[maybe_unused]] VmaAllocator allocator,
+                        [[maybe_unused]] VmaAllocation allocation) {
+#if HEN_DEV
+    VmaAllocationInfo2 info{};
+    vmaGetAllocationInfo2(allocator, allocation, &info);
+    __atomic_fetch_add(&hen_image_memory_stats[0], 1ull, __ATOMIC_RELAXED);
+    if (info.dedicatedMemory) {
+        __atomic_fetch_add(&hen_image_memory_stats[1], 1ull, __ATOMIC_RELAXED);
+    }
+    // (the driver's rule for chunked memory, by size: the whole VkDeviceMemory it is in)
+    if (info.blockSize > HEN_VMA_BLOCK_BYTES) {
+        __atomic_fetch_add(&hen_image_memory_stats[2], 1ull, __ATOMIC_RELAXED);
+    }
+    // (by the image's own size, whatever it was bound into: common/hen_frame_work.h)
+    HEN_SURFACE_COUNT(info.allocationInfo.size < (4ull << 20)    ? HEN_IMAGE_UNDER_4
+                      : info.allocationInfo.size <= (8ull << 20) ? HEN_IMAGE_4_TO_8
+                                                                 : HEN_IMAGE_OVER_8,
+                      1);
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(allocator, budgets);
+    unsigned long long blocks = 0, bytes = 0;
+    for (const VmaBudget& budget : budgets) {
+        blocks += budget.statistics.blockCount;
+        bytes += budget.statistics.blockBytes;
+    }
+    if (blocks > hen_image_memory_stats[3]) {
+        hen_image_memory_stats[3] = blocks;
+    }
+    if (bytes > hen_image_memory_stats[4]) {
+        hen_image_memory_stats[4] = bytes;
+    }
+    __atomic_fetch_add(&hen_image_memory_stats[5], 1ull, __ATOMIC_RELAXED);
+    if (info.dedicatedMemory) {
+        __atomic_fetch_add(&hen_image_memory_stats[6], 1ull, __ATOMIC_RELAXED);
+    }
+    if (info.blockSize > HEN_VMA_BLOCK_BYTES) {
+        __atomic_fetch_add(&hen_image_memory_stats[7], 1ull, __ATOMIC_RELAXED);
+    }
+#endif
+}
+
+#if HEN_DEV
+extern "C" int hen_image_memory_now(unsigned long long* out) {
+    std::scoped_lock lock{hen_image_memory_mutex};
+    if (hen_image_memory_allocator == nullptr) {
+        return 0;
+    }
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(hen_image_memory_allocator, budgets);
+    out[0] = out[1] = out[2] = out[3] = 0;
+    for (const VmaBudget& budget : budgets) {
+        out[0] += budget.statistics.blockCount;
+        out[1] += budget.statistics.allocationCount;
+        out[2] += budget.statistics.blockBytes;
+        out[3] += budget.statistics.allocationBytes;
+    }
+    return 1;
+}
+#endif
+
+void HenImageMemoryEnd(VmaAllocator allocator) {
+    {
+        std::scoped_lock lock{hen_image_memory_mutex};
+        if (hen_image_memory_allocator == allocator) {
+            hen_image_memory_allocator = nullptr;
+        }
+    }
+#if HEN_DEV
+    std::printf("hen: gfx: image memory over the title: %llu images made, %llu in memory of their own, "
+                "%llu bound into memory over 8 MiB (chunked by the driver); at most %llu blocks, "
+                "%.1f MiB\n",
+                hen_image_memory_stats[5], hen_image_memory_stats[6], hen_image_memory_stats[7],
+                hen_image_memory_stats[3], hen_image_memory_stats[4] / 1048576.0);
+    for (auto& value : hen_image_memory_stats) {
+        value = 0;
+    }
+#endif
+}
+#endif
 
 void Instance::CollectToolingInfo() {
     if (!tooling_info) {

@@ -268,9 +268,17 @@ void DLP_SRVR::Finalize(Kernel::HLERequestContext& ctx) {
     rb.Push(ResultSuccess);
 }
 
+#ifdef __SWITCH__
+extern "C" void hen_room_note(const char* text); // citra_switch/room_link.h
+#endif
+
 void DLP_SRVR::StartHosting(Kernel::HLERequestContext& ctx) {
     LOG_INFO(Service_DLP, "called");
     IPC::RequestParser rp(ctx);
+
+    // A thread of an earlier hosting that has ended by itself is still to be joined: assigning
+    // over it below would end the program. (Before the locks: the thread takes them.)
+    EndConnectionManager();
 
     std::scoped_lock lock{srvr_state_mutex, broadcast_mutex};
 
@@ -284,7 +292,9 @@ void DLP_SRVR::StartHosting(Kernel::HLERequestContext& ctx) {
         return;
     }
 
-    NWM::NetworkInfo net_info;
+    // (Every field cleared: what isn't set below went into the network's announcement as
+    // whatever the stack held, different from one hosting to the next.)
+    NWM::NetworkInfo net_info{};
     net_info.max_nodes = max_clients + 1;
     net_info.channel = channel; // if 0x0, gets set to default channel: 11
     net_info.wlan_comm_id = dlp_wlan_comm_id;
@@ -292,6 +302,19 @@ void DLP_SRVR::StartHosting(Kernel::HLERequestContext& ctx) {
 
     GetUDS()->BeginHostingNetwork({reinterpret_cast<u8*>(&net_info), sizeof(NWM::NetworkInfo)},
                                   dlp_password_buf);
+#ifdef __SWITCH__
+    // (what the clients that look for games are told, for comparing one hosting with the next)
+    hen_room_note(fmt::format("download play hosting: {} clients at most, accepts {}, title {:016X}, "
+                              "transfer size {}, required size {}, host address {}",
+                              static_cast<u32>(max_clients), manual_accept ? "by hand" : "by itself",
+                              static_cast<u64>(title_broadcast_info.title_id),
+                              static_cast<u64>(title_broadcast_info.transfer_size),
+                              static_cast<u64>(title_broadcast_info.required_size),
+                              fmt::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", host_mac_address[0],
+                                          host_mac_address[1], host_mac_address[2], host_mac_address[3],
+                                          host_mac_address[4], host_mac_address[5]))
+                      .c_str());
+#endif
 
     is_broadcasting = true;
     constexpr u32 title_broadcast_delay_ms = 1;
@@ -984,9 +1007,19 @@ DLP_SRVR::DLP_SRVR() : ServiceFramework("dlp:SRVR", 1), DLP_Base(Core::System::G
         });
 }
 
+#ifdef __SWITCH__
+extern "C" void hen_room_step(const char* text); // citra_switch/room_link.h
+#endif
+
 DLP_SRVR::~DLP_SRVR() {
+#ifdef __SWITCH__
+    hen_room_step("download play server ending");
+#endif
     EnsureEndBroadcaster();
     EndConnectionManager();
+#ifdef __SWITCH__
+    hen_room_step("download play server ended");
+#endif
 }
 
 } // namespace Service::DLP

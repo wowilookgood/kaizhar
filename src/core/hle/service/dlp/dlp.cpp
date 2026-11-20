@@ -17,4 +17,17 @@ void InstallInterfaces(Core::System& system) {
     std::make_shared<DLP_SRVR>()->InstallAsService(service_manager);
 }
 
+void StopWorkers(Core::System& system) {
+    auto& service_manager = system.ServiceManager();
+    if (auto server = service_manager.GetService<DLP_SRVR>("dlp:SRVR")) {
+        server->StopWorker();
+    }
+    if (auto client = service_manager.GetService<DLP_CLNT>("dlp:CLNT")) {
+        client->StopWorker();
+    }
+    if (auto client = service_manager.GetService<DLP_FKCL>("dlp:FKCL")) {
+        client->StopWorker();
+    }
+}
+
 } // namespace Service::DLP

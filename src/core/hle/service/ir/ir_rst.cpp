@@ -12,6 +12,7 @@
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/service/hid/hid.h"
+#include "core/hle/service/ir/ir.h"
 #include "core/hle/service/ir/ir_rst.h"
 #include "core/movie.h"
 
@@ -162,6 +163,7 @@ void IR_RST::Initialize(Kernel::HLERequestContext& ctx) {
     next_pad_index = 0;
     is_device_reload_pending.store(true);
     system.CoreTiming().ScheduleEvent(msToCycles(update_period), update_callback_id);
+    hen_rst_in_use.store(true); // (the title reads the C-Stick from here on: ir.h)
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
@@ -174,6 +176,7 @@ void IR_RST::Shutdown(Kernel::HLERequestContext& ctx) {
 
     system.CoreTiming().UnscheduleEvent(update_callback_id, 0);
     UnloadInputDevices();
+    hen_rst_in_use.store(false);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
@@ -182,6 +185,7 @@ void IR_RST::Shutdown(Kernel::HLERequestContext& ctx) {
 
 IR_RST::IR_RST(Core::System& system) : ServiceFramework("ir:rst", 2), system(system) {
     using namespace Kernel;
+    hen_rst_in_use.store(false); // (a new title has not asked yet)
     // Note: these two kernel objects are even available before Initialize service function is
     // called.
     shared_memory =
@@ -207,7 +211,9 @@ IR_RST::IR_RST(Core::System& system) : ServiceFramework("ir:rst", 2), system(sys
     RegisterHandlers(functions);
 }
 
-IR_RST::~IR_RST() = default;
+IR_RST::~IR_RST() {
+    hen_rst_in_use.store(false);
+}
 
 void IR_RST::ReloadInputDevices() {
     is_device_reload_pending.store(true);

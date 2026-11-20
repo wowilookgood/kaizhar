@@ -24,13 +24,12 @@
 // system on the console too (all cores, whoever runs), set while the title that asked runs.
 // The price is host CPU: up to three times the instructions per emulated second.
 //
-// (2026-11-13) Automatic, the default: 3 is the ceiling and 1 (upstream's charge) the floor,
+// Automatic, the default: 3 is the ceiling and 1 (upstream's charge) the floor,
 // and HenClockControl below moves the factor between them by what the host has to spare, so
 // that a scene the host cannot pay for at 804 MHz costs the game frames instead of emulation
 // speed and sound. Xenoblade's recorded route, 5 s intervals: fixed 1: 16 to 30 fps (median
 // 23) at 91 to 101% speed; fixed 3: 26 to 30 fps, speed down to 85%, 3397 ms of lag given up.
-// hen_n3ds_clock: 0 fixed 1 (--n3ds-clock-off), 1 fixed 3 (--n3ds-clock), 2 automatic,
-// 3 automatic with system calls charged like code (--n3ds-kernel-auto).
+// hen_n3ds_clock: 0 fixed 1 (--n3ds-clock-off), 1 fixed 3 (--n3ds-clock), 2 automatic.
 #ifdef __SWITCH__
 extern "C" int hen_n3ds_clock;                    // hen/jit/hen_jit.c
 extern "C" unsigned long long hen_n3ds_clock_ticks; // work charged at the fast rate (report)
@@ -45,6 +44,74 @@ static unsigned long long hen_jit_interpreted_ns() {
 }
 #endif
 
+// ("hen: emu:") The scheduled events run on the emulation thread between two slices of the
+// emulated CPU: how many of each kind and the time in them (the vertical blank's includes the
+// frame limiter's sleep and the wait for the GPU thread; the sound hardware's is the whole of
+// making a frame of sound). The clock is read only with hen_emu_stats_on. Development builds.
+// Emulation thread only.
+#if defined(__SWITCH__) && HEN_DEV
+extern "C" int hen_emu_stats_on;
+extern "C" unsigned long long hen_jit_now_ns(void);
+namespace {
+struct HenEventKind {
+    const Core::TimingEventType* type;
+    unsigned long long count, ns;
+};
+constexpr int HEN_EVENT_KINDS = 24;
+HenEventKind hen_event_kinds[HEN_EVENT_KINDS];
+unsigned long long hen_event_other[2]; // (count, ns: kinds past the table's size)
+void HenNoteEvent(const Core::TimingEventType* type, unsigned long long ns) {
+    for (HenEventKind& kind : hen_event_kinds) {
+        if (kind.type == type || kind.type == nullptr) {
+            kind.type = type;
+            kind.count++;
+            kind.ns += ns;
+            return;
+        }
+    }
+    hen_event_other[0]++;
+    hen_event_other[1] += ns;
+}
+} // namespace
+namespace Core {
+// Since the last call: every event run and the time in all of them into total[2]; the kinds
+// with the most time, most first, into names/count/ns (up to max). Returns how many.
+int HenEventStats(const char** names, unsigned long long* count, unsigned long long* ns, int max,
+                  unsigned long long* total) {
+    total[0] = hen_event_other[0];
+    total[1] = hen_event_other[1];
+    hen_event_other[0] = hen_event_other[1] = 0;
+    for (const HenEventKind& kind : hen_event_kinds) {
+        total[0] += kind.count;
+        total[1] += kind.ns;
+    }
+    int found = 0;
+    for (; found < max; found++) {
+        HenEventKind* best = nullptr;
+        for (HenEventKind& kind : hen_event_kinds) {
+            if (kind.count != 0 && (best == nullptr || kind.ns > best->ns ||
+                                    (kind.ns == best->ns && kind.count > best->count))) {
+                best = &kind;
+            }
+        }
+        if (best == nullptr) {
+            break;
+        }
+        names[found] = best->type->name->c_str();
+        count[found] = best->count;
+        ns[found] = best->ns;
+        best->count = best->ns = 0;
+    }
+    // (the types stay: an event type lives as long as the emulated system; Timing's
+    // constructor empties the table)
+    for (HenEventKind& kind : hen_event_kinds) {
+        kind.count = kind.ns = 0;
+    }
+    return found;
+}
+} // namespace Core
+#endif
+
 // Wake-ups queued from other threads and taken over by the emulation thread (hang report).
 #include <atomic>
 std::atomic<unsigned> hen_ts_pushed{0}, hen_ts_moved{0};
@@ -55,9 +122,9 @@ static bool hen_fast_clock = false;
 static u32 hen_clock_percentage = 100;
 
 // What CPU work is divided by while the mode is on, and the controller's state.
-// The floor is the old machine's rate. 0.75 was tried (2026-11-13, Xenoblade's heavy stretch):
-// the host's work stayed the same (the title does the same work a frame; 3.3 s of 5 on the
-// core either way) and speed and frames were inside the run-to-run spread, so the simpler
+// The floor is the old machine's rate. 0.75 gives nothing (Xenoblade's heavy stretch):
+// the host's work stays the same (the title does the same work a frame; 3.3 s of 5 on the
+// core either way) and speed and frames are inside the run-to-run spread, so the simpler
 // floor stays.
 constexpr double HEN_CLOCK_FLOOR = 1.0, HEN_CLOCK_STORED = 1.0, HEN_CLOCK_CEILING = 3.0;
 static double hen_clock_factor = HEN_CLOCK_CEILING;
@@ -128,7 +195,7 @@ void HenClockControl(Timing& timing, s64 work_us, s64 budget_us) {
     hen_clock_work_us = hen_clock_budget_us = hen_clock_vblanks = 0;
     // New code (over 1 ms of the window in the interpreter tier, the loading boost's line): the
     // host is paying for first visits, and at 3x the title reaches three times as many of them
-    // a blank (Smash cold, 2026-11-13: 224 ms of lag against 0 to 11 at 1x, all of it in the
+    // a blank (Smash cold: 224 ms of lag against 0 to 11 at 1x, all of it in the
     // intervals with new code). The stored clock until the code is compiled.
     const unsigned long long interpreted = hen_jit_interpreted_ns();
     const bool new_code = interpreted - hen_clock_interpreted > 1'000'000;
@@ -187,6 +254,13 @@ Timing::Timing(std::size_t num_cores, u32 cpu_clock_percentage, s64 override_bas
     // Generate non-zero base tick count to simulate time the system ran before launching the game.
     // This accounts for games that rely on the system tick to seed randomness.
     const auto base_ticks = override_base_ticks >= 0 ? override_base_ticks : GenerateBaseTicks();
+#if defined(__SWITCH__) && HEN_DEV
+    // (the event types of the system before this one are gone)
+    for (HenEventKind& kind : hen_event_kinds) {
+        kind = {};
+    }
+    hen_event_other[0] = hen_event_other[1] = 0;
+#endif
 
     timers.resize(num_cores);
     for (std::size_t i = 0; i < num_cores; ++i) {
@@ -357,10 +431,9 @@ void Timing::Timer::AddTicks(u64 ticks) {
 
 // A system call's charge (svc.cpp, address_arbiter.cpp). In the fast mode the kernel runs at the
 // fast clock too, and its charges cost the host nothing, so with the automatic clock they are
-// always a third, whatever the factor for code is. (Xenoblade, 2026-11-13: one core is 90% lock
+// always a third, whatever the factor for code is. (Xenoblade: one core is 90% lock
 // calls' charges, 1070 M of 1167 M ticks per 5 s, and that core sets the frame rate: with the
 // factor at the floor the title made 21 to 25 frames a second with the host at 90%.)
-// hen_n3ds_clock 3 (--n3ds-kernel-auto): charged like code, for comparing.
 void Timing::Timer::AddKernelTicks(u64 ticks) {
     if (hen_fast_clock && hen_n3ds_clock == 2) [[unlikely]] {
         const u64 charged = std::max<u64>(
@@ -421,7 +494,13 @@ void Timing::Timer::Advance() {
         event_queue.pop_back();
         if (evt.type->callback != nullptr) {
             const HenSlow hen_slow{evt.type->name->c_str()};
+#if defined(__SWITCH__) && HEN_DEV
+            const unsigned long long hen_event_start = hen_emu_stats_on ? hen_jit_now_ns() : 0;
             evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
+            HenNoteEvent(evt.type, hen_event_start != 0 ? hen_jit_now_ns() - hen_event_start : 0);
+#else
+            evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
+#endif
         } else {
             LOG_ERROR(Core, "Event '{}' has no callback", *evt.type->name);
         }

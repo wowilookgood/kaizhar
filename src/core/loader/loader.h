@@ -304,12 +304,23 @@ public:
         return file ? file->Filename() : "";
     }
 
+    /// (Kaizhar, Switch 2 port) Set by the code that starts a title while another runs
+    /// (Service::NS::LaunchTitle): the loader may then take what it reads from, and leave it
+    /// in, the per-run launch cache (core/loader/ncch.cpp, hen_launch_images).
+    bool hen_relaunchable = false;
+
 protected:
     Core::System& system;
     std::unique_ptr<FileUtil::IOFileBase> file;
     bool is_loaded = false;
     std::optional<Kernel::MemoryMode> memory_mode_override = std::nullopt;
 };
+
+/// (Kaizhar, Switch 2 port) The per-run launch cache of the NCCH loader forgets everything:
+/// an install or a removal is beginning (core/hle/service/am/am.cpp). Elsewhere: nothing.
+void HenLaunchCacheForget();
+/// For the line at the title's end: launches answered from the cache, images and bytes held.
+void HenLaunchCacheStats(unsigned* hits, unsigned* images, unsigned long long* bytes);
 
 /**
  * Identifies a bootable file and return a suitable loader

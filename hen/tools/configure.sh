@@ -10,7 +10,7 @@
 #   -DHEN_DEV=ON              development build: test hooks and logging (default here: OFF)
 #   -DKAIZHAR_ICON=file.jpg   another icon (256x256 JPEG)
 #   -DHEN_ROMFS_DIR=folder    test programs for romfs:/ (development builds)
-#   -DHEN_CHAIN_DIR=folder    the optional chained test launcher (development builds)
+#   -DHEN_CHAIN_DIR=folder    an optional test library, not included (development builds)
 #
 # Before the first build, fetch the submodules and apply hen/patches (see the README):
 #   git submodule update --init --recursive

@@ -6,7 +6,10 @@
 #include <boost/serialization/string.hpp>
 #include "common/archives.h"
 #include "common/assert.h"
+#include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/event.h"
+#include "core/hle/kernel/hen_ipc_trace.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/resource_limit.h"
 #include "core/hle/kernel/thread.h"
@@ -44,6 +47,11 @@ void Event::Acquire(Thread* thread) {
 }
 
 void Event::Signal() {
+#if HEN_DEV
+    // (Kaizhar: who signalled it last, for the report of the emulated threads)
+    HenIpc::Signalled(GetObjectId(), HenIpc::signalling_thread,
+                      static_cast<u64>(Core::System::GetInstance().CoreTiming().GetGlobalTimeUs().count()));
+#endif
     signaled = true;
     WakeupAllWaitingThreads();
 }

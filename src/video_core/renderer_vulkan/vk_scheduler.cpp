@@ -4,6 +4,7 @@
 
 #include <mutex>
 #include <utility>
+#include "common/hen_frame_work.h"
 #include "common/microprofile.h"
 #include "common/thread.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -17,6 +18,8 @@ MICROPROFILE_DEFINE(Vulkan_Submit, "Vulkan", "Submit Exectution", MP_RGB(255, 19
 
 #if defined(__SWITCH__) && HEN_DEV
 extern "C" void hen_blackbox_watch(void);
+extern "C" void hen_blackbox_watch_scheduler(void);
+extern "C" void hen_blackbox_unwatch_scheduler(void);
 #endif
 
 namespace Vulkan {
@@ -122,6 +125,14 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
 #if defined(__SWITCH__) && HEN_DEV
     hen_blackbox_watch(); // (hen/jit/hen_jit.c: sampled with the emulation thread)
+    // (and always under its own name; the GPU thread takes the slot above when it
+    // starts. The handle is withdrawn when this thread ends.)
+    hen_blackbox_watch_scheduler();
+    struct HenUnwatch {
+        ~HenUnwatch() {
+            hen_blackbox_unwatch_scheduler();
+        }
+    } hen_unwatch;
 #endif
 
     const auto TryPopQueue{[this](auto& work) -> bool {
@@ -186,6 +197,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wait_semaphore) {
     state = StateFlags::AllDirty;
     const u64 signal_value = master_semaphore->NextTick();
+    HEN_WORK_COUNT(HEN_WORK_SUBMITS, 1);
 
     on_submit();
 

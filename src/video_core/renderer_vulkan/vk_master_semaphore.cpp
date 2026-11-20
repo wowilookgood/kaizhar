@@ -7,6 +7,12 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
+#if defined(__SWITCH__) && HEN_DEV
+#include <atomic>
+extern "C" unsigned long long hen_jit_now_ns(void);
+std::atomic<unsigned long long> hen_last_submit_ns{0};
+#endif
+
 namespace Vulkan {
 
 constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
@@ -104,6 +110,11 @@ void MasterSemaphoreTimeline::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore
     } catch (vk::DeviceLostError& err) {
         UNREACHABLE_MSG("Device lost during submit: {}", err.what());
     }
+#if defined(__SWITCH__) && HEN_DEV
+    // (when the scheduler's worker last handed a command buffer to the driver: a slow surface
+    // download says how much of its wait came before this; vk_texture_runtime.cpp)
+    hen_last_submit_ns.store(hen_jit_now_ns(), std::memory_order_relaxed);
+#endif
 }
 
 constexpr u64 FENCE_RESERVE = 8;

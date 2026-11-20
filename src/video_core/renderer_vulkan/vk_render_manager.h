@@ -70,6 +70,12 @@ private:
     bool shadow_rendering{};
     RenderPass pass{};
     u32 num_draws{};
+#if defined(__SWITCH__) && HEN_DEV
+    // (development builds) The pass the last draw was in, kept after its end: for the counters
+    // that say why a draw begins a pass (common/hen_frame_work.h).
+    RenderPass hen_last_draw_pass{};
+    std::array<vk::Image, 2> hen_last_draw_images{};
+#endif
 };
 
 } // namespace Vulkan

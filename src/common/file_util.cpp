@@ -10,8 +10,11 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <atomic>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <boost/iostreams/device/file_descriptor.hpp>
 #include <boost/iostreams/stream.hpp>
 #include <cryptopp/aes.h>
@@ -139,6 +142,86 @@ typedef struct stat file_stat_t;
 // REMEMBER: strdup considered harmful!
 namespace FileUtil {
 
+#ifdef __SWITCH__
+// (Kaizhar, hen_launch_cache) Paths a title launch looked for and did not find.
+// Starting a title probes about forty optional files that are almost never there (code, icon,
+// banner and logo replacements in three folders each, seven patch files, a replacement header,
+// split-off RomFS and ExeFS, the same again for an update title), each a failed open or stat
+// on the card at about a millisecond: most of "the rest of loading" in the "hen: launch:"
+// line (23 to 37 ms a keyboard open in System Settings). So while a launch is being
+// made (HenAbsentScope, core/hle/service/apt/ns.cpp) a read-only open or an Exists() that
+// fails is remembered for the run, and the next launch is answered from memory.
+//  - Only inside that scope, on the thread that entered it: nothing else is answered or
+//    remembered.
+//  - A path is forgotten when this file's functions make it exist: an open for writing or
+//    appending, CreateDir, Copy to it; a Rename forgets everything (it can move a folder).
+//  - The title manager forgets everything when an install or a removal begins (am.cpp,
+//    InvalidateSavedTitleList), with the saved title list and the content paths.
+//  - NOT noticed: a file created by other means during the run (FTP, another program).
+//  - Bounded: 4096 paths, then it starts again.
+extern "C" int hen_launch_cache; // hen/jit/hen_jit.c: --no-launch-cache
+namespace {
+std::mutex hen_absent_mutex;
+std::unordered_set<std::string> hen_absent;
+std::atomic<bool> hen_absent_any{false};
+thread_local int hen_absent_scope = 0;
+unsigned hen_absent_answered = 0, hen_absent_remembered = 0; // (under the mutex)
+
+bool HenAbsentKnown(const std::string& path) {
+    if (hen_absent_scope <= 0 || !hen_absent_any.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    std::scoped_lock lock{hen_absent_mutex};
+    if (!hen_absent.contains(path)) {
+        return false;
+    }
+    hen_absent_answered++;
+    return true;
+}
+void HenAbsentRemember(const std::string& path) {
+    if (hen_absent_scope <= 0 || !hen_launch_cache) {
+        return;
+    }
+    std::scoped_lock lock{hen_absent_mutex};
+    if (hen_absent.size() >= 4096) {
+        hen_absent.clear();
+    }
+    if (hen_absent.insert(path).second) {
+        hen_absent_remembered++;
+    }
+    hen_absent_any.store(true, std::memory_order_relaxed);
+}
+/// The path now exists (or is about to): on any thread, inside a scope or not.
+void HenAbsentForget(const std::string& path) {
+    if (!hen_absent_any.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::string stripped(path);
+    while (stripped.size() > 1 && (stripped.back() == '/' || stripped.back() == '\\')) {
+        stripped.pop_back();
+    }
+    std::scoped_lock lock{hen_absent_mutex};
+    hen_absent.erase(path);
+    hen_absent.erase(stripped);
+    hen_absent.erase(stripped + '/');
+}
+} // namespace
+
+void HenAbsentScope(int delta) {
+    hen_absent_scope += delta;
+}
+void HenAbsentClear() {
+    std::scoped_lock lock{hen_absent_mutex};
+    hen_absent.clear();
+    hen_absent_any.store(false, std::memory_order_relaxed);
+}
+void HenAbsentStats(unsigned* answered, unsigned* remembered) {
+    std::scoped_lock lock{hen_absent_mutex};
+    *answered = hen_absent_answered;
+    *remembered = hen_absent_remembered;
+}
+#endif
+
 using Common::GetLastErrorMsg;
 
 // Remove any ending forward slashes from directory paths
@@ -176,7 +259,17 @@ bool Exists(const std::string& filename) {
     }
 #else
     struct stat file_info;
+#ifdef __SWITCH__
+    if (HenAbsentKnown(copy)) {
+        return false; // (a launch looked for it before in this run: see hen_absent)
+    }
+#endif
     int result = stat(copy.c_str(), &file_info);
+#ifdef __SWITCH__
+    if (result != 0) {
+        HenAbsentRemember(copy);
+    }
+#endif
 #endif
 
     return (result == 0);
@@ -283,6 +376,9 @@ bool Delete(const std::string& filepath) {
 
 bool CreateDir(const std::string& path) {
     LOG_TRACE(Common_Filesystem, "directory {}", path);
+#ifdef __SWITCH__
+    HenAbsentForget(path);
+#endif
 #ifdef _WIN32
     if (::CreateDirectoryW(Common::UTF8ToUTF16W(path).c_str(), nullptr))
         return true;
@@ -415,6 +511,11 @@ bool DeleteDir(const std::string& filename) {
 
 bool Rename(const std::string& srcFullPath, const std::string& destFullPath) {
     LOG_TRACE(Common_Filesystem, "{} --> {}", srcFullPath, destFullPath);
+#ifdef __SWITCH__
+    if (hen_absent_any.load(std::memory_order_relaxed)) {
+        HenAbsentClear(); // (a folder may be moving: everything under the new name appears)
+    }
+#endif
 #ifdef _WIN32
     if (MoveFileExW(Common::UTF8ToUTF16W(srcFullPath).c_str(),
                     Common::UTF8ToUTF16W(destFullPath).c_str(), MOVEFILE_REPLACE_EXISTING)) {
@@ -442,6 +543,9 @@ bool Rename(const std::string& srcFullPath, const std::string& destFullPath) {
 
 bool Copy(const std::string& srcFilename, const std::string& destFilename) {
     LOG_TRACE(Common_Filesystem, "{} --> {}", srcFilename, destFilename);
+#ifdef __SWITCH__
+    HenAbsentForget(destFilename);
+#endif
 #ifdef _WIN32
     if (CopyFileW(Common::UTF8ToUTF16W(srcFilename).c_str(),
                   Common::UTF8ToUTF16W(destFilename).c_str(), FALSE))
@@ -1393,8 +1497,24 @@ bool IOFile::Open() {
     }
     m_good = m_file != nullptr;
 #else
+#ifdef __SWITCH__
+    // (hen_absent, above) Only a plain read can be answered from memory; anything that may
+    // create the file makes the path forgotten.
+    const bool hen_read_only = openmode.find_first_of("wa+") == std::string::npos;
+    if (!hen_read_only) {
+        HenAbsentForget(filename);
+    } else if (HenAbsentKnown(filename)) {
+        m_good = false;
+        return false;
+    }
+#endif
     m_file = FOPEN(filename.c_str(), openmode.c_str());
     m_good = m_file != nullptr;
+#ifdef __SWITCH__
+    if (!m_good && hen_read_only) {
+        HenAbsentRemember(filename);
+    }
+#endif
 #endif
 
     return m_good;

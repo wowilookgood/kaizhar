@@ -1,6 +1,7 @@
 // Host tool for the generic fragment shader (glsl_fs_shader_gen.cpp).
-//   gen generic 0|1     the generic shader's text (1: barycentric variant)
-//   gen case SEED [canon]  a random valid fragment configuration (canon: made canonical first): its generated shader, whether the
+//   gen generic 0|1 [nd]  the generic shader's text (1: barycentric variant; nd: the variant
+//                       without the depth write, for early depth)
+//   gen case SEED [canon|zbuf]  (zbuf: Z-buffer mode always, for the variant without the depth write) a random valid fragment configuration (canon: made canonical first): its generated shader, whether the
 //                       generic shader supports it, and the configuration as the generic one
 //                       reads it (for difftest.py)
 #include <cstdio>
@@ -28,7 +29,8 @@ static Profile MakeProfile(bool barycentric) {
 int main(int argc, char** argv) {
     if (argc >= 3 && std::strcmp(argv[1], "generic") == 0) {
         const std::string code =
-            Generator::GLSL::GenerateGenericFragmentShader(MakeProfile(std::atoi(argv[2]) != 0));
+            Generator::GLSL::GenerateGenericFragmentShader(
+                MakeProfile(std::atoi(argv[2]) != 0), argc >= 4 && std::strcmp(argv[3], "nd") == 0);
         std::fwrite(code.data(), 1, code.size(), stdout);
         return 0;
     }
@@ -50,6 +52,9 @@ int main(int argc, char** argv) {
             static_cast<Pica::RasterizerRegs::ScissorMode>(pick({0, 0, 1, 3})));
         fb.depthmap_enable.Assign(
             static_cast<Pica::RasterizerRegs::DepthBuffering>(pick({0, 1})));
+        if (argc >= 4 && std::strcmp(argv[3], "zbuf") == 0) {
+            fb.depthmap_enable.Assign(Pica::RasterizerRegs::DepthBuffering::ZBuffering);
+        }
         fb.logic_op.Assign(Pica::FramebufferRegs::LogicOp::Copy);
         fb.alphablend_enable.Assign(pick({0, 1}));
 
@@ -148,6 +153,6 @@ int main(int argc, char** argv) {
         std::fwrite(code.data(), 1, code.size(), stdout);
         return 0;
     }
-    std::fprintf(stderr, "usage: gen generic 0|1 | gen case SEED\n");
+    std::fprintf(stderr, "usage: gen generic 0|1 [nd] | gen case SEED [canon|zbuf]\n");
     return 2;
 }

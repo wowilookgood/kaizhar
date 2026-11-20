@@ -23,6 +23,9 @@
 #include <boost/serialization/weak_ptr.hpp>
 #include <httplib.h>
 #include "common/thread.h"
+#ifdef __SWITCH__
+#include "idbe_passthrough.h" // (Kaizhar) hen/idbe
+#endif
 #include "common/web_util.h"
 #include "core/hle/ipc_helpers.h"
 #include "core/hle/kernel/shared_memory.h"
@@ -345,6 +348,10 @@ public:
     void MakeRequest();
     void MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
                            std::vector<Context::RequestHeader>& pending_headers);
+#ifdef __SWITCH__
+    /// (Kaizhar) hen/idbe: the Friend List's title icon download.
+    void MakeIconServerRequest(const Idbe::IconRequest& icon);
+#endif
     void MakeRequestSSL(httplib::Request& request, const Common::URLInfo& url_info,
                         std::vector<Context::RequestHeader>& pending_headers);
     bool ContentProvider(size_t offset, size_t length, httplib::DataSink& sink);

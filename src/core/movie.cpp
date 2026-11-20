@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdio>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -234,9 +235,10 @@ u64 Movie::GetTotalInputCount() const {
 // ("Expected to read type 5, but found 0", thousands of times a minute). Each kind's Nth poll
 // now gets that kind's Nth record. current_byte stays the furthest position read, which is
 // what the end-of-movie check looks at.
+static std::array<std::size_t, 8> hen_cursor{}; // (each kind's position in the recording)
 static bool HenNextOfType(const std::vector<u8>& input, ControllerStateType type, ControllerState& s,
                           std::size_t& current_byte) {
-    static std::array<std::size_t, 8> cursor{};
+    auto& cursor = hen_cursor;
     if (current_byte == 0) {
         cursor.fill(0);
     }
@@ -257,6 +259,48 @@ static bool HenNextOfType(const std::vector<u8>& input, ControllerStateType type
     return false;
 }
 
+void Movie::HenSetTitle(u64 program_id) {
+    hen_title = program_id;
+    hen_title_asked = false;
+    hen_hold = false;
+}
+
+void Movie::HenSyncAtTitleStart(u64 program_id, u64 resume_input) {
+    HenSetTitle(program_id);
+    hen_resume_input = resume_input;
+    hen_hold = play_mode == PlayMode::Playing;
+}
+
+void Movie::HenTitleAskedForPad(u64 program_id) {
+    if (program_id != hen_title || hen_title_asked ||
+        (play_mode != PlayMode::Playing && play_mode != PlayMode::Recording)) {
+        return;
+    }
+    hen_title_asked = true;
+    // (pad polls so far: read back in a playback, counted in the file while recording)
+    const u64 at = play_mode == PlayMode::Playing ? current_input : GetInputCount(recorded_input);
+    if (!hen_hold) {
+        std::printf("hen: movie: the title asked for the pad at pad input %llu\n",
+                    static_cast<unsigned long long>(at));
+        return;
+    }
+    // Every kind of input goes on from the place in the file of pad record `hen_resume_input`.
+    std::size_t byte = 0;
+    u64 seen = 0;
+    for (; byte + sizeof(ControllerState) <= recorded_input.size() && seen < hen_resume_input;
+         byte += sizeof(ControllerState)) {
+        ControllerState s{};
+        std::memcpy(&s, &recorded_input[byte], sizeof(ControllerState));
+        seen += s.type == ControllerStateType::PadAndCircle;
+    }
+    hen_cursor.fill(byte);
+    current_byte = std::max<std::size_t>(byte, 1); // (0 would put every kind back at the start)
+    current_input = seen;
+    hen_hold = false;
+    std::printf("hen: movie: the title asked for the pad: playback goes on from pad input %llu (byte %zu of %zu)\n",
+                static_cast<unsigned long long>(seen), byte, recorded_input.size());
+}
+
 void Movie::CheckInputEnd() {
     if (current_byte + sizeof(ControllerState) > recorded_input.size()) {
         LOG_INFO(Movie, "Playback finished");
@@ -266,6 +310,9 @@ void Movie::CheckInputEnd() {
 }
 
 void Movie::Play(Service::HID::PadState& pad_state, s16& circle_pad_x, s16& circle_pad_y) {
+    if (hen_hold) {
+        return; // (HenSyncAtTitleStart: nothing pressed until the title asks for the pad)
+    }
     ControllerState s{};
     if (!HenNextOfType(recorded_input, ControllerStateType::PadAndCircle, s, current_byte)) {
         return;
@@ -292,6 +339,9 @@ void Movie::Play(Service::HID::PadState& pad_state, s16& circle_pad_x, s16& circ
 }
 
 void Movie::Play(Service::HID::TouchDataEntry& touch_data) {
+    if (hen_hold) {
+        return; // (HenSyncAtTitleStart: nothing pressed until the title asks for the pad)
+    }
     ControllerState s{};
     if (!HenNextOfType(recorded_input, ControllerStateType::Touch, s, current_byte)) {
         return;
@@ -303,6 +353,9 @@ void Movie::Play(Service::HID::TouchDataEntry& touch_data) {
 }
 
 void Movie::Play(Service::HID::AccelerometerDataEntry& accelerometer_data) {
+    if (hen_hold) {
+        return; // (HenSyncAtTitleStart: nothing pressed until the title asks for the pad)
+    }
     ControllerState s{};
     if (!HenNextOfType(recorded_input, ControllerStateType::Accelerometer, s, current_byte)) {
         return;
@@ -314,6 +367,9 @@ void Movie::Play(Service::HID::AccelerometerDataEntry& accelerometer_data) {
 }
 
 void Movie::Play(Service::HID::GyroscopeDataEntry& gyroscope_data) {
+    if (hen_hold) {
+        return; // (HenSyncAtTitleStart: nothing pressed until the title asks for the pad)
+    }
     ControllerState s{};
     if (!HenNextOfType(recorded_input, ControllerStateType::Gyroscope, s, current_byte)) {
         return;
@@ -325,6 +381,9 @@ void Movie::Play(Service::HID::GyroscopeDataEntry& gyroscope_data) {
 }
 
 void Movie::Play(Service::IR::PadState& pad_state, s16& c_stick_x, s16& c_stick_y) {
+    if (hen_hold) {
+        return; // (HenSyncAtTitleStart: nothing pressed until the title asks for the pad)
+    }
     ControllerState s{};
     if (!HenNextOfType(recorded_input, ControllerStateType::IrRst, s, current_byte)) {
         return;
@@ -337,6 +396,9 @@ void Movie::Play(Service::IR::PadState& pad_state, s16& c_stick_x, s16& c_stick_
 }
 
 void Movie::Play(Service::IR::ExtraHIDResponse& extra_hid_response) {
+    if (hen_hold) {
+        return; // (HenSyncAtTitleStart: nothing pressed until the title asks for the pad)
+    }
     ControllerState s{};
     if (!HenNextOfType(recorded_input, ControllerStateType::ExtraHidResponse, s, current_byte)) {
         return;

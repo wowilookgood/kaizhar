@@ -29,6 +29,12 @@ private:
 class SVC_SyncCallback;
 class SVC_IPCCallback;
 
+#ifdef __SWITCH__
+/// (Kaizhar, svc.cpp, hen_playing) Forgets a pending "playing game" request and which processes
+/// it was made for: called when the emulated system is shut down.
+void HenPlayingGameReset();
+#endif
+
 } // namespace Kernel
 
 BOOST_CLASS_EXPORT_KEY(Kernel::SVC_SyncCallback)

@@ -44,8 +44,12 @@ public:
                     instruction_labels[offset].offset());
     }
 
+    /// (Switch 2 port) finalize false: the code is emitted but no executable memory is made;
+    /// HenFinalize does that, on the thread that will run the shader. Nothing else differs.
     void Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_code,
-                 const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data);
+                 const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data,
+                 bool finalize = true);
+    void HenFinalize();
 
     void Compile_ADD(Instruction instr);
     void Compile_DP3(Instruction instr);
@@ -144,6 +148,7 @@ private:
 
     using CompiledShader = void(const void* setup, void* state, const std::byte* start_addr);
     CompiledShader* program = nullptr;
+    std::uintptr_t hen_program_offset = 0; ///< (where the entry code starts, for HenFinalize)
 
     /// Library functions, emitted as used
     bool log2_used : 1 = false;

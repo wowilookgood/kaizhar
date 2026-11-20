@@ -1722,7 +1722,12 @@ ADD_INST: {
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
         add_inst* const inst_cream = (add_inst*)inst_base->component;
 
-        u32 rn_val = CHECK_READ_REG15_WA(cpu, inst_cream->Rn);
+        // (As upstream since 2026-10-23, "dyncom: Fix ADD PC instruction handling in Thumb":
+        // with a register operand the PC is read as it is, not rounded down to a multiple of 4.
+        // The friends module's Thumb code otherwise computes a null pointer for a buffer it
+        // sends, and the emulated kernel stops on it.)
+        u32 rn_val = inst_cream->I ? CHECK_READ_REG15_WA(cpu, inst_cream->Rn)
+                                   : CHECK_READ_REG15(cpu, inst_cream->Rn);
 
         bool carry;
         bool overflow;
